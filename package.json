@@ -1,0 +1,68 @@
+{
+  "name": "trx-parser",
+  "version": "0.7.0",
+  "private": true,
+  "description": "Fast, parallel GitHub Action to parse .NET test results and create status checks using the GitHub Checks API",
+  "main": "lib/main.js",
+  "scripts": {
+    "build": "tsc",
+    "format": "prettier --write \"**/*.ts\"",
+    "format-check": "prettier --check \"**/*.ts\"",
+    "lint": "eslint \"src/**/*.ts\"",
+    "lint-fix": "eslint --fix \"src/**/*.ts\"",
+    "package": "ncc build --source-map --license licenses.txt",
+    "test": "jest",
+    "all": "npm run build && npm run format && npm run lint && npm run package && npm test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/step-security/trx-parser.git"
+  },
+  "engines": {
+    "node": ">= 24",
+    "npm": ">= 10"
+  },
+  "keywords": [
+    "actions",
+    "node",
+    "setup",
+    "github",
+    "dotnet",
+    "test",
+    "report",
+    "trx",
+    "check",
+    "status"
+  ],
+  "author": "step-security",
+  "license": "MIT",
+  "dependencies": {
+    "@actions/core": "^1.11.1",
+    "@actions/github": "^6.0.1",
+    "@octokit/webhooks-types": "^7.6.1",
+    "@opentelemetry/auto-instrumentations-node": "^0.62.0",
+    "@opentelemetry/exporter-metrics-otlp-http": "^0.203.0",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.203.0",
+    "@opentelemetry/instrumentation": "^0.203.0",
+    "@opentelemetry/sdk-node": "^0.203.0",
+    "@types/he": "^1.1.2",
+    "axios": "^1.14.0",
+    "fast-xml-parser": "^5.2.5",
+    "he": "^1.2.0"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.14",
+    "@types/node": "^20.19.9",
+    "@typescript-eslint/eslint-plugin": "^8.38.0",
+    "@typescript-eslint/parser": "^8.38.0",
+    "@vercel/ncc": "^0.38.3",
+    "eslint": "^8.57.1",
+    "eslint-plugin-github": "^5.1.0",
+    "eslint-plugin-jest": "^28.9.0",
+    "jest": "^29.7.0",
+    "jest-circus": "^29.7.0",
+    "prettier": "^3.6.2",
+    "ts-jest": "^29.4.0",
+    "typescript": "^5.5.4"
+  }
+}
