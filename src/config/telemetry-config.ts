@@ -16,7 +16,7 @@ export interface TelemetryConfig {
  */
 function isVendorEnvironment(): boolean {
   const repository = process.env.GITHUB_REPOSITORY
-  const vendorRepository = 'step-security/trx-parser'
+  const vendorRepository = ''
 
   return repository === vendorRepository
 }
