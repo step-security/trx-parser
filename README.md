@@ -2,8 +2,6 @@
 
 # trx-parser 🧹
 
-> This Action was inspired by https://github.com/zyborg/dotnet-tests-report
-
 [![Build](https://github.com/step-security/trx-parser/workflows/Build/badge.svg?branch=main)](https://github.com/step-security/trx-parser/actions?workflow=Build)
 [![Test](https://github.com/step-security/trx-parser/workflows/Test/badge.svg?branch=main)](https://github.com/step-security/trx-parser/actions?workflow=Test)
 [![GitHub release (latest by date)](https://img.shields.io/github/v/release/step-security/trx-parser)](https://github.com/step-security/trx-parser/releases/latest)
