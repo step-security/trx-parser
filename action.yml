@@ -1,0 +1,31 @@
+name: 'trx-parser'
+description: 'Fast, parallel action to parse .NET TRX test reports and create GitHub status checks'
+author: 'step-security'
+branding:
+  icon: 'info'  
+  color: 'green'
+inputs:
+    TRX_PATH:
+      description: 'Path to the directory containing trx files'
+      required: true
+    REPO_TOKEN:
+      description: 'Pass in the repository token. This should be generally be secrets.GITHUB_TOKEN. This is used for GitHub checks api'
+      required: true
+    IGNORE_FAILURE:
+      description: 'Set to true if you want test failures not to block the pull requests. The check status will be set to neutral'
+      required: false
+      default: 'false'
+    SHA:
+      description: 'SHA value to use. If not set then will be calculated based on context'
+      required: false
+    REPORT_PREFIX:
+      description: 'A string value to use as a prefix on the generated report name. This is useful when you are using this action in multiple workflows and desire unique names'
+      required: false
+outputs:
+  test-outcome:
+    description: 'Test outcome Failed/Passed'
+  trx-files:
+    description: 'list of trx files'
+runs:
+  using: 'node24'
+  main: 'dist/index.js'
