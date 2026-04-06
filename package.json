@@ -37,7 +37,7 @@
   "author": "step-security",
   "license": "MIT",
   "dependencies": {
-    "@actions/core": "^1.11.1",
+    "@actions/core": "^2.0.0",
     "@actions/github": "^6.0.1",
     "@octokit/webhooks-types": "^7.6.1",
     "@opentelemetry/auto-instrumentations-node": "^0.62.0",
