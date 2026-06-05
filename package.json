@@ -1,6 +1,6 @@
 {
   "name": "trx-parser",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "private": true,
   "description": "Fast, parallel GitHub Action to parse .NET test results and create status checks using the GitHub Checks API",
   "main": "lib/main.js",
@@ -47,12 +47,12 @@
     "@opentelemetry/sdk-node": "^0.203.0",
     "@types/he": "^1.1.2",
     "axios": "^1.14.0",
-    "fast-xml-parser": "^5.2.5",
+    "fast-xml-parser": "^5.7.0",
     "he": "^1.2.0"
   },
   "devDependencies": {
     "@types/jest": "^29.5.14",
-    "@types/node": "^20.19.9",
+    "@types/node": "^24.6.1",
     "@typescript-eslint/eslint-plugin": "^8.38.0",
     "@typescript-eslint/parser": "^8.38.0",
     "@vercel/ncc": "^0.38.3",
