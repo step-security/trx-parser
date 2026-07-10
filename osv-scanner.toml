@@ -18,3 +18,19 @@ reason = "undici: WebSocket client exception; action does not use WebSockets"
 [[IgnoredVulns]]
 id = "GHSA-4992-7rv2-5pvq"
 reason = "undici: CRLF injection via upgrade option; not used by @actions/github or @actions/http-client"
+
+[[IgnoredVulns]]
+id = "GHSA-35p6-xmwp-9g52"
+reason = "undici: response queue poisoning on keep-alive connections; action only talks to trusted GitHub API endpoints, not attacker-controlled servers"
+
+[[IgnoredVulns]]
+id = "GHSA-g8m3-5g58-fq7m"
+reason = "undici: permissive SameSite cookie parsing allows SameSite downgrade; action does not parse or forward Set-Cookie headers, uses Octokit REST client"
+
+[[IgnoredVulns]]
+id = "GHSA-p88m-4jfj-68fv"
+reason = "undici: HTTP header injection via cookie percent-decoding; action does not use undici cookie parsing functions (parseSetCookie/parseCookie)"
+
+[[IgnoredVulns]]
+id = "GHSA-vxpw-j846-p89q"
+reason = "undici: WebSocket DoS via unbounded continuation frames; action does not use WebSockets"
