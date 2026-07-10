@@ -7718,8 +7718,6 @@ function defaultFactory (origin, opts) {
 
 class Agent extends DispatcherBase {
   constructor ({ factory = defaultFactory, maxRedirections = 0, connect, ...options } = {}) {
-    super()
-
     if (typeof factory !== 'function') {
       throw new InvalidArgumentError('factory must be a function.')
     }
@@ -7731,6 +7729,8 @@ class Agent extends DispatcherBase {
     if (!Number.isInteger(maxRedirections) || maxRedirections < 0) {
       throw new InvalidArgumentError('maxRedirections must be a positive number')
     }
+
+    super(options)
 
     if (connect && typeof connect !== 'function') {
       connect = { ...connect }
@@ -8105,6 +8105,9 @@ const EMPTY_BUF = Buffer.alloc(0)
 const FastBuffer = Buffer[Symbol.species]
 const addListener = util.addListener
 const removeAllListeners = util.removeAllListeners
+const kIdleSocketValidation = Symbol('kIdleSocketValidation')
+const kIdleSocketValidationTimeout = Symbol('kIdleSocketValidationTimeout')
+const kSocketUsed = Symbol('kSocketUsed')
 
 let extractBody
 
@@ -8327,27 +8330,69 @@ class Parser {
 
       const offset = llhttp.llhttp_get_error_pos(this.ptr) - currentBufferPtr
 
-      if (ret === constants.ERROR.PAUSED_UPGRADE) {
-        this.onUpgrade(data.slice(offset))
-      } else if (ret === constants.ERROR.PAUSED) {
-        this.paused = true
-        socket.unshift(data.slice(offset))
-      } else if (ret !== constants.ERROR.OK) {
-        const ptr = llhttp.llhttp_get_error_reason(this.ptr)
-        let message = ''
-        /* istanbul ignore else: difficult to make a test case for */
-        if (ptr) {
-          const len = new Uint8Array(llhttp.memory.buffer, ptr).indexOf(0)
-          message =
-            'Response does not match the HTTP/1.1 protocol (' +
-            Buffer.from(llhttp.memory.buffer, ptr, len).toString() +
-            ')'
+      if (ret !== constants.ERROR.OK) {
+        const body = data.subarray(offset)
+
+        if (ret === constants.ERROR.PAUSED_UPGRADE) {
+          this.onUpgrade(body)
+        } else if (ret === constants.ERROR.PAUSED) {
+          this.paused = true
+          socket.unshift(body)
+        } else {
+          throw this.createError(ret, body)
         }
-        throw new HTTPParserError(message, constants.ERROR[ret], data.slice(offset))
       }
     } catch (err) {
       util.destroy(socket, err)
     }
+  }
+
+  finish () {
+    assert(currentParser === null)
+    assert(this.ptr != null)
+    assert(!this.paused)
+
+    const { llhttp } = this
+
+    let ret
+
+    try {
+      currentParser = this
+      ret = llhttp.llhttp_finish(this.ptr)
+    } finally {
+      currentParser = null
+    }
+
+    if (ret === constants.ERROR.OK) {
+      return null
+    }
+
+    if (ret === constants.ERROR.PAUSED || ret === constants.ERROR.PAUSED_UPGRADE) {
+      this.paused = true
+      return null
+    }
+
+    return this.createError(ret, EMPTY_BUF)
+  }
+
+  createError (ret, data) {
+    const { llhttp, contentLength, bytesRead } = this
+
+    if (contentLength && bytesRead !== parseInt(contentLength, 10)) {
+      return new ResponseContentLengthMismatchError()
+    }
+
+    const ptr = llhttp.llhttp_get_error_reason(this.ptr)
+    let message = ''
+    if (ptr) {
+      const len = new Uint8Array(llhttp.memory.buffer, ptr).indexOf(0)
+      message =
+        'Response does not match the HTTP/1.1 protocol (' +
+        Buffer.from(llhttp.memory.buffer, ptr, len).toString() +
+        ')'
+    }
+
+    return new HTTPParserError(message, constants.ERROR[ret], data)
   }
 
   destroy () {
@@ -8374,6 +8419,11 @@ class Parser {
 
     /* istanbul ignore next: difficult to make a test case for */
     if (socket.destroyed) {
+      return -1
+    }
+
+    if (client[kRunning] === 0) {
+      util.destroy(socket, new SocketError('bad response', util.getSocketInfo(socket)))
       return -1
     }
 
@@ -8477,6 +8527,11 @@ class Parser {
 
     /* istanbul ignore next: difficult to make a test case for */
     if (socket.destroyed) {
+      return -1
+    }
+
+    if (client[kRunning] === 0) {
+      util.destroy(socket, new SocketError('bad response', util.getSocketInfo(socket)))
       return -1
     }
 
@@ -8653,6 +8708,7 @@ class Parser {
     request.onComplete(headers)
 
     client[kQueue][client[kRunningIdx]++] = null
+    socket[kSocketUsed] = true
 
     if (socket[kWriting]) {
       assert(client[kRunning] === 0)
@@ -8711,6 +8767,9 @@ async function connectH1 (client, socket) {
   socket[kWriting] = false
   socket[kReset] = false
   socket[kBlocking] = false
+  socket[kIdleSocketValidation] = 0
+  socket[kIdleSocketValidationTimeout] = null
+  socket[kSocketUsed] = false
   socket[kParser] = new Parser(client, socket, llhttpInstance)
 
   addListener(socket, 'error', function (err) {
@@ -8721,8 +8780,11 @@ async function connectH1 (client, socket) {
     // On Mac OS, we get an ECONNRESET even if there is a full body to be forwarded
     // to the user.
     if (err.code === 'ECONNRESET' && parser.statusCode && !parser.shouldKeepAlive) {
-      // We treat all incoming data so for as a valid response.
-      parser.onMessageComplete()
+      const parserErr = parser.finish()
+      if (parserErr) {
+        this[kError] = parserErr
+        this[kClient][kOnError](parserErr)
+      }
       return
     }
 
@@ -8741,8 +8803,10 @@ async function connectH1 (client, socket) {
     const parser = this[kParser]
 
     if (parser.statusCode && !parser.shouldKeepAlive) {
-      // We treat all incoming data so far as a valid response.
-      parser.onMessageComplete()
+      const parserErr = parser.finish()
+      if (parserErr) {
+        util.destroy(this, parserErr)
+      }
       return
     }
 
@@ -8752,10 +8816,11 @@ async function connectH1 (client, socket) {
     const client = this[kClient]
     const parser = this[kParser]
 
+    clearIdleSocketValidation(this)
+
     if (parser) {
       if (!this[kError] && parser.statusCode && !parser.shouldKeepAlive) {
-        // We treat all incoming data so far as a valid response.
-        parser.onMessageComplete()
+        this[kError] = parser.finish() || this[kError]
       }
 
       this[kParser].destroy()
@@ -8818,7 +8883,7 @@ async function connectH1 (client, socket) {
       return socket.destroyed
     },
     busy (request) {
-      if (socket[kWriting] || socket[kReset] || socket[kBlocking]) {
+      if (socket[kWriting] || socket[kReset] || socket[kBlocking] || socket[kIdleSocketValidation] === 1) {
         return true
       }
 
@@ -8856,6 +8921,31 @@ async function connectH1 (client, socket) {
   }
 }
 
+function clearIdleSocketValidation (socket) {
+  if (socket[kIdleSocketValidationTimeout]) {
+    clearTimeout(socket[kIdleSocketValidationTimeout])
+    socket[kIdleSocketValidationTimeout] = null
+  }
+
+  socket[kIdleSocketValidation] = 0
+}
+
+function scheduleIdleSocketValidation (client, socket) {
+  socket[kIdleSocketValidation] = 1
+  socket[kIdleSocketValidationTimeout] = setTimeout(() => {
+    socket[kIdleSocketValidationTimeout] = null
+    socket[kIdleSocketValidation] = 2
+
+    if (client[kSocket] === socket && !socket.destroyed) {
+      client[kResume]()
+    }
+  }, 0)
+  socket[kIdleSocketValidationTimeout].unref?.()
+}
+
+/**
+ * @param {import('./client.js')} client
+ */
 function resumeH1 (client) {
   const socket = client[kSocket]
 
@@ -8868,6 +8958,32 @@ function resumeH1 (client) {
     } else if (socket[kNoRef] && socket.ref) {
       socket.ref()
       socket[kNoRef] = false
+    }
+
+    if (client[kRunning] === 0 && client[kPending] > 0 && socket[kSocketUsed]) {
+      if (socket[kIdleSocketValidation] === 0) {
+        scheduleIdleSocketValidation(client, socket)
+        socket[kParser].readMore()
+        if (socket.destroyed) {
+          return
+        }
+        return
+      }
+
+      if (socket[kIdleSocketValidation] === 1) {
+        socket[kParser].readMore()
+        if (socket.destroyed) {
+          return
+        }
+        return
+      }
+    }
+
+    if (client[kRunning] === 0) {
+      socket[kParser].readMore()
+      if (socket.destroyed) {
+        return
+      }
     }
 
     if (client[kSize] === 0) {
@@ -8963,6 +9079,7 @@ function writeH1 (client, request) {
   }
 
   const socket = client[kSocket]
+  clearIdleSocketValidation(socket)
 
   const abort = (err) => {
     if (request.aborted || request.completed) {
@@ -10284,9 +10401,10 @@ class Client extends DispatcherBase {
     autoSelectFamilyAttemptTimeout,
     // h2
     maxConcurrentStreams,
-    allowH2
+    allowH2,
+    webSocket
   } = {}) {
-    super()
+    super({ webSocket })
 
     if (keepAlive !== undefined) {
       throw new InvalidArgumentError('unsupported keepAlive, use pipelining=0 instead')
@@ -10819,15 +10937,24 @@ const { kDestroy, kClose, kClosed, kDestroyed, kDispatch, kInterceptors } = __nc
 const kOnDestroyed = Symbol('onDestroyed')
 const kOnClosed = Symbol('onClosed')
 const kInterceptedDispatch = Symbol('Intercepted Dispatch')
+const kWebSocketOptions = Symbol('webSocketOptions')
 
 class DispatcherBase extends Dispatcher {
-  constructor () {
+  constructor (opts) {
     super()
 
     this[kDestroyed] = false
     this[kOnDestroyed] = null
     this[kClosed] = false
     this[kOnClosed] = []
+    this[kWebSocketOptions] = opts?.webSocket ?? {}
+  }
+
+  get webSocketOptions () {
+    return {
+      maxFragments: this[kWebSocketOptions].maxFragments ?? 131072,
+      maxPayloadSize: this[kWebSocketOptions].maxPayloadSize ?? 128 * 1024 * 1024
+    }
   }
 
   get destroyed () {
@@ -11391,8 +11518,8 @@ const kRemoveClient = Symbol('remove client')
 const kStats = Symbol('stats')
 
 class PoolBase extends DispatcherBase {
-  constructor () {
-    super()
+  constructor (opts) {
+    super(opts)
 
     this[kQueue] = new FixedQueue()
     this[kClients] = []
@@ -11652,8 +11779,6 @@ class Pool extends PoolBase {
     allowH2,
     ...options
   } = {}) {
-    super()
-
     if (connections != null && (!Number.isFinite(connections) || connections < 0)) {
       throw new InvalidArgumentError('invalid connections')
     }
@@ -11677,6 +11802,8 @@ class Pool extends PoolBase {
         ...connect
       })
     }
+
+    super(options)
 
     this[kInterceptors] = options.interceptors?.Pool && Array.isArray(options.interceptors.Pool)
       ? options.interceptors.Pool
@@ -16762,32 +16889,25 @@ function parseUnparsedAttributes (unparsedAttributes, cookieAttributeList = {}) 
     // If the attribute-name case-insensitively matches the string
     // "SameSite", the user agent MUST process the cookie-av as follows:
 
-    // 1. Let enforcement be "Default".
-    let enforcement = 'Default'
-
     const attributeValueLowercase = attributeValue.toLowerCase()
-    // 2. If cookie-av's attribute-value is a case-insensitive match for
-    //    "None", set enforcement to "None".
-    if (attributeValueLowercase.includes('none')) {
-      enforcement = 'None'
-    }
 
-    // 3. If cookie-av's attribute-value is a case-insensitive match for
-    //    "Strict", set enforcement to "Strict".
-    if (attributeValueLowercase.includes('strict')) {
-      enforcement = 'Strict'
+    // 1. If cookie-av's attribute-value is a case-insensitive match for
+    //    "None", append an attribute to the cookie-attribute-list with an
+    //    attribute-name of "SameSite" and an attribute-value of "None".
+    if (attributeValueLowercase === 'none') {
+      cookieAttributeList.sameSite = 'None'
+    } else if (attributeValueLowercase === 'strict') {
+      // 2. If cookie-av's attribute-value is a case-insensitive match for
+      //    "Strict", append an attribute to the cookie-attribute-list with
+      //    an attribute-name of "SameSite" and an attribute-value of
+      //    "Strict".
+      cookieAttributeList.sameSite = 'Strict'
+    } else if (attributeValueLowercase === 'lax') {
+      // 3. If cookie-av's attribute-value is a case-insensitive match for
+      //    "Lax", append an attribute to the cookie-attribute-list with an
+      //    attribute-name of "SameSite" and an attribute-value of "Lax".
+      cookieAttributeList.sameSite = 'Lax'
     }
-
-    // 4. If cookie-av's attribute-value is a case-insensitive match for
-    //    "Lax", set enforcement to "Lax".
-    if (attributeValueLowercase.includes('lax')) {
-      enforcement = 'Lax'
-    }
-
-    // 5. Append an attribute to the cookie-attribute-list with an
-    //    attribute-name of "SameSite" and an attribute-value of
-    //    enforcement.
-    cookieAttributeList.sameSite = enforcement
   } else {
     cookieAttributeList.unparsed ??= []
 
@@ -29493,40 +29613,35 @@ const tail = Buffer.from([0x00, 0x00, 0xff, 0xff])
 const kBuffer = Symbol('kBuffer')
 const kLength = Symbol('kLength')
 
-// Default maximum decompressed message size: 4 MB
-const kDefaultMaxDecompressedSize = 4 * 1024 * 1024
-
 class PerMessageDeflate {
   /** @type {import('node:zlib').InflateRaw} */
   #inflate
 
   #options = {}
 
-  /** @type {boolean} */
-  #aborted = false
-
-  /** @type {Function|null} */
-  #currentCallback = null
+  #maxPayloadSize = 0
 
   /**
    * @param {Map<string, string>} extensions
    */
-  constructor (extensions) {
+  constructor (extensions, options) {
     this.#options.serverNoContextTakeover = extensions.has('server_no_context_takeover')
     this.#options.serverMaxWindowBits = extensions.get('server_max_window_bits')
+
+    this.#maxPayloadSize = options.maxPayloadSize
   }
 
+  /**
+   * Decompress a compressed payload.
+   * @param {Buffer} chunk Compressed data
+   * @param {boolean} fin Final fragment flag
+   * @param {Function} callback Callback function
+   */
   decompress (chunk, fin, callback) {
     // An endpoint uses the following algorithm to decompress a message.
     // 1.  Append 4 octets of 0x00 0x00 0xff 0xff to the tail end of the
     //     payload of the message.
     // 2.  Decompress the resulting data using DEFLATE.
-
-    if (this.#aborted) {
-      callback(new MessageSizeExceededError())
-      return
-    }
-
     if (!this.#inflate) {
       let windowBits = Z_DEFAULT_WINDOWBITS
 
@@ -29549,23 +29664,12 @@ class PerMessageDeflate {
       this.#inflate[kLength] = 0
 
       this.#inflate.on('data', (data) => {
-        if (this.#aborted) {
-          return
-        }
-
         this.#inflate[kLength] += data.length
 
-        if (this.#inflate[kLength] > kDefaultMaxDecompressedSize) {
-          this.#aborted = true
+        if (this.#maxPayloadSize > 0 && this.#inflate[kLength] > this.#maxPayloadSize) {
+          callback(new MessageSizeExceededError())
           this.#inflate.removeAllListeners()
-          this.#inflate.destroy()
           this.#inflate = null
-
-          if (this.#currentCallback) {
-            const cb = this.#currentCallback
-            this.#currentCallback = null
-            cb(new MessageSizeExceededError())
-          }
           return
         }
 
@@ -29578,14 +29682,13 @@ class PerMessageDeflate {
       })
     }
 
-    this.#currentCallback = callback
     this.#inflate.write(chunk)
     if (fin) {
       this.#inflate.write(tail)
     }
 
     this.#inflate.flush(() => {
-      if (this.#aborted || !this.#inflate) {
+      if (!this.#inflate) {
         return
       }
 
@@ -29593,7 +29696,6 @@ class PerMessageDeflate {
 
       this.#inflate[kBuffer].length = 0
       this.#inflate[kLength] = 0
-      this.#currentCallback = null
 
       callback(null, full)
     })
@@ -29629,6 +29731,12 @@ const {
 const { WebsocketFrameSend } = __nccwpck_require__(29879)
 const { closeWebSocketConnection } = __nccwpck_require__(60896)
 const { PerMessageDeflate } = __nccwpck_require__(10908)
+const { MessageSizeExceededError } = __nccwpck_require__(68480)
+
+function failWebsocketConnectionWithCode (ws, code, reason) {
+  closeWebSocketConnection(ws, code, reason, Buffer.byteLength(reason))
+  failWebsocketConnection(ws, reason)
+}
 
 // This code was influenced by ws released under the MIT license.
 // Copyright (c) 2011 Einar Otto Stangvik <einaros@gmail.com>
@@ -29637,6 +29745,7 @@ const { PerMessageDeflate } = __nccwpck_require__(10908)
 
 class ByteParser extends Writable {
   #buffers = []
+  #fragmentsBytes = 0
   #byteOffset = 0
   #loop = false
 
@@ -29648,18 +29757,27 @@ class ByteParser extends Writable {
   /** @type {Map<string, PerMessageDeflate>} */
   #extensions
 
+  /** @type {number} */
+  #maxFragments
+
+  /** @type {number} */
+  #maxPayloadSize
+
   /**
    * @param {import('./websocket').WebSocket} ws
    * @param {Map<string, string>|null} extensions
+   * @param {{ maxFragments?: number, maxPayloadSize?: number }} [options]
    */
-  constructor (ws, extensions) {
+  constructor (ws, extensions, options = {}) {
     super()
 
     this.ws = ws
     this.#extensions = extensions == null ? new Map() : extensions
+    this.#maxFragments = options.maxFragments ?? 0
+    this.#maxPayloadSize = options.maxPayloadSize ?? 0
 
     if (this.#extensions.has('permessage-deflate')) {
-      this.#extensions.set('permessage-deflate', new PerMessageDeflate(extensions))
+      this.#extensions.set('permessage-deflate', new PerMessageDeflate(extensions, options))
     }
   }
 
@@ -29673,6 +29791,19 @@ class ByteParser extends Writable {
     this.#loop = true
 
     this.run(callback)
+  }
+
+  #validatePayloadLength () {
+    if (
+      this.#maxPayloadSize > 0 &&
+      !isControlFrame(this.#info.opcode) &&
+      this.#info.payloadLength + this.#fragmentsBytes > this.#maxPayloadSize
+    ) {
+      failWebsocketConnectionWithCode(this.ws, 1009, 'Payload size exceeds maximum allowed size')
+      return false
+    }
+
+    return true
   }
 
   /**
@@ -29763,6 +29894,10 @@ class ByteParser extends Writable {
         if (payloadLength <= 125) {
           this.#info.payloadLength = payloadLength
           this.#state = parserStates.READ_DATA
+
+          if (!this.#validatePayloadLength()) {
+            return
+          }
         } else if (payloadLength === 126) {
           this.#state = parserStates.PAYLOADLENGTH_16
         } else if (payloadLength === 127) {
@@ -29787,6 +29922,10 @@ class ByteParser extends Writable {
 
         this.#info.payloadLength = buffer.readUInt16BE(0)
         this.#state = parserStates.READ_DATA
+
+        if (!this.#validatePayloadLength()) {
+          return
+        }
       } else if (this.#state === parserStates.PAYLOADLENGTH_64) {
         if (this.#byteOffset < 8) {
           return callback()
@@ -29809,6 +29948,10 @@ class ByteParser extends Writable {
 
         this.#info.payloadLength = lower
         this.#state = parserStates.READ_DATA
+
+        if (!this.#validatePayloadLength()) {
+          return
+        }
       } else if (this.#state === parserStates.READ_DATA) {
         if (this.#byteOffset < this.#info.payloadLength) {
           return callback()
@@ -29821,42 +29964,58 @@ class ByteParser extends Writable {
           this.#state = parserStates.INFO
         } else {
           if (!this.#info.compressed) {
-            this.#fragments.push(body)
+            if (!this.writeFragments(body)) {
+              return
+            }
+
+            if (this.#maxPayloadSize > 0 && this.#fragmentsBytes > this.#maxPayloadSize) {
+              failWebsocketConnectionWithCode(this.ws, 1009, new MessageSizeExceededError().message)
+              return
+            }
 
             // If the frame is not fragmented, a message has been received.
             // If the frame is fragmented, it will terminate with a fin bit set
             // and an opcode of 0 (continuation), therefore we handle that when
             // parsing continuation frames, not here.
             if (!this.#info.fragmented && this.#info.fin) {
-              const fullMessage = Buffer.concat(this.#fragments)
-              websocketMessageReceived(this.ws, this.#info.binaryType, fullMessage)
-              this.#fragments.length = 0
+              websocketMessageReceived(this.ws, this.#info.binaryType, this.consumeFragments())
             }
 
             this.#state = parserStates.INFO
           } else {
-            this.#extensions.get('permessage-deflate').decompress(body, this.#info.fin, (error, data) => {
-              if (error) {
-                failWebsocketConnection(this.ws, error.message)
-                return
-              }
+            this.#extensions.get('permessage-deflate').decompress(
+              body,
+              this.#info.fin,
+              (error, data) => {
+                if (error) {
+                  const code = error instanceof MessageSizeExceededError ? 1009 : 1007
+                  failWebsocketConnectionWithCode(this.ws, code, error.message)
+                  return
+                }
 
-              this.#fragments.push(data)
+                if (!this.writeFragments(data)) {
+                  return
+                }
 
-              if (!this.#info.fin) {
-                this.#state = parserStates.INFO
+                if (this.#maxPayloadSize > 0 && this.#fragmentsBytes > this.#maxPayloadSize) {
+                  failWebsocketConnectionWithCode(this.ws, 1009, new MessageSizeExceededError().message)
+                  return
+                }
+
+                if (!this.#info.fin) {
+                  this.#state = parserStates.INFO
+                  this.#loop = true
+                  this.run(callback)
+                  return
+                }
+
+                websocketMessageReceived(this.ws, this.#info.binaryType, this.consumeFragments())
+
                 this.#loop = true
+                this.#state = parserStates.INFO
                 this.run(callback)
-                return
               }
-
-              websocketMessageReceived(this.ws, this.#info.binaryType, Buffer.concat(this.#fragments))
-
-              this.#loop = true
-              this.#state = parserStates.INFO
-              this.#fragments.length = 0
-              this.run(callback)
-            })
+            )
 
             this.#loop = false
             break
@@ -29906,6 +30065,35 @@ class ByteParser extends Writable {
     this.#byteOffset -= n
 
     return buffer
+  }
+
+  writeFragments (fragment) {
+    if (
+      this.#maxFragments > 0 &&
+      this.#fragments.length === this.#maxFragments
+    ) {
+      failWebsocketConnectionWithCode(this.ws, 1008, 'Too many message fragments')
+      return false
+    }
+
+    this.#fragmentsBytes += fragment.length
+    this.#fragments.push(fragment)
+    return true
+  }
+
+  consumeFragments () {
+    const fragments = this.#fragments
+
+    if (fragments.length === 1) {
+      this.#fragmentsBytes = 0
+      return fragments.shift()
+    }
+
+    const output = Buffer.concat(fragments, this.#fragmentsBytes)
+    this.#fragments = []
+    this.#fragmentsBytes = 0
+
+    return output
   }
 
   parseCloseBody (data) {
@@ -30943,7 +31131,14 @@ class WebSocket extends EventTarget {
     // once this happens, the connection is open
     this[kResponse] = response
 
-    const parser = new ByteParser(this, parsedExtensions)
+    const webSocketOptions = this[kController]?.dispatcher?.webSocketOptions
+    const maxFragments = webSocketOptions?.maxFragments
+    const maxPayloadSize = webSocketOptions?.maxPayloadSize
+
+    const parser = new ByteParser(this, parsedExtensions, {
+      maxFragments,
+      maxPayloadSize
+    })
     parser.on('drain', onParserDrain)
     parser.on('error', onParserError.bind(this))
 
@@ -33814,7 +34009,7 @@ class EmptyCallCredentials extends CallCredentials {
 /***/ }),
 
 /***/ 61803:
-/***/ ((__unused_webpack_module, exports) => {
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 "use strict";
 
@@ -33836,7 +34031,23 @@ class EmptyCallCredentials extends CallCredentials {
  */
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.InterceptingListenerImpl = void 0;
+exports.statusOrFromValue = statusOrFromValue;
+exports.statusOrFromError = statusOrFromError;
 exports.isInterceptingListener = isInterceptingListener;
+const metadata_1 = __nccwpck_require__(36100);
+function statusOrFromValue(value) {
+    return {
+        ok: true,
+        value: value
+    };
+}
+function statusOrFromError(error) {
+    var _a;
+    return {
+        ok: false,
+        error: Object.assign(Object.assign({}, error), { metadata: (_a = error.metadata) !== null && _a !== void 0 ? _a : new metadata_1.Metadata() })
+    };
+}
 function isInterceptingListener(listener) {
     return (listener.onReceiveMetadata !== undefined &&
         listener.onReceiveMetadata.length === 1);
@@ -33986,6 +34197,10 @@ class ClientUnaryCallImpl extends events_1.EventEmitter {
         var _a, _b;
         return (_b = (_a = this.call) === null || _a === void 0 ? void 0 : _a.getPeer()) !== null && _b !== void 0 ? _b : 'unknown';
     }
+    getAuthContext() {
+        var _a, _b;
+        return (_b = (_a = this.call) === null || _a === void 0 ? void 0 : _a.getAuthContext()) !== null && _b !== void 0 ? _b : null;
+    }
 }
 exports.ClientUnaryCallImpl = ClientUnaryCallImpl;
 class ClientReadableStreamImpl extends stream_1.Readable {
@@ -34000,6 +34215,10 @@ class ClientReadableStreamImpl extends stream_1.Readable {
     getPeer() {
         var _a, _b;
         return (_b = (_a = this.call) === null || _a === void 0 ? void 0 : _a.getPeer()) !== null && _b !== void 0 ? _b : 'unknown';
+    }
+    getAuthContext() {
+        var _a, _b;
+        return (_b = (_a = this.call) === null || _a === void 0 ? void 0 : _a.getAuthContext()) !== null && _b !== void 0 ? _b : null;
     }
     _read(_size) {
         var _a;
@@ -34019,6 +34238,10 @@ class ClientWritableStreamImpl extends stream_1.Writable {
     getPeer() {
         var _a, _b;
         return (_b = (_a = this.call) === null || _a === void 0 ? void 0 : _a.getPeer()) !== null && _b !== void 0 ? _b : 'unknown';
+    }
+    getAuthContext() {
+        var _a, _b;
+        return (_b = (_a = this.call) === null || _a === void 0 ? void 0 : _a.getAuthContext()) !== null && _b !== void 0 ? _b : null;
     }
     _write(chunk, encoding, cb) {
         var _a;
@@ -34051,6 +34274,10 @@ class ClientDuplexStreamImpl extends stream_1.Duplex {
     getPeer() {
         var _a, _b;
         return (_b = (_a = this.call) === null || _a === void 0 ? void 0 : _a.getPeer()) !== null && _b !== void 0 ? _b : 'unknown';
+    }
+    getAuthContext() {
+        var _a, _b;
+        return (_b = (_a = this.call) === null || _a === void 0 ? void 0 : _a.getAuthContext()) !== null && _b !== void 0 ? _b : null;
     }
     _read(_size) {
         var _a;
@@ -34721,6 +34948,7 @@ exports.recognizedOptions = {
     'grpc.lb.ring_hash.ring_size_cap': true,
     'grpc-node.retry_max_attempts_limit': true,
     'grpc-node.flow_control_window': true,
+    'grpc.server_call_metric_recording': true
 };
 function channelOptionsEqual(options1, options2) {
     const keys1 = Object.keys(options1).sort();
@@ -35669,6 +35897,9 @@ class InterceptingCall {
             }
         });
     }
+    getAuthContext() {
+        return this.nextCall.getAuthContext();
+    }
 }
 exports.InterceptingCall = InterceptingCall;
 function getCall(channel, path, options) {
@@ -35758,6 +35989,9 @@ class BaseInterceptingCall {
     }
     halfClose() {
         this.call.halfClose();
+    }
+    getAuthContext() {
+        return this.call.getAuthContext();
     }
 }
 /**
@@ -36429,6 +36663,12 @@ class DeflateHandler extends CompressionHandler {
             let totalLength = 0;
             const messageParts = [];
             const decompresser = zlib.createInflate();
+            decompresser.on('error', (error) => {
+                reject({
+                    code: constants_1.Status.INTERNAL,
+                    details: 'Failed to decompress deflate-encoded message'
+                });
+            });
             decompresser.on('data', (chunk) => {
                 messageParts.push(chunk);
                 totalLength += chunk.byteLength;
@@ -36470,6 +36710,12 @@ class GzipHandler extends CompressionHandler {
             let totalLength = 0;
             const messageParts = [];
             const decompresser = zlib.createGunzip();
+            decompresser.on('error', (error) => {
+                reject({
+                    code: constants_1.Status.INTERNAL,
+                    details: 'Failed to decompress gzip-encoded message'
+                });
+            });
             decompresser.on('data', (chunk) => {
                 messageParts.push(chunk);
                 totalLength += chunk.byteLength;
@@ -36923,10 +37169,19 @@ function formatDateDifference(startDate, endDate) {
  *
  */
 Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.durationMessageToDuration = durationMessageToDuration;
 exports.msToDuration = msToDuration;
 exports.durationToMs = durationToMs;
 exports.isDuration = isDuration;
+exports.isDurationMessage = isDurationMessage;
 exports.parseDuration = parseDuration;
+exports.durationToString = durationToString;
+function durationMessageToDuration(message) {
+    return {
+        seconds: Number.parseInt(message.seconds),
+        nanos: message.nanos
+    };
+}
 function msToDuration(millis) {
     return {
         seconds: (millis / 1000) | 0,
@@ -36939,6 +37194,9 @@ function durationToMs(duration) {
 function isDuration(value) {
     return typeof value.seconds === 'number' && typeof value.nanos === 'number';
 }
+function isDurationMessage(value) {
+    return typeof value.seconds === 'string' && typeof value.nanos === 'number';
+}
 const durationRegex = /^(\d+)(?:\.(\d+))?s$/;
 function parseDuration(value) {
     const match = value.match(durationRegex);
@@ -36949,6 +37207,22 @@ function parseDuration(value) {
         seconds: Number.parseInt(match[1], 10),
         nanos: match[2] ? Number.parseInt(match[2].padEnd(9, '0'), 10) : 0
     };
+}
+function durationToString(duration) {
+    if (duration.nanos === 0) {
+        return `${duration.seconds}s`;
+    }
+    let scaleFactor;
+    if (duration.nanos % 1000000 === 0) {
+        scaleFactor = 1000000;
+    }
+    else if (duration.nanos % 1000 === 0) {
+        scaleFactor = 1000;
+    }
+    else {
+        scaleFactor = 1;
+    }
+    return `${duration.seconds}.${duration.nanos / scaleFactor}s`;
 }
 //# sourceMappingURL=duration.js.map
 
@@ -37036,13 +37310,14 @@ function getErrorCode(error) {
 "use strict";
 
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.SUBCHANNEL_ARGS_EXCLUDE_KEY_PREFIX = exports.createCertificateProviderChannelCredentials = exports.FileWatcherCertificateProvider = exports.createCertificateProviderServerCredentials = exports.createServerCredentialsWithInterceptors = exports.BaseSubchannelWrapper = exports.registerAdminService = exports.FilterStackFactory = exports.BaseFilter = exports.PickResultType = exports.QueuePicker = exports.UnavailablePicker = exports.ChildLoadBalancerHandler = exports.EndpointMap = exports.endpointHasAddress = exports.endpointToString = exports.subchannelAddressToString = exports.LeafLoadBalancer = exports.isLoadBalancerNameRegistered = exports.parseLoadBalancingConfig = exports.selectLbConfigFromList = exports.registerLoadBalancerType = exports.createChildChannelControlHelper = exports.BackoffTimeout = exports.parseDuration = exports.durationToMs = exports.splitHostPort = exports.uriToString = exports.createResolver = exports.registerResolver = exports.log = exports.trace = void 0;
+exports.SUBCHANNEL_ARGS_EXCLUDE_KEY_PREFIX = exports.createCertificateProviderChannelCredentials = exports.FileWatcherCertificateProvider = exports.createCertificateProviderServerCredentials = exports.createServerCredentialsWithInterceptors = exports.BaseSubchannelWrapper = exports.registerAdminService = exports.FilterStackFactory = exports.BaseFilter = exports.statusOrFromError = exports.statusOrFromValue = exports.PickResultType = exports.QueuePicker = exports.UnavailablePicker = exports.ChildLoadBalancerHandler = exports.EndpointMap = exports.endpointHasAddress = exports.endpointToString = exports.subchannelAddressToString = exports.LeafLoadBalancer = exports.isLoadBalancerNameRegistered = exports.parseLoadBalancingConfig = exports.selectLbConfigFromList = exports.registerLoadBalancerType = exports.createChildChannelControlHelper = exports.BackoffTimeout = exports.parseDuration = exports.durationToMs = exports.splitHostPort = exports.uriToString = exports.CHANNEL_ARGS_CONFIG_SELECTOR_KEY = exports.createResolver = exports.registerResolver = exports.log = exports.trace = void 0;
 var logging_1 = __nccwpck_require__(8536);
 Object.defineProperty(exports, "trace", ({ enumerable: true, get: function () { return logging_1.trace; } }));
 Object.defineProperty(exports, "log", ({ enumerable: true, get: function () { return logging_1.log; } }));
 var resolver_1 = __nccwpck_require__(76255);
 Object.defineProperty(exports, "registerResolver", ({ enumerable: true, get: function () { return resolver_1.registerResolver; } }));
 Object.defineProperty(exports, "createResolver", ({ enumerable: true, get: function () { return resolver_1.createResolver; } }));
+Object.defineProperty(exports, "CHANNEL_ARGS_CONFIG_SELECTOR_KEY", ({ enumerable: true, get: function () { return resolver_1.CHANNEL_ARGS_CONFIG_SELECTOR_KEY; } }));
 var uri_parser_1 = __nccwpck_require__(56027);
 Object.defineProperty(exports, "uriToString", ({ enumerable: true, get: function () { return uri_parser_1.uriToString; } }));
 Object.defineProperty(exports, "splitHostPort", ({ enumerable: true, get: function () { return uri_parser_1.splitHostPort; } }));
@@ -37070,6 +37345,9 @@ var picker_1 = __nccwpck_require__(71663);
 Object.defineProperty(exports, "UnavailablePicker", ({ enumerable: true, get: function () { return picker_1.UnavailablePicker; } }));
 Object.defineProperty(exports, "QueuePicker", ({ enumerable: true, get: function () { return picker_1.QueuePicker; } }));
 Object.defineProperty(exports, "PickResultType", ({ enumerable: true, get: function () { return picker_1.PickResultType; } }));
+var call_interface_1 = __nccwpck_require__(61803);
+Object.defineProperty(exports, "statusOrFromValue", ({ enumerable: true, get: function () { return call_interface_1.statusOrFromValue; } }));
+Object.defineProperty(exports, "statusOrFromError", ({ enumerable: true, get: function () { return call_interface_1.statusOrFromError; } }));
 var filter_1 = __nccwpck_require__(81467);
 Object.defineProperty(exports, "BaseFilter", ({ enumerable: true, get: function () { return filter_1.BaseFilter; } }));
 var filter_stack_1 = __nccwpck_require__(95726);
@@ -37528,7 +37806,7 @@ function getProxiedConnection(address, channelOptions) {
  *
  */
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.experimental = exports.ServerInterceptingCall = exports.ResponderBuilder = exports.ServerListenerBuilder = exports.addAdminServicesToServer = exports.getChannelzHandlers = exports.getChannelzServiceDefinition = exports.InterceptorConfigurationError = exports.InterceptingCall = exports.RequesterBuilder = exports.ListenerBuilder = exports.StatusBuilder = exports.getClientChannel = exports.ServerCredentials = exports.Server = exports.setLogVerbosity = exports.setLogger = exports.load = exports.loadObject = exports.CallCredentials = exports.ChannelCredentials = exports.waitForClientReady = exports.closeClient = exports.Channel = exports.makeGenericClientConstructor = exports.makeClientConstructor = exports.loadPackageDefinition = exports.Client = exports.compressionAlgorithms = exports.propagate = exports.connectivityState = exports.status = exports.logVerbosity = exports.Metadata = exports.credentials = void 0;
+exports.experimental = exports.ServerMetricRecorder = exports.ServerInterceptingCall = exports.ResponderBuilder = exports.ServerListenerBuilder = exports.addAdminServicesToServer = exports.getChannelzHandlers = exports.getChannelzServiceDefinition = exports.InterceptorConfigurationError = exports.InterceptingCall = exports.RequesterBuilder = exports.ListenerBuilder = exports.StatusBuilder = exports.getClientChannel = exports.ServerCredentials = exports.Server = exports.setLogVerbosity = exports.setLogger = exports.load = exports.loadObject = exports.CallCredentials = exports.ChannelCredentials = exports.waitForClientReady = exports.closeClient = exports.Channel = exports.makeGenericClientConstructor = exports.makeClientConstructor = exports.loadPackageDefinition = exports.Client = exports.compressionAlgorithms = exports.propagate = exports.connectivityState = exports.status = exports.logVerbosity = exports.Metadata = exports.credentials = void 0;
 const call_credentials_1 = __nccwpck_require__(79190);
 Object.defineProperty(exports, "CallCredentials", ({ enumerable: true, get: function () { return call_credentials_1.CallCredentials; } }));
 const channel_1 = __nccwpck_require__(86918);
@@ -37635,6 +37913,8 @@ var server_interceptors_1 = __nccwpck_require__(42151);
 Object.defineProperty(exports, "ServerListenerBuilder", ({ enumerable: true, get: function () { return server_interceptors_1.ServerListenerBuilder; } }));
 Object.defineProperty(exports, "ResponderBuilder", ({ enumerable: true, get: function () { return server_interceptors_1.ResponderBuilder; } }));
 Object.defineProperty(exports, "ServerInterceptingCall", ({ enumerable: true, get: function () { return server_interceptors_1.ServerInterceptingCall; } }));
+var orca_1 = __nccwpck_require__(82124);
+Object.defineProperty(exports, "ServerMetricRecorder", ({ enumerable: true, get: function () { return orca_1.ServerMetricRecorder; } }));
 const experimental = __nccwpck_require__(20079);
 exports.experimental = experimental;
 const resolver_dns = __nccwpck_require__(51149);
@@ -37643,6 +37923,7 @@ const resolver_ip = __nccwpck_require__(52617);
 const load_balancer_pick_first = __nccwpck_require__(78639);
 const load_balancer_round_robin = __nccwpck_require__(71936);
 const load_balancer_outlier_detection = __nccwpck_require__(95343);
+const load_balancer_weighted_round_robin = __nccwpck_require__(47616);
 const channelz = __nccwpck_require__(68198);
 (() => {
     resolver_dns.setup();
@@ -37651,6 +37932,7 @@ const channelz = __nccwpck_require__(68198);
     load_balancer_pick_first.setup();
     load_balancer_round_robin.setup();
     load_balancer_outlier_detection.setup();
+    load_balancer_weighted_round_robin.setup();
     channelz.setup();
 })();
 //# sourceMappingURL=index.js.map
@@ -38357,7 +38639,7 @@ class ChildLoadBalancerHandler {
      * @param lbConfig
      * @param attributes
      */
-    updateAddressList(endpointList, lbConfig, options) {
+    updateAddressList(endpointList, lbConfig, options, resolutionNote) {
         let childToUpdate;
         if (this.currentChild === null ||
             this.latestConfig === null ||
@@ -38386,7 +38668,7 @@ class ChildLoadBalancerHandler {
             }
         }
         this.latestConfig = lbConfig;
-        childToUpdate.updateAddressList(endpointList, lbConfig, options);
+        return childToUpdate.updateAddressList(endpointList, lbConfig, options, resolutionNote);
     }
     exitIdle() {
         if (this.currentChild) {
@@ -38677,7 +38959,7 @@ class OutlierDetectionPicker {
             if (mapEntry) {
                 let onCallEnded = wrappedPick.onCallEnded;
                 if (this.countCalls) {
-                    onCallEnded = statusCode => {
+                    onCallEnded = (statusCode, details, metadata) => {
                         var _a;
                         if (statusCode === constants_1.Status.OK) {
                             mapEntry.counter.addSuccess();
@@ -38685,7 +38967,7 @@ class OutlierDetectionPicker {
                         else {
                             mapEntry.counter.addFailure();
                         }
-                        (_a = wrappedPick.onCallEnded) === null || _a === void 0 ? void 0 : _a.call(wrappedPick, statusCode);
+                        (_a = wrappedPick.onCallEnded) === null || _a === void 0 ? void 0 : _a.call(wrappedPick, statusCode, details, metadata);
                     };
                 }
                 return Object.assign(Object.assign({}, wrappedPick), { subchannel: subchannelWrapper.getWrappedSubchannel(), onCallEnded: onCallEnded });
@@ -38932,25 +39214,27 @@ class OutlierDetectionLoadBalancer {
             }
         }
     }
-    updateAddressList(endpointList, lbConfig, options) {
+    updateAddressList(endpointList, lbConfig, options, resolutionNote) {
         if (!(lbConfig instanceof OutlierDetectionLoadBalancingConfig)) {
-            return;
+            return false;
         }
         trace('Received update with config: ' + JSON.stringify(lbConfig.toJsonObject(), undefined, 2));
-        for (const endpoint of endpointList) {
-            if (!this.entryMap.has(endpoint)) {
-                trace('Adding map entry for ' + (0, subchannel_address_1.endpointToString)(endpoint));
-                this.entryMap.set(endpoint, {
-                    counter: new CallCounter(),
-                    currentEjectionTimestamp: null,
-                    ejectionTimeMultiplier: 0,
-                    subchannelWrappers: [],
-                });
+        if (endpointList.ok) {
+            for (const endpoint of endpointList.value) {
+                if (!this.entryMap.has(endpoint)) {
+                    trace('Adding map entry for ' + (0, subchannel_address_1.endpointToString)(endpoint));
+                    this.entryMap.set(endpoint, {
+                        counter: new CallCounter(),
+                        currentEjectionTimestamp: null,
+                        ejectionTimeMultiplier: 0,
+                        subchannelWrappers: [],
+                    });
+                }
             }
+            this.entryMap.deleteMissing(endpointList.value);
         }
-        this.entryMap.deleteMissing(endpointList);
         const childPolicy = lbConfig.getChildPolicy();
-        this.childBalancer.updateAddressList(endpointList, childPolicy, options);
+        this.childBalancer.updateAddressList(endpointList, childPolicy, options, resolutionNote);
         if (lbConfig.getSuccessRateEjectionConfig() ||
             lbConfig.getFailurePercentageEjectionConfig()) {
             if (this.timerStartTime) {
@@ -38977,6 +39261,7 @@ class OutlierDetectionLoadBalancer {
             }
         }
         this.latestConfig = lbConfig;
+        return true;
     }
     exitIdle() {
         this.childBalancer.exitIdle();
@@ -39035,6 +39320,7 @@ const logging = __nccwpck_require__(8536);
 const constants_1 = __nccwpck_require__(68288);
 const subchannel_address_2 = __nccwpck_require__(97021);
 const net_1 = __nccwpck_require__(69278);
+const call_interface_1 = __nccwpck_require__(61803);
 const TRACER_NAME = 'pick_first';
 function trace(text) {
     logging.trace(constants_1.LogVerbosity.DEBUG, TRACER_NAME, text);
@@ -39192,6 +39478,7 @@ class PickFirstLoadBalancer {
         this.lastError = null;
         this.latestAddressList = null;
         this.latestOptions = {};
+        this.latestResolutionNote = '';
         this.connectionDelayTimeout = setTimeout(() => { }, 0);
         clearTimeout(this.connectionDelayTimeout);
     }
@@ -39215,7 +39502,7 @@ class PickFirstLoadBalancer {
             }
         }
         else if (((_a = this.latestAddressList) === null || _a === void 0 ? void 0 : _a.length) === 0) {
-            const errorMessage = `No connection established. Last error: ${this.lastError}`;
+            const errorMessage = `No connection established. Last error: ${this.lastError}. Resolution note: ${this.latestResolutionNote}`;
             this.updateState(connectivity_state_1.ConnectivityState.TRANSIENT_FAILURE, new picker_1.UnavailablePicker({
                 details: errorMessage,
             }), errorMessage);
@@ -39225,7 +39512,7 @@ class PickFirstLoadBalancer {
         }
         else {
             if (this.stickyTransientFailureMode) {
-                const errorMessage = `No connection established. Last error: ${this.lastError}`;
+                const errorMessage = `No connection established. Last error: ${this.lastError}. Resolution note: ${this.latestResolutionNote}`;
                 this.updateState(connectivity_state_1.ConnectivityState.TRANSIENT_FAILURE, new picker_1.UnavailablePicker({
                     details: errorMessage,
                 }), errorMessage);
@@ -39406,10 +39693,17 @@ class PickFirstLoadBalancer {
         this.startNextSubchannelConnecting(0);
         this.calculateAndReportNewState();
     }
-    updateAddressList(endpointList, lbConfig, options) {
+    updateAddressList(maybeEndpointList, lbConfig, options, resolutionNote) {
         if (!(lbConfig instanceof PickFirstLoadBalancingConfig)) {
-            return;
+            return false;
         }
+        if (!maybeEndpointList.ok) {
+            if (this.children.length === 0 && this.currentPick === null) {
+                this.channelControlHelper.updateState(connectivity_state_1.ConnectivityState.TRANSIENT_FAILURE, new picker_1.UnavailablePicker(maybeEndpointList.error), maybeEndpointList.error.details);
+            }
+            return true;
+        }
+        let endpointList = maybeEndpointList.value;
         this.reportHealthStatus = options[REPORT_HEALTH_STATUS_OPTION_NAME];
         /* Previously, an update would be discarded if it was identical to the
          * previous update, to minimize churn. Now the DNS resolver is
@@ -39419,13 +39713,18 @@ class PickFirstLoadBalancer {
         }
         const rawAddressList = [].concat(...endpointList.map(endpoint => endpoint.addresses));
         trace('updateAddressList([' + rawAddressList.map(address => (0, subchannel_address_1.subchannelAddressToString)(address)) + '])');
-        if (rawAddressList.length === 0) {
-            this.lastError = 'No addresses resolved';
-        }
         const addressList = interleaveAddressFamilies(rawAddressList);
         this.latestAddressList = addressList;
         this.latestOptions = options;
         this.connectToAddressList(addressList, options);
+        this.latestResolutionNote = resolutionNote;
+        if (rawAddressList.length > 0) {
+            return true;
+        }
+        else {
+            this.lastError = 'No addresses resolved';
+            return false;
+        }
     }
     exitIdle() {
         if (this.currentState === connectivity_state_1.ConnectivityState.IDLE &&
@@ -39453,9 +39752,10 @@ const LEAF_CONFIG = new PickFirstLoadBalancingConfig(false);
  * that more closely reflects how it will be used as a leaf balancer.
  */
 class LeafLoadBalancer {
-    constructor(endpoint, channelControlHelper, options) {
+    constructor(endpoint, channelControlHelper, options, resolutionNote) {
         this.endpoint = endpoint;
         this.options = options;
+        this.resolutionNote = resolutionNote;
         this.latestState = connectivity_state_1.ConnectivityState.IDLE;
         const childChannelControlHelper = (0, load_balancer_1.createChildChannelControlHelper)(channelControlHelper, {
             updateState: (connectivityState, picker, errorMessage) => {
@@ -39468,7 +39768,7 @@ class LeafLoadBalancer {
         this.latestPicker = new picker_1.QueuePicker(this.pickFirstBalancer);
     }
     startConnecting() {
-        this.pickFirstBalancer.updateAddressList([this.endpoint], LEAF_CONFIG, Object.assign(Object.assign({}, this.options), { [REPORT_HEALTH_STATUS_OPTION_NAME]: true }));
+        this.pickFirstBalancer.updateAddressList((0, call_interface_1.statusOrFromValue)([this.endpoint]), LEAF_CONFIG, Object.assign(Object.assign({}, this.options), { [REPORT_HEALTH_STATUS_OPTION_NAME]: true }), this.resolutionNote);
     }
     /**
      * Update the endpoint associated with this LeafLoadBalancer to a new
@@ -39578,6 +39878,9 @@ class RoundRobinPicker {
         return this.children[this.nextIndex].endpoint;
     }
 }
+function rotateArray(list, startIndex) {
+    return [...list.slice(startIndex), ...list.slice(0, startIndex)];
+}
 class RoundRobinLoadBalancer {
     constructor(channelControlHelper) {
         this.channelControlHelper = channelControlHelper;
@@ -39664,17 +39967,34 @@ class RoundRobinLoadBalancer {
         for (const child of this.children) {
             child.destroy();
         }
+        this.children = [];
     }
-    updateAddressList(endpointList, lbConfig, options) {
+    updateAddressList(maybeEndpointList, lbConfig, options, resolutionNote) {
+        if (!(lbConfig instanceof RoundRobinLoadBalancingConfig)) {
+            return false;
+        }
+        if (!maybeEndpointList.ok) {
+            if (this.children.length === 0) {
+                this.updateState(connectivity_state_1.ConnectivityState.TRANSIENT_FAILURE, new picker_1.UnavailablePicker(maybeEndpointList.error), maybeEndpointList.error.details);
+            }
+            return true;
+        }
+        const startIndex = (Math.random() * maybeEndpointList.value.length) | 0;
+        const endpointList = rotateArray(maybeEndpointList.value, startIndex);
         this.resetSubchannelList();
+        if (endpointList.length === 0) {
+            const errorMessage = `No addresses resolved. Resolution note: ${resolutionNote}`;
+            this.updateState(connectivity_state_1.ConnectivityState.TRANSIENT_FAILURE, new picker_1.UnavailablePicker({ details: errorMessage }), errorMessage);
+        }
         trace('Connect to endpoint list ' + endpointList.map(subchannel_address_1.endpointToString));
         this.updatesPaused = true;
-        this.children = endpointList.map(endpoint => new load_balancer_pick_first_1.LeafLoadBalancer(endpoint, this.childChannelControlHelper, options));
+        this.children = endpointList.map(endpoint => new load_balancer_pick_first_1.LeafLoadBalancer(endpoint, this.childChannelControlHelper, options, resolutionNote));
         for (const child of this.children) {
             child.startConnecting();
         }
         this.updatesPaused = false;
         this.calculateAndUpdateState();
+        return true;
     }
     exitIdle() {
         /* The round_robin LB policy is only in the IDLE state if it has no
@@ -39696,6 +40016,405 @@ function setup() {
     (0, load_balancer_1.registerLoadBalancerType)(TYPE_NAME, RoundRobinLoadBalancer, RoundRobinLoadBalancingConfig);
 }
 //# sourceMappingURL=load-balancer-round-robin.js.map
+
+/***/ }),
+
+/***/ 47616:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+/*
+ * Copyright 2025 gRPC authors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ */
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.WeightedRoundRobinLoadBalancingConfig = void 0;
+exports.setup = setup;
+const connectivity_state_1 = __nccwpck_require__(60778);
+const constants_1 = __nccwpck_require__(68288);
+const duration_1 = __nccwpck_require__(63929);
+const load_balancer_1 = __nccwpck_require__(7000);
+const load_balancer_pick_first_1 = __nccwpck_require__(78639);
+const logging = __nccwpck_require__(8536);
+const orca_1 = __nccwpck_require__(82124);
+const picker_1 = __nccwpck_require__(71663);
+const priority_queue_1 = __nccwpck_require__(58291);
+const subchannel_address_1 = __nccwpck_require__(97021);
+const TRACER_NAME = 'weighted_round_robin';
+function trace(text) {
+    logging.trace(constants_1.LogVerbosity.DEBUG, TRACER_NAME, text);
+}
+const TYPE_NAME = 'weighted_round_robin';
+const DEFAULT_OOB_REPORTING_PERIOD_MS = 10000;
+const DEFAULT_BLACKOUT_PERIOD_MS = 10000;
+const DEFAULT_WEIGHT_EXPIRATION_PERIOD_MS = 3 * 60000;
+const DEFAULT_WEIGHT_UPDATE_PERIOD_MS = 1000;
+const DEFAULT_ERROR_UTILIZATION_PENALTY = 1;
+function validateFieldType(obj, fieldName, expectedType) {
+    if (fieldName in obj &&
+        obj[fieldName] !== undefined &&
+        typeof obj[fieldName] !== expectedType) {
+        throw new Error(`weighted round robin config ${fieldName} parse error: expected ${expectedType}, got ${typeof obj[fieldName]}`);
+    }
+}
+function parseDurationField(obj, fieldName) {
+    if (fieldName in obj && obj[fieldName] !== undefined && obj[fieldName] !== null) {
+        let durationObject;
+        if ((0, duration_1.isDuration)(obj[fieldName])) {
+            durationObject = obj[fieldName];
+        }
+        else if ((0, duration_1.isDurationMessage)(obj[fieldName])) {
+            durationObject = (0, duration_1.durationMessageToDuration)(obj[fieldName]);
+        }
+        else if (typeof obj[fieldName] === 'string') {
+            const parsedDuration = (0, duration_1.parseDuration)(obj[fieldName]);
+            if (!parsedDuration) {
+                throw new Error(`weighted round robin config ${fieldName}: failed to parse duration string ${obj[fieldName]}`);
+            }
+            durationObject = parsedDuration;
+        }
+        else {
+            throw new Error(`weighted round robin config ${fieldName}: expected duration, got ${typeof obj[fieldName]}`);
+        }
+        return (0, duration_1.durationToMs)(durationObject);
+    }
+    return null;
+}
+class WeightedRoundRobinLoadBalancingConfig {
+    constructor(enableOobLoadReport, oobLoadReportingPeriodMs, blackoutPeriodMs, weightExpirationPeriodMs, weightUpdatePeriodMs, errorUtilizationPenalty) {
+        this.enableOobLoadReport = enableOobLoadReport !== null && enableOobLoadReport !== void 0 ? enableOobLoadReport : false;
+        this.oobLoadReportingPeriodMs = oobLoadReportingPeriodMs !== null && oobLoadReportingPeriodMs !== void 0 ? oobLoadReportingPeriodMs : DEFAULT_OOB_REPORTING_PERIOD_MS;
+        this.blackoutPeriodMs = blackoutPeriodMs !== null && blackoutPeriodMs !== void 0 ? blackoutPeriodMs : DEFAULT_BLACKOUT_PERIOD_MS;
+        this.weightExpirationPeriodMs = weightExpirationPeriodMs !== null && weightExpirationPeriodMs !== void 0 ? weightExpirationPeriodMs : DEFAULT_WEIGHT_EXPIRATION_PERIOD_MS;
+        this.weightUpdatePeriodMs = Math.max(weightUpdatePeriodMs !== null && weightUpdatePeriodMs !== void 0 ? weightUpdatePeriodMs : DEFAULT_WEIGHT_UPDATE_PERIOD_MS, 100);
+        this.errorUtilizationPenalty = errorUtilizationPenalty !== null && errorUtilizationPenalty !== void 0 ? errorUtilizationPenalty : DEFAULT_ERROR_UTILIZATION_PENALTY;
+    }
+    getLoadBalancerName() {
+        return TYPE_NAME;
+    }
+    toJsonObject() {
+        return {
+            enable_oob_load_report: this.enableOobLoadReport,
+            oob_load_reporting_period: (0, duration_1.durationToString)((0, duration_1.msToDuration)(this.oobLoadReportingPeriodMs)),
+            blackout_period: (0, duration_1.durationToString)((0, duration_1.msToDuration)(this.blackoutPeriodMs)),
+            weight_expiration_period: (0, duration_1.durationToString)((0, duration_1.msToDuration)(this.weightExpirationPeriodMs)),
+            weight_update_period: (0, duration_1.durationToString)((0, duration_1.msToDuration)(this.weightUpdatePeriodMs)),
+            error_utilization_penalty: this.errorUtilizationPenalty
+        };
+    }
+    static createFromJson(obj) {
+        validateFieldType(obj, 'enable_oob_load_report', 'boolean');
+        validateFieldType(obj, 'error_utilization_penalty', 'number');
+        if (obj.error_utilization_penalty < 0) {
+            throw new Error('weighted round robin config error_utilization_penalty < 0');
+        }
+        return new WeightedRoundRobinLoadBalancingConfig(obj.enable_oob_load_report, parseDurationField(obj, 'oob_load_reporting_period'), parseDurationField(obj, 'blackout_period'), parseDurationField(obj, 'weight_expiration_period'), parseDurationField(obj, 'weight_update_period'), obj.error_utilization_penalty);
+    }
+    getEnableOobLoadReport() {
+        return this.enableOobLoadReport;
+    }
+    getOobLoadReportingPeriodMs() {
+        return this.oobLoadReportingPeriodMs;
+    }
+    getBlackoutPeriodMs() {
+        return this.blackoutPeriodMs;
+    }
+    getWeightExpirationPeriodMs() {
+        return this.weightExpirationPeriodMs;
+    }
+    getWeightUpdatePeriodMs() {
+        return this.weightUpdatePeriodMs;
+    }
+    getErrorUtilizationPenalty() {
+        return this.errorUtilizationPenalty;
+    }
+}
+exports.WeightedRoundRobinLoadBalancingConfig = WeightedRoundRobinLoadBalancingConfig;
+class WeightedRoundRobinPicker {
+    constructor(children, metricsHandler) {
+        this.metricsHandler = metricsHandler;
+        this.queue = new priority_queue_1.PriorityQueue((a, b) => a.deadline < b.deadline);
+        const positiveWeight = children.filter(picker => picker.weight > 0);
+        let averageWeight;
+        if (positiveWeight.length < 2) {
+            averageWeight = 1;
+        }
+        else {
+            let weightSum = 0;
+            for (const { weight } of positiveWeight) {
+                weightSum += weight;
+            }
+            averageWeight = weightSum / positiveWeight.length;
+        }
+        for (const child of children) {
+            const period = child.weight > 0 ? 1 / child.weight : averageWeight;
+            this.queue.push({
+                endpointName: child.endpointName,
+                picker: child.picker,
+                period: period,
+                deadline: Math.random() * period
+            });
+        }
+    }
+    pick(pickArgs) {
+        const entry = this.queue.pop();
+        this.queue.push(Object.assign(Object.assign({}, entry), { deadline: entry.deadline + entry.period }));
+        const childPick = entry.picker.pick(pickArgs);
+        if (childPick.pickResultType === picker_1.PickResultType.COMPLETE) {
+            if (this.metricsHandler) {
+                return Object.assign(Object.assign({}, childPick), { onCallEnded: (0, orca_1.createMetricsReader)(loadReport => this.metricsHandler(loadReport, entry.endpointName), childPick.onCallEnded) });
+            }
+            else {
+                const subchannelWrapper = childPick.subchannel;
+                return Object.assign(Object.assign({}, childPick), { subchannel: subchannelWrapper.getWrappedSubchannel() });
+            }
+        }
+        else {
+            return childPick;
+        }
+    }
+}
+class WeightedRoundRobinLoadBalancer {
+    constructor(channelControlHelper) {
+        this.channelControlHelper = channelControlHelper;
+        this.latestConfig = null;
+        this.children = new Map();
+        this.currentState = connectivity_state_1.ConnectivityState.IDLE;
+        this.updatesPaused = false;
+        this.lastError = null;
+        this.weightUpdateTimer = null;
+    }
+    countChildrenWithState(state) {
+        let count = 0;
+        for (const entry of this.children.values()) {
+            if (entry.child.getConnectivityState() === state) {
+                count += 1;
+            }
+        }
+        return count;
+    }
+    updateWeight(entry, loadReport) {
+        var _a, _b;
+        const qps = loadReport.rps_fractional;
+        let utilization = loadReport.application_utilization;
+        if (utilization > 0 && qps > 0) {
+            utilization += (loadReport.eps / qps) * ((_b = (_a = this.latestConfig) === null || _a === void 0 ? void 0 : _a.getErrorUtilizationPenalty()) !== null && _b !== void 0 ? _b : 0);
+        }
+        const newWeight = utilization === 0 ? 0 : qps / utilization;
+        if (newWeight === 0) {
+            return;
+        }
+        const now = new Date();
+        if (entry.nonEmptySince === null) {
+            entry.nonEmptySince = now;
+        }
+        entry.lastUpdated = now;
+        entry.weight = newWeight;
+    }
+    getWeight(entry) {
+        if (!this.latestConfig) {
+            return 0;
+        }
+        const now = new Date().getTime();
+        if (now - entry.lastUpdated.getTime() >= this.latestConfig.getWeightExpirationPeriodMs()) {
+            entry.nonEmptySince = null;
+            return 0;
+        }
+        const blackoutPeriod = this.latestConfig.getBlackoutPeriodMs();
+        if (blackoutPeriod > 0 && (entry.nonEmptySince === null || now - entry.nonEmptySince.getTime() < blackoutPeriod)) {
+            return 0;
+        }
+        return entry.weight;
+    }
+    calculateAndUpdateState() {
+        if (this.updatesPaused || !this.latestConfig) {
+            return;
+        }
+        if (this.countChildrenWithState(connectivity_state_1.ConnectivityState.READY) > 0) {
+            const weightedPickers = [];
+            for (const [endpoint, entry] of this.children) {
+                if (entry.child.getConnectivityState() !== connectivity_state_1.ConnectivityState.READY) {
+                    continue;
+                }
+                weightedPickers.push({
+                    endpointName: endpoint,
+                    picker: entry.child.getPicker(),
+                    weight: this.getWeight(entry)
+                });
+            }
+            trace('Created picker with weights: ' + weightedPickers.map(entry => entry.endpointName + ':' + entry.weight).join(','));
+            let metricsHandler;
+            if (!this.latestConfig.getEnableOobLoadReport()) {
+                metricsHandler = (loadReport, endpointName) => {
+                    const childEntry = this.children.get(endpointName);
+                    if (childEntry) {
+                        this.updateWeight(childEntry, loadReport);
+                    }
+                };
+            }
+            else {
+                metricsHandler = null;
+            }
+            this.updateState(connectivity_state_1.ConnectivityState.READY, new WeightedRoundRobinPicker(weightedPickers, metricsHandler), null);
+        }
+        else if (this.countChildrenWithState(connectivity_state_1.ConnectivityState.CONNECTING) > 0) {
+            this.updateState(connectivity_state_1.ConnectivityState.CONNECTING, new picker_1.QueuePicker(this), null);
+        }
+        else if (this.countChildrenWithState(connectivity_state_1.ConnectivityState.TRANSIENT_FAILURE) > 0) {
+            const errorMessage = `weighted_round_robin: No connection established. Last error: ${this.lastError}`;
+            this.updateState(connectivity_state_1.ConnectivityState.TRANSIENT_FAILURE, new picker_1.UnavailablePicker({
+                details: errorMessage,
+            }), errorMessage);
+        }
+        else {
+            this.updateState(connectivity_state_1.ConnectivityState.IDLE, new picker_1.QueuePicker(this), null);
+        }
+        /* round_robin should keep all children connected, this is how we do that.
+          * We can't do this more efficiently in the individual child's updateState
+          * callback because that doesn't have a reference to which child the state
+          * change is associated with. */
+        for (const { child } of this.children.values()) {
+            if (child.getConnectivityState() === connectivity_state_1.ConnectivityState.IDLE) {
+                child.exitIdle();
+            }
+        }
+    }
+    updateState(newState, picker, errorMessage) {
+        trace(connectivity_state_1.ConnectivityState[this.currentState] +
+            ' -> ' +
+            connectivity_state_1.ConnectivityState[newState]);
+        this.currentState = newState;
+        this.channelControlHelper.updateState(newState, picker, errorMessage);
+    }
+    updateAddressList(maybeEndpointList, lbConfig, options, resolutionNote) {
+        var _a, _b;
+        if (!(lbConfig instanceof WeightedRoundRobinLoadBalancingConfig)) {
+            return false;
+        }
+        if (!maybeEndpointList.ok) {
+            if (this.children.size === 0) {
+                this.updateState(connectivity_state_1.ConnectivityState.TRANSIENT_FAILURE, new picker_1.UnavailablePicker(maybeEndpointList.error), maybeEndpointList.error.details);
+            }
+            return true;
+        }
+        if (maybeEndpointList.value.length === 0) {
+            const errorMessage = `No addresses resolved. Resolution note: ${resolutionNote}`;
+            this.updateState(connectivity_state_1.ConnectivityState.TRANSIENT_FAILURE, new picker_1.UnavailablePicker({ details: errorMessage }), errorMessage);
+            return false;
+        }
+        trace('Connect to endpoint list ' + maybeEndpointList.value.map(subchannel_address_1.endpointToString));
+        const now = new Date();
+        const seenEndpointNames = new Set();
+        this.updatesPaused = true;
+        this.latestConfig = lbConfig;
+        for (const endpoint of maybeEndpointList.value) {
+            const name = (0, subchannel_address_1.endpointToString)(endpoint);
+            seenEndpointNames.add(name);
+            let entry = this.children.get(name);
+            if (!entry) {
+                entry = {
+                    child: new load_balancer_pick_first_1.LeafLoadBalancer(endpoint, (0, load_balancer_1.createChildChannelControlHelper)(this.channelControlHelper, {
+                        updateState: (connectivityState, picker, errorMessage) => {
+                            /* Ensure that name resolution is requested again after active
+                              * connections are dropped. This is more aggressive than necessary to
+                              * accomplish that, so we are counting on resolvers to have
+                              * reasonable rate limits. */
+                            if (this.currentState === connectivity_state_1.ConnectivityState.READY && connectivityState !== connectivity_state_1.ConnectivityState.READY) {
+                                this.channelControlHelper.requestReresolution();
+                            }
+                            if (connectivityState === connectivity_state_1.ConnectivityState.READY) {
+                                entry.nonEmptySince = null;
+                            }
+                            if (errorMessage) {
+                                this.lastError = errorMessage;
+                            }
+                            this.calculateAndUpdateState();
+                        },
+                        createSubchannel: (subchannelAddress, subchannelArgs) => {
+                            const subchannel = this.channelControlHelper.createSubchannel(subchannelAddress, subchannelArgs);
+                            if (entry === null || entry === void 0 ? void 0 : entry.oobMetricsListener) {
+                                return new orca_1.OrcaOobMetricsSubchannelWrapper(subchannel, entry.oobMetricsListener, this.latestConfig.getOobLoadReportingPeriodMs());
+                            }
+                            else {
+                                return subchannel;
+                            }
+                        }
+                    }), options, resolutionNote),
+                    lastUpdated: now,
+                    nonEmptySince: null,
+                    weight: 0,
+                    oobMetricsListener: null
+                };
+                this.children.set(name, entry);
+            }
+            if (lbConfig.getEnableOobLoadReport()) {
+                entry.oobMetricsListener = loadReport => {
+                    this.updateWeight(entry, loadReport);
+                };
+            }
+            else {
+                entry.oobMetricsListener = null;
+            }
+        }
+        for (const [endpointName, entry] of this.children) {
+            if (seenEndpointNames.has(endpointName)) {
+                entry.child.startConnecting();
+            }
+            else {
+                entry.child.destroy();
+                this.children.delete(endpointName);
+            }
+        }
+        this.updatesPaused = false;
+        this.calculateAndUpdateState();
+        if (this.weightUpdateTimer) {
+            clearInterval(this.weightUpdateTimer);
+        }
+        this.weightUpdateTimer = (_b = (_a = setInterval(() => {
+            if (this.currentState === connectivity_state_1.ConnectivityState.READY) {
+                this.calculateAndUpdateState();
+            }
+        }, lbConfig.getWeightUpdatePeriodMs())).unref) === null || _b === void 0 ? void 0 : _b.call(_a);
+        return true;
+    }
+    exitIdle() {
+        /* The weighted_round_robin LB policy is only in the IDLE state if it has
+         * no addresses to try to connect to and it has no picked subchannel.
+         * In that case, there is no meaningful action that can be taken here. */
+    }
+    resetBackoff() {
+        // This LB policy has no backoff to reset
+    }
+    destroy() {
+        for (const entry of this.children.values()) {
+            entry.child.destroy();
+        }
+        this.children.clear();
+        if (this.weightUpdateTimer) {
+            clearInterval(this.weightUpdateTimer);
+        }
+    }
+    getTypeName() {
+        return TYPE_NAME;
+    }
+}
+function setup() {
+    (0, load_balancer_1.registerLoadBalancerType)(TYPE_NAME, WeightedRoundRobinLoadBalancer, WeightedRoundRobinLoadBalancingConfig);
+}
+//# sourceMappingURL=load-balancer-weighted-round-robin.js.map
 
 /***/ }),
 
@@ -39924,7 +40643,7 @@ class LoadBalancingCall {
                 this.startTime.toISOString());
             const finalStatus = Object.assign(Object.assign({}, status), { progress });
             (_a = this.listener) === null || _a === void 0 ? void 0 : _a.onReceiveStatus(finalStatus);
-            (_b = this.onCallEnded) === null || _b === void 0 ? void 0 : _b.call(this, finalStatus.code);
+            (_b = this.onCallEnded) === null || _b === void 0 ? void 0 : _b.call(this, finalStatus.code, finalStatus.details, finalStatus.metadata);
         }
     }
     doPick() {
@@ -40116,6 +40835,14 @@ class LoadBalancingCall {
     }
     getCallNumber() {
         return this.callNumber;
+    }
+    getAuthContext() {
+        if (this.child) {
+            return this.child.getAuthContext();
+        }
+        else {
+            return null;
+        }
     }
 }
 exports.LoadBalancingCall = LoadBalancingCall;
@@ -40428,7 +41155,7 @@ exports.Metadata = void 0;
 const logging_1 = __nccwpck_require__(8536);
 const constants_1 = __nccwpck_require__(68288);
 const error_1 = __nccwpck_require__(98219);
-const LEGAL_KEY_REGEX = /^[0-9a-z_.-]+$/;
+const LEGAL_KEY_REGEX = /^[:0-9a-z_.-]+$/;
 const LEGAL_NON_BINARY_VALUE_REGEX = /^[ -~]*$/;
 function isLegalKey(key) {
     return LEGAL_KEY_REGEX.test(key);
@@ -40471,6 +41198,7 @@ function validate(key, value) {
 class Metadata {
     constructor(options = {}) {
         this.internalRepr = new Map();
+        this.opaqueData = new Map();
         this.options = options;
     }
     /**
@@ -40583,6 +41311,9 @@ class Metadata {
         // NOTE: Node <8.9 formats http2 headers incorrectly.
         const result = {};
         for (const [key, values] of this.internalRepr) {
+            if (key.startsWith(':')) {
+                continue;
+            }
             // We assume that the user's interaction with this object is limited to
             // through its public API (i.e. keys and values are already validated).
             result[key] = values.map(bufToString);
@@ -40599,6 +41330,25 @@ class Metadata {
             result[key] = values;
         }
         return result;
+    }
+    /**
+     * Attach additional data of any type to the metadata object, which will not
+     * be included when sending headers. The data can later be retrieved with
+     * `getOpaque`. Keys with the prefix `grpc` are reserved for use by this
+     * library.
+     * @param key
+     * @param value
+     */
+    setOpaque(key, value) {
+        this.opaqueData.set(key, value);
+    }
+    /**
+     * Retrieve data previously added with `setOpaque`.
+     * @param key
+     * @returns
+     */
+    getOpaque(key) {
+        return this.opaqueData.get(key);
     }
     /**
      * Returns a new Metadata object based fields in a given IncomingHttpHeaders
@@ -40655,6 +41405,335 @@ const bufToString = (val) => {
     return Buffer.isBuffer(val) ? val.toString('base64') : val;
 };
 //# sourceMappingURL=metadata.js.map
+
+/***/ }),
+
+/***/ 82124:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+/*
+ * Copyright 2025 gRPC authors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ */
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.OrcaOobMetricsSubchannelWrapper = exports.GRPC_METRICS_HEADER = exports.ServerMetricRecorder = exports.PerRequestMetricRecorder = void 0;
+exports.createOrcaClient = createOrcaClient;
+exports.createMetricsReader = createMetricsReader;
+const make_client_1 = __nccwpck_require__(76983);
+const duration_1 = __nccwpck_require__(63929);
+const channel_credentials_1 = __nccwpck_require__(32257);
+const subchannel_interface_1 = __nccwpck_require__(70098);
+const constants_1 = __nccwpck_require__(68288);
+const backoff_timeout_1 = __nccwpck_require__(14643);
+const connectivity_state_1 = __nccwpck_require__(60778);
+const loadedOrcaProto = null;
+function loadOrcaProto() {
+    if (loadedOrcaProto) {
+        return loadedOrcaProto;
+    }
+    /* The purpose of this complexity is to avoid loading @grpc/proto-loader at
+     * runtime for users who will not use/enable ORCA. */
+    const loaderLoadSync = (__nccwpck_require__(76081)/* .loadSync */ .Yi);
+    const loadedProto = loaderLoadSync('xds/service/orca/v3/orca.proto', {
+        keepCase: true,
+        longs: String,
+        enums: String,
+        defaults: true,
+        oneofs: true,
+        includeDirs: [
+            __nccwpck_require__.ab + "xds",
+            __nccwpck_require__.ab + "protoc-gen-validate"
+        ],
+    });
+    return (0, make_client_1.loadPackageDefinition)(loadedProto);
+}
+/**
+ * ORCA metrics recorder for a single request
+ */
+class PerRequestMetricRecorder {
+    constructor() {
+        this.message = {};
+    }
+    /**
+     * Records a request cost metric measurement for the call.
+     * @param name
+     * @param value
+     */
+    recordRequestCostMetric(name, value) {
+        if (!this.message.request_cost) {
+            this.message.request_cost = {};
+        }
+        this.message.request_cost[name] = value;
+    }
+    /**
+     * Records a request cost metric measurement for the call.
+     * @param name
+     * @param value
+     */
+    recordUtilizationMetric(name, value) {
+        if (!this.message.utilization) {
+            this.message.utilization = {};
+        }
+        this.message.utilization[name] = value;
+    }
+    /**
+     * Records an opaque named metric measurement for the call.
+     * @param name
+     * @param value
+     */
+    recordNamedMetric(name, value) {
+        if (!this.message.named_metrics) {
+            this.message.named_metrics = {};
+        }
+        this.message.named_metrics[name] = value;
+    }
+    /**
+     * Records the CPU utilization metric measurement for the call.
+     * @param value
+     */
+    recordCPUUtilizationMetric(value) {
+        this.message.cpu_utilization = value;
+    }
+    /**
+     * Records the memory utilization metric measurement for the call.
+     * @param value
+     */
+    recordMemoryUtilizationMetric(value) {
+        this.message.mem_utilization = value;
+    }
+    /**
+     * Records the memory utilization metric measurement for the call.
+     * @param value
+     */
+    recordApplicationUtilizationMetric(value) {
+        this.message.application_utilization = value;
+    }
+    /**
+     * Records the queries per second measurement.
+     * @param value
+     */
+    recordQpsMetric(value) {
+        this.message.rps_fractional = value;
+    }
+    /**
+     * Records the errors per second measurement.
+     * @param value
+     */
+    recordEpsMetric(value) {
+        this.message.eps = value;
+    }
+    serialize() {
+        const orcaProto = loadOrcaProto();
+        return orcaProto.xds.data.orca.v3.OrcaLoadReport.serialize(this.message);
+    }
+}
+exports.PerRequestMetricRecorder = PerRequestMetricRecorder;
+const DEFAULT_REPORT_INTERVAL_MS = 30000;
+class ServerMetricRecorder {
+    constructor() {
+        this.message = {};
+        this.serviceImplementation = {
+            StreamCoreMetrics: call => {
+                const reportInterval = call.request.report_interval ?
+                    (0, duration_1.durationToMs)((0, duration_1.durationMessageToDuration)(call.request.report_interval)) :
+                    DEFAULT_REPORT_INTERVAL_MS;
+                const reportTimer = setInterval(() => {
+                    call.write(this.message);
+                }, reportInterval);
+                call.on('cancelled', () => {
+                    clearInterval(reportTimer);
+                });
+            }
+        };
+    }
+    putUtilizationMetric(name, value) {
+        if (!this.message.utilization) {
+            this.message.utilization = {};
+        }
+        this.message.utilization[name] = value;
+    }
+    setAllUtilizationMetrics(metrics) {
+        this.message.utilization = Object.assign({}, metrics);
+    }
+    deleteUtilizationMetric(name) {
+        var _a;
+        (_a = this.message.utilization) === null || _a === void 0 ? true : delete _a[name];
+    }
+    setCpuUtilizationMetric(value) {
+        this.message.cpu_utilization = value;
+    }
+    deleteCpuUtilizationMetric() {
+        delete this.message.cpu_utilization;
+    }
+    setApplicationUtilizationMetric(value) {
+        this.message.application_utilization = value;
+    }
+    deleteApplicationUtilizationMetric() {
+        delete this.message.application_utilization;
+    }
+    setQpsMetric(value) {
+        this.message.rps_fractional = value;
+    }
+    deleteQpsMetric() {
+        delete this.message.rps_fractional;
+    }
+    setEpsMetric(value) {
+        this.message.eps = value;
+    }
+    deleteEpsMetric() {
+        delete this.message.eps;
+    }
+    addToServer(server) {
+        const serviceDefinition = loadOrcaProto().xds.service.orca.v3.OpenRcaService.service;
+        server.addService(serviceDefinition, this.serviceImplementation);
+    }
+}
+exports.ServerMetricRecorder = ServerMetricRecorder;
+function createOrcaClient(channel) {
+    const ClientClass = loadOrcaProto().xds.service.orca.v3.OpenRcaService;
+    return new ClientClass('unused', channel_credentials_1.ChannelCredentials.createInsecure(), { channelOverride: channel });
+}
+exports.GRPC_METRICS_HEADER = 'endpoint-load-metrics-bin';
+const PARSED_LOAD_REPORT_KEY = 'grpc_orca_load_report';
+/**
+ * Create an onCallEnded callback for use in a picker.
+ * @param listener The listener to handle metrics, whenever they are provided.
+ * @param previousOnCallEnded The previous onCallEnded callback to propagate
+ * to, if applicable.
+ * @returns
+ */
+function createMetricsReader(listener, previousOnCallEnded) {
+    return (code, details, metadata) => {
+        let parsedLoadReport = metadata.getOpaque(PARSED_LOAD_REPORT_KEY);
+        if (parsedLoadReport) {
+            listener(parsedLoadReport);
+        }
+        else {
+            const serializedLoadReport = metadata.get(exports.GRPC_METRICS_HEADER);
+            if (serializedLoadReport.length > 0) {
+                const orcaProto = loadOrcaProto();
+                parsedLoadReport = orcaProto.xds.data.orca.v3.OrcaLoadReport.deserialize(serializedLoadReport[0]);
+                listener(parsedLoadReport);
+                metadata.setOpaque(PARSED_LOAD_REPORT_KEY, parsedLoadReport);
+            }
+        }
+        if (previousOnCallEnded) {
+            previousOnCallEnded(code, details, metadata);
+        }
+    };
+}
+const DATA_PRODUCER_KEY = 'orca_oob_metrics';
+class OobMetricsDataWatcher {
+    constructor(metricsListener, intervalMs) {
+        this.metricsListener = metricsListener;
+        this.intervalMs = intervalMs;
+        this.dataProducer = null;
+    }
+    setSubchannel(subchannel) {
+        const producer = subchannel.getOrCreateDataProducer(DATA_PRODUCER_KEY, createOobMetricsDataProducer);
+        this.dataProducer = producer;
+        producer.addDataWatcher(this);
+    }
+    destroy() {
+        var _a;
+        (_a = this.dataProducer) === null || _a === void 0 ? void 0 : _a.removeDataWatcher(this);
+    }
+    getInterval() {
+        return this.intervalMs;
+    }
+    onMetricsUpdate(metrics) {
+        this.metricsListener(metrics);
+    }
+}
+class OobMetricsDataProducer {
+    constructor(subchannel) {
+        this.subchannel = subchannel;
+        this.dataWatchers = new Set();
+        this.orcaSupported = true;
+        this.metricsCall = null;
+        this.currentInterval = Infinity;
+        this.backoffTimer = new backoff_timeout_1.BackoffTimeout(() => this.updateMetricsSubscription());
+        this.subchannelStateListener = () => this.updateMetricsSubscription();
+        const channel = subchannel.getChannel();
+        this.client = createOrcaClient(channel);
+        subchannel.addConnectivityStateListener(this.subchannelStateListener);
+    }
+    addDataWatcher(dataWatcher) {
+        this.dataWatchers.add(dataWatcher);
+        this.updateMetricsSubscription();
+    }
+    removeDataWatcher(dataWatcher) {
+        var _a;
+        this.dataWatchers.delete(dataWatcher);
+        if (this.dataWatchers.size === 0) {
+            this.subchannel.removeDataProducer(DATA_PRODUCER_KEY);
+            (_a = this.metricsCall) === null || _a === void 0 ? void 0 : _a.cancel();
+            this.metricsCall = null;
+            this.client.close();
+            this.subchannel.removeConnectivityStateListener(this.subchannelStateListener);
+        }
+        else {
+            this.updateMetricsSubscription();
+        }
+    }
+    updateMetricsSubscription() {
+        var _a;
+        if (this.dataWatchers.size === 0 || !this.orcaSupported || this.subchannel.getConnectivityState() !== connectivity_state_1.ConnectivityState.READY) {
+            return;
+        }
+        const newInterval = Math.min(...Array.from(this.dataWatchers).map(watcher => watcher.getInterval()));
+        if (!this.metricsCall || newInterval !== this.currentInterval) {
+            (_a = this.metricsCall) === null || _a === void 0 ? void 0 : _a.cancel();
+            this.currentInterval = newInterval;
+            const metricsCall = this.client.streamCoreMetrics({ report_interval: (0, duration_1.msToDuration)(newInterval) });
+            this.metricsCall = metricsCall;
+            metricsCall.on('data', (report) => {
+                this.dataWatchers.forEach(watcher => {
+                    watcher.onMetricsUpdate(report);
+                });
+            });
+            metricsCall.on('error', (error) => {
+                this.metricsCall = null;
+                if (error.code === constants_1.Status.UNIMPLEMENTED) {
+                    this.orcaSupported = false;
+                    return;
+                }
+                if (error.code === constants_1.Status.CANCELLED) {
+                    return;
+                }
+                this.backoffTimer.runOnce();
+            });
+        }
+    }
+}
+class OrcaOobMetricsSubchannelWrapper extends subchannel_interface_1.BaseSubchannelWrapper {
+    constructor(child, metricsListener, intervalMs) {
+        super(child);
+        this.addDataWatcher(new OobMetricsDataWatcher(metricsListener, intervalMs));
+    }
+    getWrappedSubchannel() {
+        return this.child;
+    }
+}
+exports.OrcaOobMetricsSubchannelWrapper = OrcaOobMetricsSubchannelWrapper;
+function createOobMetricsDataProducer(subchannel) {
+    return new OobMetricsDataProducer(subchannel);
+}
+//# sourceMappingURL=orca.js.map
 
 /***/ }),
 
@@ -40751,6 +41830,133 @@ exports.QueuePicker = QueuePicker;
 
 /***/ }),
 
+/***/ 58291:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+/*
+ * Copyright 2025 gRPC authors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ */
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.PriorityQueue = void 0;
+const top = 0;
+const parent = (i) => Math.floor(i / 2);
+const left = (i) => i * 2 + 1;
+const right = (i) => i * 2 + 2;
+/**
+ * A generic priority queue implemented as an array-based binary heap.
+ * Adapted from https://stackoverflow.com/a/42919752/159388
+ */
+class PriorityQueue {
+    /**
+     *
+     * @param comparator Returns true if the first argument should precede the
+     *   second in the queue. Defaults to `(a, b) => a > b`
+     */
+    constructor(comparator = (a, b) => a > b) {
+        this.comparator = comparator;
+        this.heap = [];
+    }
+    /**
+     * @returns The number of items currently in the queue
+     */
+    size() {
+        return this.heap.length;
+    }
+    /**
+     * @returns True if there are no items in the queue, false otherwise
+     */
+    isEmpty() {
+        return this.size() == 0;
+    }
+    /**
+     * Look at the front item that would be popped, without modifying the contents
+     * of the queue
+     * @returns The front item in the queue, or undefined if the queue is empty
+     */
+    peek() {
+        return this.heap[top];
+    }
+    /**
+     * Add the items to the queue
+     * @param values The items to add
+     * @returns The new size of the queue after adding the items
+     */
+    push(...values) {
+        values.forEach(value => {
+            this.heap.push(value);
+            this.siftUp();
+        });
+        return this.size();
+    }
+    /**
+     * Remove the front item in the queue and return it
+     * @returns The front item in the queue, or undefined if the queue is empty
+     */
+    pop() {
+        const poppedValue = this.peek();
+        const bottom = this.size() - 1;
+        if (bottom > top) {
+            this.swap(top, bottom);
+        }
+        this.heap.pop();
+        this.siftDown();
+        return poppedValue;
+    }
+    /**
+     * Simultaneously remove the front item in the queue and add the provided
+     * item.
+     * @param value The item to add
+     * @returns The front item in the queue, or undefined if the queue is empty
+     */
+    replace(value) {
+        const replacedValue = this.peek();
+        this.heap[top] = value;
+        this.siftDown();
+        return replacedValue;
+    }
+    greater(i, j) {
+        return this.comparator(this.heap[i], this.heap[j]);
+    }
+    swap(i, j) {
+        [this.heap[i], this.heap[j]] = [this.heap[j], this.heap[i]];
+    }
+    siftUp() {
+        let node = this.size() - 1;
+        while (node > top && this.greater(node, parent(node))) {
+            this.swap(node, parent(node));
+            node = parent(node);
+        }
+    }
+    siftDown() {
+        let node = top;
+        while ((left(node) < this.size() && this.greater(left(node), node)) ||
+            (right(node) < this.size() && this.greater(right(node), node))) {
+            let maxChild = (right(node) < this.size() && this.greater(right(node), left(node))) ? right(node) : left(node);
+            this.swap(node, maxChild);
+            node = maxChild;
+        }
+    }
+}
+exports.PriorityQueue = PriorityQueue;
+//# sourceMappingURL=priority-queue.js.map
+
+/***/ }),
+
 /***/ 51149:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
@@ -40778,6 +41984,7 @@ const resolver_1 = __nccwpck_require__(76255);
 const dns_1 = __nccwpck_require__(72250);
 const service_config_1 = __nccwpck_require__(70005);
 const constants_1 = __nccwpck_require__(68288);
+const call_interface_1 = __nccwpck_require__(61803);
 const metadata_1 = __nccwpck_require__(36100);
 const logging = __nccwpck_require__(8536);
 const constants_2 = __nccwpck_require__(68288);
@@ -40805,8 +42012,7 @@ class DnsResolver {
         this.pendingLookupPromise = null;
         this.pendingTxtPromise = null;
         this.latestLookupResult = null;
-        this.latestServiceConfig = null;
-        this.latestServiceConfigError = null;
+        this.latestServiceConfigResult = null;
         this.continueResolving = false;
         this.isNextResolutionTimerRunning = false;
         this.isServiceConfigEnabled = true;
@@ -40876,7 +42082,7 @@ class DnsResolver {
             if (!this.returnedIpResult) {
                 trace('Returning IP address for target ' + (0, uri_parser_1.uriToString)(this.target));
                 setImmediate(() => {
-                    this.listener.onSuccessfulResolution(this.ipResult, null, null, null, {});
+                    this.listener((0, call_interface_1.statusOrFromValue)(this.ipResult), {}, null, '');
                 });
                 this.returnedIpResult = true;
             }
@@ -40888,11 +42094,10 @@ class DnsResolver {
         if (this.dnsHostname === null) {
             trace('Failed to parse DNS address ' + (0, uri_parser_1.uriToString)(this.target));
             setImmediate(() => {
-                this.listener.onError({
+                this.listener((0, call_interface_1.statusOrFromError)({
                     code: constants_1.Status.UNAVAILABLE,
-                    details: `Failed to parse DNS address ${(0, uri_parser_1.uriToString)(this.target)}`,
-                    metadata: new metadata_1.Metadata(),
-                });
+                    details: `Failed to parse DNS address ${(0, uri_parser_1.uriToString)(this.target)}`
+                }), {}, null, '');
             });
             this.stopNextResolutionTimer();
         }
@@ -40915,11 +42120,9 @@ class DnsResolver {
                     return;
                 }
                 this.pendingLookupPromise = null;
-                this.backoff.reset();
-                this.backoff.stop();
-                this.latestLookupResult = addressList.map(address => ({
+                this.latestLookupResult = (0, call_interface_1.statusOrFromValue)(addressList.map(address => ({
                     addresses: [address],
-                }));
+                })));
                 const allAddressesString = '[' +
                     addressList.map(addr => addr.host + ':' + addr.port).join(',') +
                     ']';
@@ -40927,15 +42130,12 @@ class DnsResolver {
                     (0, uri_parser_1.uriToString)(this.target) +
                     ': ' +
                     allAddressesString);
-                if (this.latestLookupResult.length === 0) {
-                    this.listener.onError(this.defaultResolutionError);
-                    return;
-                }
                 /* If the TXT lookup has not yet finished, both of the last two
                  * arguments will be null, which is the equivalent of getting an
                  * empty TXT response. When the TXT lookup does finish, its handler
                  * can update the service config by using the same address list */
-                this.listener.onSuccessfulResolution(this.latestLookupResult, this.latestServiceConfig, this.latestServiceConfigError, null, {});
+                const healthStatus = this.listener(this.latestLookupResult, {}, this.latestServiceConfigResult, '');
+                this.handleHealthStatus(healthStatus);
             }, err => {
                 if (this.pendingLookupPromise === null) {
                     return;
@@ -40946,7 +42146,7 @@ class DnsResolver {
                     err.message);
                 this.pendingLookupPromise = null;
                 this.stopNextResolutionTimer();
-                this.listener.onError(this.defaultResolutionError);
+                this.listener((0, call_interface_1.statusOrFromError)(this.defaultResolutionError), {}, this.latestServiceConfigResult, '');
             });
             /* If there already is a still-pending TXT resolution, we can just use
              * that result when it comes in */
@@ -40960,22 +42160,28 @@ class DnsResolver {
                         return;
                     }
                     this.pendingTxtPromise = null;
+                    let serviceConfig;
                     try {
-                        this.latestServiceConfig = (0, service_config_1.extractAndSelectServiceConfig)(txtRecord, this.percentage);
+                        serviceConfig = (0, service_config_1.extractAndSelectServiceConfig)(txtRecord, this.percentage);
+                        if (serviceConfig) {
+                            this.latestServiceConfigResult = (0, call_interface_1.statusOrFromValue)(serviceConfig);
+                        }
+                        else {
+                            this.latestServiceConfigResult = null;
+                        }
                     }
                     catch (err) {
-                        this.latestServiceConfigError = {
+                        this.latestServiceConfigResult = (0, call_interface_1.statusOrFromError)({
                             code: constants_1.Status.UNAVAILABLE,
-                            details: `Parsing service config failed with error ${err.message}`,
-                            metadata: new metadata_1.Metadata(),
-                        };
+                            details: `Parsing service config failed with error ${err.message}`
+                        });
                     }
                     if (this.latestLookupResult !== null) {
                         /* We rely here on the assumption that calling this function with
                          * identical parameters will be essentialy idempotent, and calling
                          * it with the same address list and a different service config
                          * should result in a fast and seamless switchover. */
-                        this.listener.onSuccessfulResolution(this.latestLookupResult, this.latestServiceConfig, this.latestServiceConfigError, null, {});
+                        this.listener(this.latestLookupResult, {}, this.latestServiceConfigResult, '');
                     }
                 }, err => {
                     /* If TXT lookup fails we should do nothing, which means that we
@@ -40987,6 +42193,21 @@ class DnsResolver {
                      * bubble up as an unhandled promise rejection. */
                 });
             }
+        }
+    }
+    /**
+     * The ResolverListener returns a boolean indicating whether the LB policy
+     * accepted the resolution result. A false result on an otherwise successful
+     * resolution should be treated as a resolution failure.
+     * @param healthStatus
+     */
+    handleHealthStatus(healthStatus) {
+        if (healthStatus) {
+            this.backoff.stop();
+            this.backoff.reset();
+        }
+        else {
+            this.continueResolving = true;
         }
     }
     async lookup(hostname) {
@@ -41082,8 +42303,7 @@ class DnsResolver {
         this.pendingLookupPromise = null;
         this.pendingTxtPromise = null;
         this.latestLookupResult = null;
-        this.latestServiceConfig = null;
-        this.latestServiceConfigError = null;
+        this.latestServiceConfigResult = null;
         this.returnedIpResult = false;
     }
     /**
@@ -41130,9 +42350,11 @@ function setup() {
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.setup = setup;
 const net_1 = __nccwpck_require__(69278);
+const call_interface_1 = __nccwpck_require__(61803);
 const constants_1 = __nccwpck_require__(68288);
 const metadata_1 = __nccwpck_require__(36100);
 const resolver_1 = __nccwpck_require__(76255);
+const subchannel_address_1 = __nccwpck_require__(97021);
 const uri_parser_1 = __nccwpck_require__(56027);
 const logging = __nccwpck_require__(8536);
 const TRACER_NAME = 'ip_resolver';
@@ -41188,17 +42410,17 @@ class IpResolver {
             });
         }
         this.endpoints = addresses.map(address => ({ addresses: [address] }));
-        trace('Parsed ' + target.scheme + ' address list ' + addresses);
+        trace('Parsed ' + target.scheme + ' address list ' + addresses.map(subchannel_address_1.subchannelAddressToString));
     }
     updateResolution() {
         if (!this.hasReturnedResult) {
             this.hasReturnedResult = true;
             process.nextTick(() => {
                 if (this.error) {
-                    this.listener.onError(this.error);
+                    this.listener((0, call_interface_1.statusOrFromError)(this.error), {}, null, '');
                 }
                 else {
-                    this.listener.onSuccessfulResolution(this.endpoints, null, null, null, {});
+                    this.listener((0, call_interface_1.statusOrFromValue)(this.endpoints), {}, null, '');
                 }
             });
         }
@@ -41241,6 +42463,7 @@ function setup() {
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.setup = setup;
 const resolver_1 = __nccwpck_require__(76255);
+const call_interface_1 = __nccwpck_require__(61803);
 class UdsResolver {
     constructor(target, listener, channelOptions) {
         this.listener = listener;
@@ -41258,7 +42481,7 @@ class UdsResolver {
     updateResolution() {
         if (!this.hasReturnedResult) {
             this.hasReturnedResult = true;
-            process.nextTick(this.listener.onSuccessfulResolution, this.endpoints, null, null, null, {});
+            process.nextTick(this.listener, (0, call_interface_1.statusOrFromValue)(this.endpoints), {}, null, '');
         }
     }
     destroy() {
@@ -41297,12 +42520,14 @@ function setup() {
  *
  */
 Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.CHANNEL_ARGS_CONFIG_SELECTOR_KEY = void 0;
 exports.registerResolver = registerResolver;
 exports.registerDefaultScheme = registerDefaultScheme;
 exports.createResolver = createResolver;
 exports.getDefaultAuthority = getDefaultAuthority;
 exports.mapUriDefaultScheme = mapUriDefaultScheme;
 const uri_parser_1 = __nccwpck_require__(56027);
+exports.CHANNEL_ARGS_CONFIG_SELECTOR_KEY = 'grpc.internal.config_selector';
 const registeredResolvers = {};
 let defaultScheme = null;
 /**
@@ -41681,6 +42906,14 @@ class ResolvingCall {
     getCallNumber() {
         return this.callNumber;
     }
+    getAuthContext() {
+        if (this.child) {
+            return this.child.getAuthContext();
+        }
+        else {
+            return null;
+        }
+    }
 }
 exports.ResolvingCall = ResolvingCall;
 //# sourceMappingURL=resolving-call.js.map
@@ -41872,60 +43105,7 @@ class ResolvingLoadBalancer {
             addChannelzChild: channelControlHelper.addChannelzChild.bind(channelControlHelper),
             removeChannelzChild: channelControlHelper.removeChannelzChild.bind(channelControlHelper),
         });
-        this.innerResolver = (0, resolver_1.createResolver)(target, {
-            onSuccessfulResolution: (endpointList, serviceConfig, serviceConfigError, configSelector, attributes) => {
-                var _a;
-                this.backoffTimeout.stop();
-                this.backoffTimeout.reset();
-                let workingServiceConfig = null;
-                /* This first group of conditionals implements the algorithm described
-                 * in https://github.com/grpc/proposal/blob/master/A21-service-config-error-handling.md
-                 * in the section called "Behavior on receiving a new gRPC Config".
-                 */
-                if (serviceConfig === null) {
-                    // Step 4 and 5
-                    if (serviceConfigError === null) {
-                        // Step 5
-                        this.previousServiceConfig = null;
-                        workingServiceConfig = this.defaultServiceConfig;
-                    }
-                    else {
-                        // Step 4
-                        if (this.previousServiceConfig === null) {
-                            // Step 4.ii
-                            this.handleResolutionFailure(serviceConfigError);
-                        }
-                        else {
-                            // Step 4.i
-                            workingServiceConfig = this.previousServiceConfig;
-                        }
-                    }
-                }
-                else {
-                    // Step 3
-                    workingServiceConfig = serviceConfig;
-                    this.previousServiceConfig = serviceConfig;
-                }
-                const workingConfigList = (_a = workingServiceConfig === null || workingServiceConfig === void 0 ? void 0 : workingServiceConfig.loadBalancingConfig) !== null && _a !== void 0 ? _a : [];
-                const loadBalancingConfig = (0, load_balancer_1.selectLbConfigFromList)(workingConfigList, true);
-                if (loadBalancingConfig === null) {
-                    // There were load balancing configs but none are supported. This counts as a resolution failure
-                    this.handleResolutionFailure({
-                        code: constants_1.Status.UNAVAILABLE,
-                        details: 'All load balancer options in service config are not compatible',
-                        metadata: new metadata_1.Metadata(),
-                    });
-                    configSelector === null || configSelector === void 0 ? void 0 : configSelector.unref();
-                    return;
-                }
-                this.childLoadBalancer.updateAddressList(endpointList, loadBalancingConfig, Object.assign(Object.assign({}, this.channelOptions), attributes));
-                const finalServiceConfig = workingServiceConfig !== null && workingServiceConfig !== void 0 ? workingServiceConfig : this.defaultServiceConfig;
-                this.onSuccessfulResolution(finalServiceConfig, configSelector !== null && configSelector !== void 0 ? configSelector : getDefaultConfigSelector(finalServiceConfig));
-            },
-            onError: (error) => {
-                this.handleResolutionFailure(error);
-            },
-        }, channelOptions);
+        this.innerResolver = (0, resolver_1.createResolver)(target, this.handleResolverResult.bind(this), channelOptions);
         const backoffOptions = {
             initialDelay: channelOptions['grpc.initial_reconnect_backoff_ms'],
             maxDelay: channelOptions['grpc.max_reconnect_backoff_ms'],
@@ -41940,6 +43120,47 @@ class ResolvingLoadBalancer {
             }
         }, backoffOptions);
         this.backoffTimeout.unref();
+    }
+    handleResolverResult(endpointList, attributes, serviceConfig, resolutionNote) {
+        var _a, _b;
+        this.backoffTimeout.stop();
+        this.backoffTimeout.reset();
+        let resultAccepted = true;
+        let workingServiceConfig = null;
+        if (serviceConfig === null) {
+            workingServiceConfig = this.defaultServiceConfig;
+        }
+        else if (serviceConfig.ok) {
+            workingServiceConfig = serviceConfig.value;
+        }
+        else {
+            if (this.previousServiceConfig !== null) {
+                workingServiceConfig = this.previousServiceConfig;
+            }
+            else {
+                resultAccepted = false;
+                this.handleResolutionFailure(serviceConfig.error);
+            }
+        }
+        if (workingServiceConfig !== null) {
+            const workingConfigList = (_a = workingServiceConfig === null || workingServiceConfig === void 0 ? void 0 : workingServiceConfig.loadBalancingConfig) !== null && _a !== void 0 ? _a : [];
+            const loadBalancingConfig = (0, load_balancer_1.selectLbConfigFromList)(workingConfigList, true);
+            if (loadBalancingConfig === null) {
+                resultAccepted = false;
+                this.handleResolutionFailure({
+                    code: constants_1.Status.UNAVAILABLE,
+                    details: 'All load balancer options in service config are not compatible',
+                    metadata: new metadata_1.Metadata(),
+                });
+            }
+            else {
+                resultAccepted = this.childLoadBalancer.updateAddressList(endpointList, loadBalancingConfig, Object.assign(Object.assign({}, this.channelOptions), attributes), resolutionNote);
+            }
+        }
+        if (resultAccepted) {
+            this.onSuccessfulResolution(workingServiceConfig, (_b = attributes[resolver_1.CHANNEL_ARGS_CONFIG_SELECTOR_KEY]) !== null && _b !== void 0 ? _b : getDefaultConfigSelector(workingServiceConfig));
+        }
+        return resultAccepted;
     }
     updateResolution() {
         this.innerResolver.updateResolution();
@@ -42308,13 +43529,18 @@ class RetryingCall {
                 value.toString().toLowerCase() === ((_a = constants_1.Status[code]) === null || _a === void 0 ? void 0 : _a.toLowerCase());
         });
     }
+    getNextRetryJitter() {
+        /* Jitter of +-20% is applied: https://github.com/grpc/proposal/blob/master/A6-client-retries.md#exponential-backoff */
+        return Math.random() * (1.2 - 0.8) + 0.8;
+    }
     getNextRetryBackoffMs() {
         var _a;
         const retryPolicy = (_a = this.callConfig) === null || _a === void 0 ? void 0 : _a.methodConfig.retryPolicy;
         if (!retryPolicy) {
             return 0;
         }
-        const nextBackoffMs = Math.random() * this.nextRetryBackoffSec * 1000;
+        const jitter = this.getNextRetryJitter();
+        const nextBackoffMs = jitter * this.nextRetryBackoffSec * 1000;
         const maxBackoffSec = Number(retryPolicy.maxBackoff.substring(0, retryPolicy.maxBackoff.length - 1));
         this.nextRetryBackoffSec = Math.min(this.nextRetryBackoffSec * retryPolicy.backoffMultiplier, maxBackoffSec);
         return nextBackoffMs;
@@ -42536,7 +43762,7 @@ class RetryingCall {
             state: 'ACTIVE',
             call: child,
             nextMessageToSend: 0,
-            startTime: new Date()
+            startTime: new Date(),
         });
         const previousAttempts = this.attempts - 1;
         const initialMetadata = this.initialMetadata.clone();
@@ -42584,12 +43810,11 @@ class RetryingCall {
         this.startNewAttempt();
         this.maybeStartHedgingTimer();
     }
-    handleChildWriteCompleted(childIndex) {
+    handleChildWriteCompleted(childIndex, messageIndex) {
         var _a, _b;
-        const childCall = this.underlyingCalls[childIndex];
-        const messageIndex = childCall.nextMessageToSend;
         (_b = (_a = this.getBufferEntry(messageIndex)).callback) === null || _b === void 0 ? void 0 : _b.call(_a);
         this.clearSentMessages();
+        const childCall = this.underlyingCalls[childIndex];
         childCall.nextMessageToSend += 1;
         this.sendNextChildMessage(childIndex);
     }
@@ -42598,16 +43823,28 @@ class RetryingCall {
         if (childCall.state === 'COMPLETED') {
             return;
         }
-        if (this.getBufferEntry(childCall.nextMessageToSend)) {
-            const bufferEntry = this.getBufferEntry(childCall.nextMessageToSend);
+        const messageIndex = childCall.nextMessageToSend;
+        if (this.getBufferEntry(messageIndex)) {
+            const bufferEntry = this.getBufferEntry(messageIndex);
             switch (bufferEntry.entryType) {
                 case 'MESSAGE':
                     childCall.call.sendMessageWithContext({
                         callback: error => {
                             // Ignore error
-                            this.handleChildWriteCompleted(childIndex);
+                            this.handleChildWriteCompleted(childIndex, messageIndex);
                         },
                     }, bufferEntry.message.message);
+                    // Optimization: if the next entry is HALF_CLOSE, send it immediately
+                    // without waiting for the message callback. This is safe because the message
+                    // has already been passed to the underlying transport.
+                    const nextEntry = this.getBufferEntry(messageIndex + 1);
+                    if (nextEntry.entryType === 'HALF_CLOSE') {
+                        this.trace('Sending halfClose immediately after message to child [' +
+                            childCall.call.getCallNumber() +
+                            '] - optimizing for unary/final message');
+                        childCall.nextMessageToSend += 1;
+                        childCall.call.halfClose();
+                    }
                     break;
                 case 'HALF_CLOSE':
                     childCall.nextMessageToSend += 1;
@@ -42620,7 +43857,6 @@ class RetryingCall {
         }
     }
     sendMessageWithContext(context, message) {
-        var _a;
         this.trace('write() called with message of length ' + message.length);
         const writeObj = {
             message,
@@ -42634,14 +43870,19 @@ class RetryingCall {
         };
         this.writeBuffer.push(bufferEntry);
         if (bufferEntry.allocated) {
-            (_a = context.callback) === null || _a === void 0 ? void 0 : _a.call(context);
+            // Run this in next tick to avoid suspending the current execution context
+            // otherwise it might cause half closing the call before sending message
+            process.nextTick(() => {
+                var _a;
+                (_a = context.callback) === null || _a === void 0 ? void 0 : _a.call(context);
+            });
             for (const [callIndex, call] of this.underlyingCalls.entries()) {
                 if (call.state === 'ACTIVE' &&
                     call.nextMessageToSend === messageIndex) {
                     call.call.sendMessageWithContext({
                         callback: error => {
                             // Ignore error
-                            this.handleChildWriteCompleted(callIndex);
+                            this.handleChildWriteCompleted(callIndex, messageIndex);
                         },
                     }, message);
                 }
@@ -42659,7 +43900,7 @@ class RetryingCall {
                 call.call.sendMessageWithContext({
                     callback: error => {
                         // Ignore error
-                        this.handleChildWriteCompleted(this.committedCallIndex);
+                        this.handleChildWriteCompleted(this.committedCallIndex, messageIndex);
                     },
                 }, message);
             }
@@ -42682,10 +43923,19 @@ class RetryingCall {
             allocated: false,
         });
         for (const call of this.underlyingCalls) {
-            if ((call === null || call === void 0 ? void 0 : call.state) === 'ACTIVE' &&
-                call.nextMessageToSend === halfCloseIndex) {
-                call.nextMessageToSend += 1;
-                call.call.halfClose();
+            if ((call === null || call === void 0 ? void 0 : call.state) === 'ACTIVE') {
+                // Send halfClose to call when either:
+                // - nextMessageToSend === halfCloseIndex - 1: last message sent, callback pending (optimization)
+                // - nextMessageToSend === halfCloseIndex: all messages sent and acknowledged
+                if (call.nextMessageToSend === halfCloseIndex
+                    || call.nextMessageToSend === halfCloseIndex - 1) {
+                    this.trace('Sending halfClose immediately to child [' +
+                        call.call.getCallNumber() +
+                        '] - all messages already sent');
+                    call.nextMessageToSend += 1;
+                    call.call.halfClose();
+                }
+                // Otherwise, halfClose will be sent by sendNextChildMessage when message callbacks complete
             }
         }
     }
@@ -42697,6 +43947,14 @@ class RetryingCall {
     }
     getHost() {
         return this.host;
+    }
+    getAuthContext() {
+        if (this.committedCallIndex !== null) {
+            return this.underlyingCalls[this.committedCallIndex].call.getAuthContext();
+        }
+        else {
+            return null;
+        }
     }
 }
 exports.RetryingCall = RetryingCall;
@@ -42773,6 +44031,12 @@ class ServerUnaryCallImpl extends events_1.EventEmitter {
     getHost() {
         return this.call.getHost();
     }
+    getAuthContext() {
+        return this.call.getAuthContext();
+    }
+    getMetricsRecorder() {
+        return this.call.getMetricsRecorder();
+    }
 }
 exports.ServerUnaryCallImpl = ServerUnaryCallImpl;
 class ServerReadableStreamImpl extends stream_1.Readable {
@@ -42800,6 +44064,12 @@ class ServerReadableStreamImpl extends stream_1.Readable {
     }
     getHost() {
         return this.call.getHost();
+    }
+    getAuthContext() {
+        return this.call.getAuthContext();
+    }
+    getMetricsRecorder() {
+        return this.call.getMetricsRecorder();
     }
 }
 exports.ServerReadableStreamImpl = ServerReadableStreamImpl;
@@ -42835,6 +44105,12 @@ class ServerWritableStreamImpl extends stream_1.Writable {
     }
     getHost() {
         return this.call.getHost();
+    }
+    getAuthContext() {
+        return this.call.getAuthContext();
+    }
+    getMetricsRecorder() {
+        return this.call.getMetricsRecorder();
     }
     _write(chunk, encoding, 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -42886,6 +44162,12 @@ class ServerDuplexStreamImpl extends stream_1.Duplex {
     }
     getHost() {
         return this.call.getHost();
+    }
+    getAuthContext() {
+        return this.call.getAuthContext();
+    }
+    getMetricsRecorder() {
+        return this.call.getMetricsRecorder();
     }
     _read(size) {
         this.call.startRead();
@@ -43266,6 +44548,8 @@ const error_1 = __nccwpck_require__(98219);
 const zlib = __nccwpck_require__(43106);
 const stream_decoder_1 = __nccwpck_require__(47956);
 const logging = __nccwpck_require__(8536);
+const tls_1 = __nccwpck_require__(64756);
+const orca_1 = __nccwpck_require__(82124);
 const TRACER_NAME = 'server_call';
 function trace(text) {
     logging.trace(constants_1.LogVerbosity.DEBUG, TRACER_NAME, text);
@@ -43541,6 +44825,15 @@ class ServerInterceptingCall {
     getHost() {
         return this.nextCall.getHost();
     }
+    getAuthContext() {
+        return this.nextCall.getAuthContext();
+    }
+    getConnectionInfo() {
+        return this.nextCall.getConnectionInfo();
+    }
+    getMetricsRecorder() {
+        return this.nextCall.getMetricsRecorder();
+    }
 }
 exports.ServerInterceptingCall = ServerInterceptingCall;
 const GRPC_ACCEPT_ENCODING_HEADER = 'grpc-accept-encoding';
@@ -43572,7 +44865,7 @@ const defaultResponseOptions = {
 };
 class BaseServerInterceptingCall {
     constructor(stream, headers, callEventTracker, handler, options) {
-        var _a;
+        var _a, _b;
         this.stream = stream;
         this.callEventTracker = callEventTracker;
         this.handler = handler;
@@ -43590,13 +44883,7 @@ class BaseServerInterceptingCall {
         this.isReadPending = false;
         this.receivedHalfClose = false;
         this.streamEnded = false;
-        this.stream.once('error', (err) => {
-            /* We need an error handler to avoid uncaught error event exceptions, but
-             * there is nothing we can reasonably do here. Any error event should
-             * have a corresponding close event, which handles emitting the cancelled
-             * event. And the stream is now in a bad state, so we can't reasonably
-             * expect to be able to send an error over it. */
-        });
+        this.metricsRecorder = new orca_1.PerRequestMetricRecorder();
         this.stream.once('close', () => {
             var _a;
             trace('Request to method ' +
@@ -43652,6 +44939,14 @@ class BaseServerInterceptingCall {
         metadata.remove(http2.constants.HTTP2_HEADER_TE);
         metadata.remove(http2.constants.HTTP2_HEADER_CONTENT_TYPE);
         this.metadata = metadata;
+        const socket = (_b = stream.session) === null || _b === void 0 ? void 0 : _b.socket;
+        this.connectionInfo = {
+            localAddress: socket === null || socket === void 0 ? void 0 : socket.localAddress,
+            localPort: socket === null || socket === void 0 ? void 0 : socket.localPort,
+            remoteAddress: socket === null || socket === void 0 ? void 0 : socket.remoteAddress,
+            remotePort: socket === null || socket === void 0 ? void 0 : socket.remotePort
+        };
+        this.shouldSendMetrics = !!options['grpc.server_call_metric_recording'];
     }
     handleTimeoutHeader(timeoutHeader) {
         const match = timeoutHeader.toString().match(DEADLINE_REGEX);
@@ -43746,6 +45041,12 @@ class BaseServerInterceptingCall {
             return new Promise((resolve, reject) => {
                 let totalLength = 0;
                 const messageParts = [];
+                decompresser.on('error', (error) => {
+                    reject({
+                        code: constants_1.Status.INTERNAL,
+                        details: 'Failed to decompress message'
+                    });
+                });
                 decompresser.on('data', (chunk) => {
                     messageParts.push(chunk);
                     totalLength += chunk.byteLength;
@@ -43919,7 +45220,7 @@ class BaseServerInterceptingCall {
         });
     }
     sendStatus(status) {
-        var _a, _b;
+        var _a, _b, _c;
         if (this.checkCancelled()) {
             return;
         }
@@ -43929,17 +45230,20 @@ class BaseServerInterceptingCall {
             constants_1.Status[status.code] +
             ' details: ' +
             status.details);
+        const statusMetadata = (_c = (_b = status.metadata) === null || _b === void 0 ? void 0 : _b.clone()) !== null && _c !== void 0 ? _c : new metadata_1.Metadata();
+        if (this.shouldSendMetrics) {
+            statusMetadata.set(orca_1.GRPC_METRICS_HEADER, this.metricsRecorder.serialize());
+        }
         if (this.metadataSent) {
             if (!this.wantTrailers) {
                 this.wantTrailers = true;
                 this.stream.once('wantTrailers', () => {
-                    var _a;
                     if (this.callEventTracker && !this.streamEnded) {
                         this.streamEnded = true;
                         this.callEventTracker.onStreamEnd(true);
                         this.callEventTracker.onCallEnd(status);
                     }
-                    const trailersToSend = Object.assign({ [GRPC_STATUS_HEADER]: status.code, [GRPC_MESSAGE_HEADER]: encodeURI(status.details) }, (_a = status.metadata) === null || _a === void 0 ? void 0 : _a.toHttp2Headers());
+                    const trailersToSend = Object.assign({ [GRPC_STATUS_HEADER]: status.code, [GRPC_MESSAGE_HEADER]: encodeURI(status.details) }, statusMetadata.toHttp2Headers());
                     this.stream.sendTrailers(trailersToSend);
                     this.notifyOnCancel();
                 });
@@ -43956,7 +45260,7 @@ class BaseServerInterceptingCall {
                 this.callEventTracker.onCallEnd(status);
             }
             // Trailers-only response
-            const trailersToSend = Object.assign(Object.assign({ [GRPC_STATUS_HEADER]: status.code, [GRPC_MESSAGE_HEADER]: encodeURI(status.details) }, defaultResponseHeaders), (_b = status.metadata) === null || _b === void 0 ? void 0 : _b.toHttp2Headers());
+            const trailersToSend = Object.assign(Object.assign({ [GRPC_STATUS_HEADER]: status.code, [GRPC_MESSAGE_HEADER]: encodeURI(status.details) }, defaultResponseHeaders), statusMetadata.toHttp2Headers());
             this.stream.respond(trailersToSend, { endStream: true });
             this.notifyOnCancel();
         }
@@ -43996,6 +45300,25 @@ class BaseServerInterceptingCall {
     }
     getHost() {
         return this.host;
+    }
+    getAuthContext() {
+        var _a;
+        if (((_a = this.stream.session) === null || _a === void 0 ? void 0 : _a.socket) instanceof tls_1.TLSSocket) {
+            const peerCertificate = this.stream.session.socket.getPeerCertificate();
+            return {
+                transportSecurityType: 'ssl',
+                sslPeerCertificate: peerCertificate.raw ? peerCertificate : undefined
+            };
+        }
+        else {
+            return {};
+        }
+    }
+    getConnectionInfo() {
+        return this.connectionInfo;
+    }
+    getMetricsRecorder() {
+        return this.metricsRecorder;
     }
 }
 exports.BaseServerInterceptingCall = BaseServerInterceptingCall;
@@ -44514,20 +45837,23 @@ let Server = (() => {
             }
             resolvePort(port) {
                 return new Promise((resolve, reject) => {
-                    const resolverListener = {
-                        onSuccessfulResolution: (endpointList, serviceConfig, serviceConfigError) => {
-                            // We only want one resolution result. Discard all future results
-                            resolverListener.onSuccessfulResolution = () => { };
-                            const addressList = [].concat(...endpointList.map(endpoint => endpoint.addresses));
-                            if (addressList.length === 0) {
-                                reject(new Error(`No addresses resolved for port ${port}`));
-                                return;
-                            }
-                            resolve(addressList);
-                        },
-                        onError: error => {
-                            reject(new Error(error.details));
-                        },
+                    let seenResolution = false;
+                    const resolverListener = (endpointList, attributes, serviceConfig, resolutionNote) => {
+                        if (seenResolution) {
+                            return true;
+                        }
+                        seenResolution = true;
+                        if (!endpointList.ok) {
+                            reject(new Error(endpointList.error.details));
+                            return true;
+                        }
+                        const addressList = [].concat(...endpointList.value.map(endpoint => endpoint.addresses));
+                        if (addressList.length === 0) {
+                            reject(new Error(`No addresses resolved for port ${port}`));
+                            return true;
+                        }
+                        resolve(addressList);
+                        return true;
                     };
                     const resolver = (0, resolver_1.createResolver)(port, resolverListener, this.options);
                     resolver.updateResolution();
@@ -44956,6 +46282,13 @@ let Server = (() => {
                 channelzSessionInfo === null || channelzSessionInfo === void 0 ? void 0 : channelzSessionInfo.streamTracker.addCallFailed();
             }
             _channelzHandler(extraInterceptors, stream, headers) {
+                stream.once('error', (err) => {
+                    /* We need an error handler to avoid uncaught error event exceptions, but
+                     * there is nothing we can reasonably do here. Any error event should
+                     * have a corresponding close event, which handles emitting the cancelled
+                     * event. And the stream is now in a bad state, so we can't reasonably
+                     * expect to be able to send an error over it. */
+                });
                 // for handling idle timeout
                 this.onStreamOpened(stream);
                 const channelzSessionInfo = this.sessions.get(stream.session);
@@ -45015,6 +46348,13 @@ let Server = (() => {
                 }
             }
             _streamHandler(extraInterceptors, stream, headers) {
+                stream.once('error', (err) => {
+                    /* We need an error handler to avoid uncaught error event exceptions, but
+                     * there is nothing we can reasonably do here. Any error event should
+                     * have a corresponding close event, which handles emitting the cancelled
+                     * event. And the stream is now in a bad state, so we can't reasonably
+                     * expect to be able to send an error over it. */
+                });
                 // for handling idle timeout
                 this.onStreamOpened(stream);
                 if (this._verifyContentType(stream, headers) !== true) {
@@ -45153,7 +46493,7 @@ let Server = (() => {
                                 if (err) {
                                     this.keepaliveTrace('Ping failed with error: ' + err.message);
                                     sessionClosedByServer = true;
-                                    session.close();
+                                    session.destroy();
                                 }
                                 else {
                                     this.keepaliveTrace('Received ping response');
@@ -45173,7 +46513,7 @@ let Server = (() => {
                             this.keepaliveTrace('Ping send failed: ' + pingSendError);
                             this.trace('Connection dropped due to ping send error: ' + pingSendError);
                             sessionClosedByServer = true;
-                            session.close();
+                            session.destroy();
                             return;
                         }
                         keepaliveTimer = setTimeout(() => {
@@ -45181,7 +46521,7 @@ let Server = (() => {
                             this.keepaliveTrace('Ping timeout passed without response');
                             this.trace('Connection dropped by keepalive timeout');
                             sessionClosedByServer = true;
-                            session.close();
+                            session.destroy();
                         }, this.keepaliveTimeoutMs);
                         (_b = keepaliveTimer.unref) === null || _b === void 0 ? void 0 : _b.call(keepaliveTimer);
                     };
@@ -45300,7 +46640,7 @@ let Server = (() => {
                                         ' return in ' +
                                         duration);
                                     sessionClosedByServer = true;
-                                    session.close();
+                                    session.destroy();
                                 }
                                 else {
                                     this.keepaliveTrace('Received ping response');
@@ -45320,7 +46660,7 @@ let Server = (() => {
                             this.keepaliveTrace('Ping send failed: ' + pingSendError);
                             this.channelzTrace.addTrace('CT_INFO', 'Connection dropped due to ping send error: ' + pingSendError);
                             sessionClosedByServer = true;
-                            session.close();
+                            session.destroy();
                             return;
                         }
                         channelzSessionInfo.keepAlivesSent += 1;
@@ -45329,7 +46669,7 @@ let Server = (() => {
                             this.keepaliveTrace('Ping timeout passed without response');
                             this.channelzTrace.addTrace('CT_INFO', 'Connection dropped by keepalive timeout from ' + clientAddress);
                             sessionClosedByServer = true;
-                            session.close();
+                            session.destroy();
                         }, this.keepaliveTimeoutMs);
                         (_b = keepaliveTimeout.unref) === null || _b === void 0 ? void 0 : _b.call(keepaliveTimeout);
                     };
@@ -46062,6 +47402,258 @@ function extractAndSelectServiceConfig(txtRecord, percentage) {
     return null;
 }
 //# sourceMappingURL=service-config.js.map
+
+/***/ }),
+
+/***/ 40701:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+/*
+ * Copyright 2025 gRPC authors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ */
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.SingleSubchannelChannel = void 0;
+const call_number_1 = __nccwpck_require__(35675);
+const channelz_1 = __nccwpck_require__(68198);
+const compression_filter_1 = __nccwpck_require__(43430);
+const connectivity_state_1 = __nccwpck_require__(60778);
+const constants_1 = __nccwpck_require__(68288);
+const control_plane_status_1 = __nccwpck_require__(39962);
+const deadline_1 = __nccwpck_require__(52173);
+const filter_stack_1 = __nccwpck_require__(95726);
+const metadata_1 = __nccwpck_require__(36100);
+const resolver_1 = __nccwpck_require__(76255);
+const uri_parser_1 = __nccwpck_require__(56027);
+class SubchannelCallWrapper {
+    constructor(subchannel, method, filterStackFactory, options, callNumber) {
+        var _a, _b;
+        this.subchannel = subchannel;
+        this.method = method;
+        this.options = options;
+        this.callNumber = callNumber;
+        this.childCall = null;
+        this.pendingMessage = null;
+        this.readPending = false;
+        this.halfClosePending = false;
+        this.pendingStatus = null;
+        this.readFilterPending = false;
+        this.writeFilterPending = false;
+        const splitPath = this.method.split('/');
+        let serviceName = '';
+        /* The standard path format is "/{serviceName}/{methodName}", so if we split
+          * by '/', the first item should be empty and the second should be the
+          * service name */
+        if (splitPath.length >= 2) {
+            serviceName = splitPath[1];
+        }
+        const hostname = (_b = (_a = (0, uri_parser_1.splitHostPort)(this.options.host)) === null || _a === void 0 ? void 0 : _a.host) !== null && _b !== void 0 ? _b : 'localhost';
+        /* Currently, call credentials are only allowed on HTTPS connections, so we
+          * can assume that the scheme is "https" */
+        this.serviceUrl = `https://${hostname}/${serviceName}`;
+        const timeout = (0, deadline_1.getRelativeTimeout)(options.deadline);
+        if (timeout !== Infinity) {
+            if (timeout <= 0) {
+                this.cancelWithStatus(constants_1.Status.DEADLINE_EXCEEDED, 'Deadline exceeded');
+            }
+            else {
+                setTimeout(() => {
+                    this.cancelWithStatus(constants_1.Status.DEADLINE_EXCEEDED, 'Deadline exceeded');
+                }, timeout);
+            }
+        }
+        this.filterStack = filterStackFactory.createFilter();
+    }
+    cancelWithStatus(status, details) {
+        if (this.childCall) {
+            this.childCall.cancelWithStatus(status, details);
+        }
+        else {
+            this.pendingStatus = {
+                code: status,
+                details: details,
+                metadata: new metadata_1.Metadata()
+            };
+        }
+    }
+    getPeer() {
+        var _a, _b;
+        return (_b = (_a = this.childCall) === null || _a === void 0 ? void 0 : _a.getPeer()) !== null && _b !== void 0 ? _b : this.subchannel.getAddress();
+    }
+    async start(metadata, listener) {
+        if (this.pendingStatus) {
+            listener.onReceiveStatus(this.pendingStatus);
+            return;
+        }
+        if (this.subchannel.getConnectivityState() !== connectivity_state_1.ConnectivityState.READY) {
+            listener.onReceiveStatus({
+                code: constants_1.Status.UNAVAILABLE,
+                details: 'Subchannel not ready',
+                metadata: new metadata_1.Metadata()
+            });
+            return;
+        }
+        const filteredMetadata = await this.filterStack.sendMetadata(Promise.resolve(metadata));
+        let credsMetadata;
+        try {
+            credsMetadata = await this.subchannel.getCallCredentials()
+                .generateMetadata({ method_name: this.method, service_url: this.serviceUrl });
+        }
+        catch (e) {
+            const error = e;
+            const { code, details } = (0, control_plane_status_1.restrictControlPlaneStatusCode)(typeof error.code === 'number' ? error.code : constants_1.Status.UNKNOWN, `Getting metadata from plugin failed with error: ${error.message}`);
+            listener.onReceiveStatus({
+                code: code,
+                details: details,
+                metadata: new metadata_1.Metadata(),
+            });
+            return;
+        }
+        credsMetadata.merge(filteredMetadata);
+        const childListener = {
+            onReceiveMetadata: async (metadata) => {
+                listener.onReceiveMetadata(await this.filterStack.receiveMetadata(metadata));
+            },
+            onReceiveMessage: async (message) => {
+                this.readFilterPending = true;
+                const filteredMessage = await this.filterStack.receiveMessage(message);
+                this.readFilterPending = false;
+                listener.onReceiveMessage(filteredMessage);
+                if (this.pendingStatus) {
+                    listener.onReceiveStatus(this.pendingStatus);
+                }
+            },
+            onReceiveStatus: async (status) => {
+                const filteredStatus = await this.filterStack.receiveTrailers(status);
+                if (this.readFilterPending) {
+                    this.pendingStatus = filteredStatus;
+                }
+                else {
+                    listener.onReceiveStatus(filteredStatus);
+                }
+            }
+        };
+        this.childCall = this.subchannel.createCall(credsMetadata, this.options.host, this.method, childListener);
+        if (this.readPending) {
+            this.childCall.startRead();
+        }
+        if (this.pendingMessage) {
+            this.childCall.sendMessageWithContext(this.pendingMessage.context, this.pendingMessage.message);
+        }
+        if (this.halfClosePending && !this.writeFilterPending) {
+            this.childCall.halfClose();
+        }
+    }
+    async sendMessageWithContext(context, message) {
+        this.writeFilterPending = true;
+        const filteredMessage = await this.filterStack.sendMessage(Promise.resolve({ message: message, flags: context.flags }));
+        this.writeFilterPending = false;
+        if (this.childCall) {
+            this.childCall.sendMessageWithContext(context, filteredMessage.message);
+            if (this.halfClosePending) {
+                this.childCall.halfClose();
+            }
+        }
+        else {
+            this.pendingMessage = { context, message: filteredMessage.message };
+        }
+    }
+    startRead() {
+        if (this.childCall) {
+            this.childCall.startRead();
+        }
+        else {
+            this.readPending = true;
+        }
+    }
+    halfClose() {
+        if (this.childCall && !this.writeFilterPending) {
+            this.childCall.halfClose();
+        }
+        else {
+            this.halfClosePending = true;
+        }
+    }
+    getCallNumber() {
+        return this.callNumber;
+    }
+    setCredentials(credentials) {
+        throw new Error("Method not implemented.");
+    }
+    getAuthContext() {
+        if (this.childCall) {
+            return this.childCall.getAuthContext();
+        }
+        else {
+            return null;
+        }
+    }
+}
+class SingleSubchannelChannel {
+    constructor(subchannel, target, options) {
+        this.subchannel = subchannel;
+        this.target = target;
+        this.channelzEnabled = false;
+        this.channelzTrace = new channelz_1.ChannelzTrace();
+        this.callTracker = new channelz_1.ChannelzCallTracker();
+        this.childrenTracker = new channelz_1.ChannelzChildrenTracker();
+        this.channelzEnabled = options['grpc.enable_channelz'] !== 0;
+        this.channelzRef = (0, channelz_1.registerChannelzChannel)((0, uri_parser_1.uriToString)(target), () => ({
+            target: `${(0, uri_parser_1.uriToString)(target)} (${subchannel.getAddress()})`,
+            state: this.subchannel.getConnectivityState(),
+            trace: this.channelzTrace,
+            callTracker: this.callTracker,
+            children: this.childrenTracker.getChildLists()
+        }), this.channelzEnabled);
+        if (this.channelzEnabled) {
+            this.childrenTracker.refChild(subchannel.getChannelzRef());
+        }
+        this.filterStackFactory = new filter_stack_1.FilterStackFactory([new compression_filter_1.CompressionFilterFactory(this, options)]);
+    }
+    close() {
+        if (this.channelzEnabled) {
+            this.childrenTracker.unrefChild(this.subchannel.getChannelzRef());
+        }
+        (0, channelz_1.unregisterChannelzRef)(this.channelzRef);
+    }
+    getTarget() {
+        return (0, uri_parser_1.uriToString)(this.target);
+    }
+    getConnectivityState(tryToConnect) {
+        throw new Error("Method not implemented.");
+    }
+    watchConnectivityState(currentState, deadline, callback) {
+        throw new Error("Method not implemented.");
+    }
+    getChannelzRef() {
+        return this.channelzRef;
+    }
+    createCall(method, deadline) {
+        const callOptions = {
+            deadline: deadline,
+            host: (0, resolver_1.getDefaultAuthority)(this.target),
+            flags: constants_1.Propagate.DEFAULTS,
+            parentCall: null
+        };
+        return new SubchannelCallWrapper(this.subchannel, method, this.filterStackFactory, callOptions, (0, call_number_1.getNextCallNumber)());
+    }
+}
+exports.SingleSubchannelChannel = SingleSubchannelChannel;
+//# sourceMappingURL=single-subchannel-channel.js.map
 
 /***/ }),
 
@@ -46944,6 +48536,9 @@ class Http2SubchannelCall {
     getCallNumber() {
         return this.callId;
     }
+    getAuthContext() {
+        return this.transport.getAuthContext();
+    }
     startRead() {
         /* If the stream has ended with an error, we should not emit any more
          * messages and we should communicate that the stream has ended */
@@ -47033,6 +48628,8 @@ class BaseSubchannelWrapper {
         this.child = child;
         this.healthy = true;
         this.healthListeners = new Set();
+        this.refcount = 0;
+        this.dataWatchers = new Set();
         child.addHealthStateWatcher(childHealthy => {
             /* A change to the child health state only affects this wrapper's overall
              * health state if this wrapper is reporting healthy. */
@@ -47066,9 +48663,19 @@ class BaseSubchannelWrapper {
     }
     ref() {
         this.child.ref();
+        this.refcount += 1;
     }
     unref() {
         this.child.unref();
+        this.refcount -= 1;
+        if (this.refcount === 0) {
+            this.destroy();
+        }
+    }
+    destroy() {
+        for (const watcher of this.dataWatchers) {
+            watcher.destroy();
+        }
     }
     getChannelzRef() {
         return this.child.getChannelzRef();
@@ -47081,6 +48688,10 @@ class BaseSubchannelWrapper {
     }
     removeHealthStateWatcher(listener) {
         this.healthListeners.delete(listener);
+    }
+    addDataWatcher(dataWatcher) {
+        dataWatcher.setSubchannel(this.getRealSubchannel());
+        this.dataWatchers.add(dataWatcher);
     }
     setHealthy(healthy) {
         if (healthy !== this.healthy) {
@@ -47100,6 +48711,9 @@ class BaseSubchannelWrapper {
     }
     getCallCredentials() {
         return this.child.getCallCredentials();
+    }
+    getChannel() {
+        return this.child.getChannel();
     }
 }
 exports.BaseSubchannelWrapper = BaseSubchannelWrapper;
@@ -47281,6 +48895,7 @@ const constants_1 = __nccwpck_require__(68288);
 const uri_parser_1 = __nccwpck_require__(56027);
 const subchannel_address_1 = __nccwpck_require__(97021);
 const channelz_1 = __nccwpck_require__(68198);
+const single_subchannel_channel_1 = __nccwpck_require__(40701);
 const TRACER_NAME = 'subchannel';
 /* setInterval and setTimeout only accept signed 32 bit integers. JS doesn't
  * have a constant for the max signed 32 bit integer, so this is a simple way
@@ -47329,6 +48944,8 @@ class Subchannel {
         this.refcount = 0;
         // Channelz info
         this.channelzEnabled = true;
+        this.dataProducers = new Map();
+        this.subchannelChannel = null;
         const backoffOptions = {
             initialDelay: options['grpc.initial_reconnect_backoff_ms'],
             maxDelay: options['grpc.max_reconnect_backoff_ms'],
@@ -47625,6 +49242,27 @@ class Subchannel {
     getCallCredentials() {
         return this.secureConnector.getCallCredentials();
     }
+    getChannel() {
+        if (!this.subchannelChannel) {
+            this.subchannelChannel = new single_subchannel_channel_1.SingleSubchannelChannel(this, this.channelTarget, this.options);
+        }
+        return this.subchannelChannel;
+    }
+    addDataWatcher(dataWatcher) {
+        throw new Error('Not implemented');
+    }
+    getOrCreateDataProducer(name, createDataProducer) {
+        const existingProducer = this.dataProducers.get(name);
+        if (existingProducer) {
+            return existingProducer;
+        }
+        const newProducer = createDataProducer(this);
+        this.dataProducers.set(name, newProducer);
+        return newProducer;
+    }
+    removeDataProducer(name) {
+        this.dataProducers.delete(name);
+    }
 }
 exports.Subchannel = Subchannel;
 //# sourceMappingURL=subchannel.js.map
@@ -47696,6 +49334,7 @@ function getDefaultRootsData() {
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.Http2SubchannelConnector = void 0;
 const http2 = __nccwpck_require__(85675);
+const tls_1 = __nccwpck_require__(64756);
 const channelz_1 = __nccwpck_require__(68198);
 const constants_1 = __nccwpck_require__(68288);
 const http_proxy_1 = __nccwpck_require__(18954);
@@ -47823,6 +49462,15 @@ class Http2Transport {
          * which should only happen after everything else is set up. */
         if (this.keepaliveWithoutCalls) {
             this.maybeStartKeepalivePingTimer();
+        }
+        if (session.socket instanceof tls_1.TLSSocket) {
+            this.authContext = {
+                transportSecurityType: 'ssl',
+                sslPeerCertificate: session.socket.getPeerCertificate()
+            };
+        }
+        else {
+            this.authContext = {};
         }
     }
     getChannelzInfo() {
@@ -48141,6 +49789,9 @@ class Http2Transport {
     getOptions() {
         return this.options;
     }
+    getAuthContext() {
+        return this.authContext;
+    }
     shutdown() {
         this.session.close();
         (0, channelz_1.unregisterChannelzRef)(this.channelzRef);
@@ -48163,6 +49814,7 @@ class Http2SubchannelConnector {
             return Promise.reject('Connection closed before starting HTTP/2 handshake');
         }
         return new Promise((resolve, reject) => {
+            var _a, _b, _c, _d, _e, _f, _g, _h;
             let remoteName = null;
             let realTarget = this.channelTarget;
             if ('grpc.http_connect_target' in options) {
@@ -48199,19 +49851,40 @@ class Http2SubchannelConnector {
             const sessionOptions = {
                 createConnection: (authority, option) => {
                     return secureConnectResult.socket;
-                }
+                },
+                settings: {
+                    initialWindowSize: (_d = (_a = options['grpc-node.flow_control_window']) !== null && _a !== void 0 ? _a : (_c = (_b = http2.getDefaultSettings) === null || _b === void 0 ? void 0 : _b.call(http2)) === null || _c === void 0 ? void 0 : _c.initialWindowSize) !== null && _d !== void 0 ? _d : 65535,
+                },
+                maxSendHeaderBlockLength: Number.MAX_SAFE_INTEGER,
+                /* By default, set a very large max session memory limit, to effectively
+                 * disable enforcement of the limit. Some testing indicates that Node's
+                 * behavior degrades badly when this limit is reached, so we solve that
+                 * by disabling the check entirely. */
+                maxSessionMemory: (_e = options['grpc-node.max_session_memory']) !== null && _e !== void 0 ? _e : Number.MAX_SAFE_INTEGER
             };
-            if (options['grpc-node.flow_control_window'] !== undefined) {
-                sessionOptions.settings = {
-                    initialWindowSize: options['grpc-node.flow_control_window']
-                };
-            }
             const session = http2.connect(`${scheme}://${targetPath}`, sessionOptions);
+            // Prepare window size configuration for remoteSettings handler
+            const defaultWin = (_h = (_g = (_f = http2.getDefaultSettings) === null || _f === void 0 ? void 0 : _f.call(http2)) === null || _g === void 0 ? void 0 : _g.initialWindowSize) !== null && _h !== void 0 ? _h : 65535; // 65 535 B
+            const connWin = options['grpc-node.flow_control_window'];
             this.session = session;
             let errorMessage = 'Failed to connect';
             let reportedError = false;
             session.unref();
             session.once('remoteSettings', () => {
+                var _a;
+                // Send WINDOW_UPDATE now to avoid 65 KB start-window stall.
+                if (connWin && connWin > defaultWin) {
+                    try {
+                        // Node ≥ 14.18
+                        session.setLocalWindowSize(connWin);
+                    }
+                    catch (_b) {
+                        // Older Node: bump by the delta
+                        const delta = connWin - ((_a = session.state.localWindowSize) !== null && _a !== void 0 ? _a : defaultWin);
+                        if (delta > 0)
+                            session.incrementWindowSize(delta);
+                    }
+                }
                 session.removeAllListeners();
                 secureConnectResult.socket.removeListener('close', closeHandler);
                 secureConnectResult.socket.removeListener('error', errorHandler);
@@ -48544,8 +50217,8 @@ function createMethodDefinition(method, serviceName, options, fileDescriptors) {
         responseDeserialize: createDeserializer(responseType, options),
         // TODO(murgatroid99): Find a better way to handle this
         originalName: camelCase(method.name),
-        requestType: createMessageDefinition(requestType, fileDescriptors),
-        responseType: createMessageDefinition(responseType, fileDescriptors),
+        requestType: createMessageDefinition(requestType, options, fileDescriptors),
+        responseType: createMessageDefinition(responseType, options, fileDescriptors),
         options: mapMethodOptions(method.parsedOptions),
     };
 }
@@ -48556,12 +50229,14 @@ function createServiceDefinition(service, name, options, fileDescriptors) {
     }
     return def;
 }
-function createMessageDefinition(message, fileDescriptors) {
+function createMessageDefinition(message, options, fileDescriptors) {
     const messageDescriptor = message.toDescriptor('proto3');
     return {
         format: 'Protocol Buffer 3 DescriptorProto',
         type: messageDescriptor.$type.toObject(messageDescriptor, descriptorOptions),
         fileDescriptorProtos: fileDescriptors,
+        serialize: createSerializer(message),
+        deserialize: createDeserializer(message, options)
     };
 }
 function createEnumDefinition(enumType, fileDescriptors) {
@@ -48584,7 +50259,7 @@ function createDefinition(obj, name, options, fileDescriptors) {
         return createServiceDefinition(obj, name, options, fileDescriptors);
     }
     else if (obj instanceof Protobuf.Type) {
-        return createMessageDefinition(obj, fileDescriptors);
+        return createMessageDefinition(obj, options, fileDescriptors);
     }
     else if (obj instanceof Protobuf.Enum) {
         return createEnumDefinition(obj, fileDescriptors);
@@ -62749,7 +64424,7 @@ exports.ATTR_FAAS_COLDSTART = 'faas.coldstart';
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.PACKAGE_NAME = exports.PACKAGE_VERSION = void 0;
 // this is autogenerated file, see scripts/version-update.js
-exports.PACKAGE_VERSION = '0.54.0';
+exports.PACKAGE_VERSION = '0.54.1';
 exports.PACKAGE_NAME = '@opentelemetry/instrumentation-aws-lambda';
 //# sourceMappingURL=version.js.map
 
@@ -62874,6 +64549,18 @@ class AwsInstrumentation extends instrumentation_1.InstrumentationBase {
                 api_1.diag.error(`${AwsInstrumentation.component} instrumentation: responseHook error`, e);
         }, true);
     }
+    _callUserExceptionResponseHook(span, request, err) {
+        const { exceptionHook } = this.getConfig();
+        if (!exceptionHook)
+            return;
+        const requestInfo = {
+            request,
+        };
+        (0, instrumentation_1.safeExecuteInTheMiddle)(() => exceptionHook(span, requestInfo, err), (e) => {
+            if (e)
+                api_1.diag.error(`${AwsInstrumentation.component} instrumentation: exceptionHook error`, e);
+        }, true);
+    }
     _getV3ConstructStackPatch(moduleVersion, original) {
         const self = this;
         return function constructStack(...args) {
@@ -62985,6 +64672,7 @@ class AwsInstrumentation extends instrumentation_1.InstrumentationBase {
                                 message: err.message,
                             });
                             span.recordException(err);
+                            self._callUserExceptionResponseHook(span, normalizedRequest, err);
                             throw err;
                         })
                             .finally(() => {
@@ -63272,12 +64960,44 @@ exports.propwrap = propwrap;
  * limitations under the License.
  */
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.ATTR_AWS_SNS_TOPIC_ARN = exports.GEN_AI_TOKEN_TYPE_VALUE_OUTPUT = exports.GEN_AI_TOKEN_TYPE_VALUE_INPUT = exports.GEN_AI_SYSTEM_VALUE_AWS_BEDROCK = exports.GEN_AI_OPERATION_NAME_VALUE_CHAT = exports.ATTR_GEN_AI_USAGE_OUTPUT_TOKENS = exports.ATTR_GEN_AI_USAGE_INPUT_TOKENS = exports.ATTR_GEN_AI_TOKEN_TYPE = exports.ATTR_GEN_AI_SYSTEM = exports.ATTR_GEN_AI_RESPONSE_FINISH_REASONS = exports.ATTR_GEN_AI_REQUEST_TOP_P = exports.ATTR_GEN_AI_REQUEST_TEMPERATURE = exports.ATTR_GEN_AI_REQUEST_STOP_SEQUENCES = exports.ATTR_GEN_AI_REQUEST_MODEL = exports.ATTR_GEN_AI_REQUEST_MAX_TOKENS = exports.ATTR_GEN_AI_OPERATION_NAME = void 0;
+exports.GEN_AI_TOKEN_TYPE_VALUE_OUTPUT = exports.GEN_AI_TOKEN_TYPE_VALUE_INPUT = exports.GEN_AI_SYSTEM_VALUE_AWS_BEDROCK = exports.GEN_AI_OPERATION_NAME_VALUE_CHAT = exports.ATTR_MESSAGING_OPERATION_TYPE = exports.ATTR_MESSAGING_MESSAGE_ID = exports.ATTR_MESSAGING_DESTINATION_NAME = exports.ATTR_MESSAGING_BATCH_MESSAGE_COUNT = exports.ATTR_GEN_AI_USAGE_OUTPUT_TOKENS = exports.ATTR_GEN_AI_USAGE_INPUT_TOKENS = exports.ATTR_GEN_AI_TOKEN_TYPE = exports.ATTR_GEN_AI_SYSTEM = exports.ATTR_GEN_AI_RESPONSE_FINISH_REASONS = exports.ATTR_GEN_AI_REQUEST_TOP_P = exports.ATTR_GEN_AI_REQUEST_TEMPERATURE = exports.ATTR_GEN_AI_REQUEST_STOP_SEQUENCES = exports.ATTR_GEN_AI_REQUEST_MODEL = exports.ATTR_GEN_AI_REQUEST_MAX_TOKENS = exports.ATTR_GEN_AI_OPERATION_NAME = exports.ATTR_AWS_STEP_FUNCTIONS_STATE_MACHINE_ARN = exports.ATTR_AWS_STEP_FUNCTIONS_ACTIVITY_ARN = exports.ATTR_AWS_SNS_TOPIC_ARN = exports.ATTR_AWS_SECRETSMANAGER_SECRET_ARN = void 0;
 /*
  * This file contains a copy of unstable semantic convention definitions
  * used by this package.
  * @see https://github.com/open-telemetry/opentelemetry-js/tree/main/semantic-conventions#unstable-semconv
  */
+/**
+ * The ARN of the Secret stored in the Secrets Mangger
+ *
+ * @example arn:aws:secretsmanager:us-east-1:123456789012:secret:SecretName-6RandomCharacters
+ *
+ * @experimental This attribute is experimental and is subject to breaking changes in minor releases of `@opentelemetry/semantic-conventions`.
+ */
+exports.ATTR_AWS_SECRETSMANAGER_SECRET_ARN = 'aws.secretsmanager.secret.arn';
+/**
+ * The ARN of the AWS SNS Topic. An Amazon SNS [topic](https://docs.aws.amazon.com/sns/latest/dg/sns-create-topic.html) is a logical access point that acts as a communication channel.
+ *
+ * @example arn:aws:sns:us-east-1:123456789012:mystack-mytopic-NZJ5JSMVGFIE
+ *
+ * @experimental This attribute is experimental and is subject to breaking changes in minor releases of `@opentelemetry/semantic-conventions`.
+ */
+exports.ATTR_AWS_SNS_TOPIC_ARN = 'aws.sns.topic.arn';
+/**
+ * The ARN of the AWS Step Functions Activity.
+ *
+ * @example arn:aws:states:us-east-1:123456789012:activity:get-greeting
+ *
+ * @experimental This attribute is experimental and is subject to breaking changes in minor releases of `@opentelemetry/semantic-conventions`.
+ */
+exports.ATTR_AWS_STEP_FUNCTIONS_ACTIVITY_ARN = 'aws.step_functions.activity.arn';
+/**
+ * The ARN of the AWS Step Functions State Machine.
+ *
+ * @example arn:aws:states:us-east-1:123456789012:stateMachine:myStateMachine:1
+ *
+ * @experimental This attribute is experimental and is subject to breaking changes in minor releases of `@opentelemetry/semantic-conventions`.
+ */
+exports.ATTR_AWS_STEP_FUNCTIONS_STATE_MACHINE_ARN = 'aws.step_functions.state_machine.arn';
 /**
  * The name of the operation being performed.
  *
@@ -63381,30 +65101,76 @@ exports.ATTR_GEN_AI_USAGE_INPUT_TOKENS = 'gen_ai.usage.input_tokens';
  */
 exports.ATTR_GEN_AI_USAGE_OUTPUT_TOKENS = 'gen_ai.usage.output_tokens';
 /**
+ * The number of messages sent, received, or processed in the scope of the batching operation.
+ *
+ * @example 0
+ * @example 1
+ * @example 2
+ *
+ * @note Instrumentations **SHOULD NOT** set `messaging.batch.message_count` on spans that operate with a single message. When a messaging client library supports both batch and single-message API for the same operation, instrumentations **SHOULD** use `messaging.batch.message_count` for batching APIs and **SHOULD NOT** use it for single-message APIs.
+ *
+ * @experimental This attribute is experimental and is subject to breaking changes in minor releases of `@opentelemetry/semantic-conventions`.
+ */
+exports.ATTR_MESSAGING_BATCH_MESSAGE_COUNT = 'messaging.batch.message_count';
+/**
+ * The message destination name
+ *
+ * @example MyQueue
+ * @example MyTopic
+ *
+ * @note Destination name **SHOULD** uniquely identify a specific queue, topic or other entity within the broker. If
+ * the broker doesn't have such notion, the destination name **SHOULD** uniquely identify the broker.
+ *
+ * @experimental This attribute is experimental and is subject to breaking changes in minor releases of `@opentelemetry/semantic-conventions`.
+ */
+exports.ATTR_MESSAGING_DESTINATION_NAME = 'messaging.destination.name';
+/**
+ * A value used by the messaging system as an identifier for the message, represented as a string.
+ *
+ * @example "452a7c7c7c7048c2f887f61572b18fc2"
+ *
+ * @experimental This attribute is experimental and is subject to breaking changes in minor releases of `@opentelemetry/semantic-conventions`.
+ */
+exports.ATTR_MESSAGING_MESSAGE_ID = 'messaging.message.id';
+/**
+ * A string identifying the type of the messaging operation.
+ *
+ * @note If a custom value is used, it **MUST** be of low cardinality.
+ * @experimental This attribute is experimental and is subject to breaking changes in minor releases of `@opentelemetry/semantic-conventions`.
+ */
+exports.ATTR_MESSAGING_OPERATION_TYPE = 'messaging.operation.type';
+/**
  * Enum value "chat" for attribute {@link ATTR_GEN_AI_OPERATION_NAME}.
+ *
+ * Chat completion operation such as [OpenAI Chat API](https://platform.openai.com/docs/api-reference/chat)
+ *
+ * @experimental This enum value is experimental and is subject to breaking changes in minor releases of `@opentelemetry/semantic-conventions`.
  */
 exports.GEN_AI_OPERATION_NAME_VALUE_CHAT = 'chat';
 /**
  * Enum value "aws.bedrock" for attribute {@link ATTR_GEN_AI_SYSTEM}.
+ *
+ * AWS Bedrock
+ *
+ * @experimental This enum value is experimental and is subject to breaking changes in minor releases of `@opentelemetry/semantic-conventions`.
  */
 exports.GEN_AI_SYSTEM_VALUE_AWS_BEDROCK = 'aws.bedrock';
 /**
  * Enum value "input" for attribute {@link ATTR_GEN_AI_TOKEN_TYPE}.
+ *
+ * Input tokens (prompt, input, etc.)
+ *
+ * @experimental This enum value is experimental and is subject to breaking changes in minor releases of `@opentelemetry/semantic-conventions`.
  */
 exports.GEN_AI_TOKEN_TYPE_VALUE_INPUT = 'input';
 /**
  * Enum value "output" for attribute {@link ATTR_GEN_AI_TOKEN_TYPE}.
+ *
+ * Output tokens (completion, response, etc.)
+ *
+ * @experimental This enum value is experimental and is subject to breaking changes in minor releases of `@opentelemetry/semantic-conventions`.
  */
 exports.GEN_AI_TOKEN_TYPE_VALUE_OUTPUT = 'output';
-/**
- * Originally from '@opentelemetry/semantic-conventions/incubating'
- * https://github.com/open-telemetry/semantic-conventions/blob/main/docs/registry/attributes/aws.md#amazon-sns-attributes
- * The ARN of the AWS SNS Topic. An Amazon SNS [topic](https://docs.aws.amazon.com/sns/latest/dg/sns-create-topic.html)
- *  is a logical access point that acts as a communication channel.
- * @example arn:aws:sns:us-east-1:123456789012:mystack-mytopic-NZJ5JSMVGFIE
- * @experimental This attribute is experimental and is subject to breaking changes in minor releases of `@opentelemetry/semantic-conventions`.
- */
-exports.ATTR_AWS_SNS_TOPIC_ARN = 'aws.sns.topic.arn';
 //# sourceMappingURL=semconv.js.map
 
 /***/ }),
@@ -63505,13 +65271,20 @@ exports.ServicesExtensions = void 0;
 const sqs_1 = __nccwpck_require__(7715);
 const bedrock_runtime_1 = __nccwpck_require__(11929);
 const dynamodb_1 = __nccwpck_require__(64612);
+const secretsmanager_1 = __nccwpck_require__(75472);
 const sns_1 = __nccwpck_require__(47204);
+const stepfunctions_1 = __nccwpck_require__(64729);
 const lambda_1 = __nccwpck_require__(50479);
 const s3_1 = __nccwpck_require__(36086);
 const kinesis_1 = __nccwpck_require__(92588);
 class ServicesExtensions {
     services = new Map();
     constructor() {
+        this.registerServices();
+    }
+    registerServices() {
+        this.services.set('SecretsManager', new secretsmanager_1.SecretsManagerServiceExtension());
+        this.services.set('SFN', new stepfunctions_1.StepFunctionsServiceExtension());
         this.services.set('SQS', new sqs_1.SqsServiceExtension());
         this.services.set('SNS', new sns_1.SnsServiceExtension());
         this.services.set('DynamoDB', new dynamodb_1.DynamodbServiceExtension());
@@ -64394,6 +66167,59 @@ exports.S3ServiceExtension = S3ServiceExtension;
 
 /***/ }),
 
+/***/ 75472:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.SecretsManagerServiceExtension = void 0;
+/*
+ * Copyright The OpenTelemetry Authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+const api_1 = __nccwpck_require__(63914);
+const semconv_1 = __nccwpck_require__(47984);
+class SecretsManagerServiceExtension {
+    requestPreSpanHook(request, _config) {
+        const secretId = request.commandInput?.SecretId;
+        const spanKind = api_1.SpanKind.CLIENT;
+        let spanName;
+        const spanAttributes = {};
+        if (typeof secretId === 'string' &&
+            secretId.startsWith('arn:aws:secretsmanager:')) {
+            spanAttributes[semconv_1.ATTR_AWS_SECRETSMANAGER_SECRET_ARN] = secretId;
+        }
+        return {
+            isIncoming: false,
+            spanAttributes,
+            spanKind,
+            spanName,
+        };
+    }
+    responseHook(response, span, tracer, config) {
+        const secretArn = response.data?.ARN;
+        if (secretArn) {
+            span.setAttribute(semconv_1.ATTR_AWS_SECRETSMANAGER_SECRET_ARN, secretArn);
+        }
+    }
+}
+exports.SecretsManagerServiceExtension = SecretsManagerServiceExtension;
+//# sourceMappingURL=secretsmanager.js.map
+
+/***/ }),
+
 /***/ 47204:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
@@ -64512,8 +66338,8 @@ exports.SqsServiceExtension = void 0;
  * limitations under the License.
  */
 const api_1 = __nccwpck_require__(63914);
-const propagation_utils_1 = __nccwpck_require__(30784);
 const semantic_conventions_1 = __nccwpck_require__(13695);
+const semconv_1 = __nccwpck_require__(47984);
 const MessageAttributes_1 = __nccwpck_require__(57616);
 class SqsServiceExtension {
     requestPreSpanHook(request, _config) {
@@ -64522,10 +66348,9 @@ class SqsServiceExtension {
         let spanKind = api_1.SpanKind.CLIENT;
         let spanName;
         const spanAttributes = {
-            [semantic_conventions_1.SEMATTRS_MESSAGING_SYSTEM]: 'aws.sqs',
-            [semantic_conventions_1.SEMATTRS_MESSAGING_DESTINATION_KIND]: semantic_conventions_1.MESSAGINGDESTINATIONKINDVALUES_QUEUE,
-            [semantic_conventions_1.SEMATTRS_MESSAGING_DESTINATION]: queueName,
-            [semantic_conventions_1.SEMATTRS_MESSAGING_URL]: queueUrl,
+            [semantic_conventions_1.SEMATTRS_MESSAGING_SYSTEM]: 'aws_sqs',
+            [semconv_1.ATTR_MESSAGING_DESTINATION_NAME]: queueName,
+            [semantic_conventions_1.ATTR_URL_FULL]: queueUrl,
         };
         let isIncoming = false;
         switch (request.commandName) {
@@ -64534,8 +66359,7 @@ class SqsServiceExtension {
                     isIncoming = true;
                     spanKind = api_1.SpanKind.CONSUMER;
                     spanName = `${queueName} receive`;
-                    spanAttributes[semantic_conventions_1.SEMATTRS_MESSAGING_OPERATION] =
-                        semantic_conventions_1.MESSAGINGOPERATIONVALUES_RECEIVE;
+                    spanAttributes[semconv_1.ATTR_MESSAGING_OPERATION_TYPE] = 'receive';
                     request.commandInput.MessageAttributeNames =
                         (0, MessageAttributes_1.addPropagationFieldsToAttributeNames)(request.commandInput.MessageAttributeNames, api_1.propagation.fields());
                 }
@@ -64576,38 +66400,28 @@ class SqsServiceExtension {
                 break;
         }
     };
-    responseHook = (response, span, tracer, config) => {
+    responseHook = (response, span, _tracer, config) => {
         switch (response.request.commandName) {
             case 'SendMessage':
-                span.setAttribute(semantic_conventions_1.SEMATTRS_MESSAGING_MESSAGE_ID, response?.data?.MessageId);
+                span.setAttribute(semconv_1.ATTR_MESSAGING_MESSAGE_ID, response?.data?.MessageId);
                 break;
             case 'SendMessageBatch':
                 // TODO: How should this be handled?
                 break;
             case 'ReceiveMessage': {
-                const messages = response?.data?.Messages;
-                if (messages) {
-                    const queueUrl = this.extractQueueUrl(response.request.commandInput);
-                    const queueName = this.extractQueueNameFromUrl(queueUrl);
-                    propagation_utils_1.pubsubPropagation.patchMessagesArrayToStartProcessSpans({
-                        messages,
-                        parentContext: api_1.trace.setSpan(api_1.context.active(), span),
-                        tracer,
-                        messageToSpanDetails: (message) => ({
-                            name: queueName ?? 'unknown',
-                            parentContext: api_1.propagation.extract(api_1.ROOT_CONTEXT, (0, MessageAttributes_1.extractPropagationContext)(message, config.sqsExtractContextPropagationFromPayload), MessageAttributes_1.contextGetter),
+                const messages = response?.data?.Messages || [];
+                span.setAttribute(semconv_1.ATTR_MESSAGING_BATCH_MESSAGE_COUNT, messages.length);
+                for (const message of messages) {
+                    const propagatedContext = api_1.propagation.extract(api_1.ROOT_CONTEXT, (0, MessageAttributes_1.extractPropagationContext)(message, config.sqsExtractContextPropagationFromPayload), MessageAttributes_1.contextGetter);
+                    const spanContext = api_1.trace.getSpanContext(propagatedContext);
+                    if (spanContext) {
+                        span.addLink({
+                            context: spanContext,
                             attributes: {
-                                [semantic_conventions_1.SEMATTRS_MESSAGING_SYSTEM]: 'aws.sqs',
-                                [semantic_conventions_1.SEMATTRS_MESSAGING_DESTINATION]: queueName,
-                                [semantic_conventions_1.SEMATTRS_MESSAGING_DESTINATION_KIND]: semantic_conventions_1.MESSAGINGDESTINATIONKINDVALUES_QUEUE,
-                                [semantic_conventions_1.SEMATTRS_MESSAGING_MESSAGE_ID]: message.MessageId,
-                                [semantic_conventions_1.SEMATTRS_MESSAGING_URL]: queueUrl,
-                                [semantic_conventions_1.SEMATTRS_MESSAGING_OPERATION]: semantic_conventions_1.MESSAGINGOPERATIONVALUES_PROCESS,
+                                [semconv_1.ATTR_MESSAGING_MESSAGE_ID]: message.MessageId,
                             },
-                        }),
-                        processHook: (span, message) => config.sqsProcessHook?.(span, { message }),
-                    });
-                    propagation_utils_1.pubsubPropagation.patchArrayForProcessSpans(messages, tracer, api_1.context.active());
+                        });
+                    }
                 }
                 break;
             }
@@ -64627,6 +66441,55 @@ class SqsServiceExtension {
 }
 exports.SqsServiceExtension = SqsServiceExtension;
 //# sourceMappingURL=sqs.js.map
+
+/***/ }),
+
+/***/ 64729:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.StepFunctionsServiceExtension = void 0;
+/*
+ * Copyright The OpenTelemetry Authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+const api_1 = __nccwpck_require__(63914);
+const semconv_1 = __nccwpck_require__(47984);
+class StepFunctionsServiceExtension {
+    requestPreSpanHook(request, _config) {
+        const stateMachineArn = request.commandInput?.stateMachineArn;
+        const activityArn = request.commandInput?.activityArn;
+        const spanKind = api_1.SpanKind.CLIENT;
+        const spanAttributes = {};
+        if (stateMachineArn) {
+            spanAttributes[semconv_1.ATTR_AWS_STEP_FUNCTIONS_STATE_MACHINE_ARN] =
+                stateMachineArn;
+        }
+        if (activityArn) {
+            spanAttributes[semconv_1.ATTR_AWS_STEP_FUNCTIONS_ACTIVITY_ARN] = activityArn;
+        }
+        return {
+            isIncoming: false,
+            spanAttributes,
+            spanKind,
+        };
+    }
+}
+exports.StepFunctionsServiceExtension = StepFunctionsServiceExtension;
+//# sourceMappingURL=stepfunctions.js.map
 
 /***/ }),
 
@@ -64720,7 +66583,7 @@ exports.bindPromise = bindPromise;
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.PACKAGE_NAME = exports.PACKAGE_VERSION = void 0;
 // this is autogenerated file, see scripts/version-update.js
-exports.PACKAGE_VERSION = '0.56.0';
+exports.PACKAGE_VERSION = '0.58.0';
 exports.PACKAGE_NAME = '@opentelemetry/instrumentation-aws-sdk';
 //# sourceMappingURL=version.js.map
 
@@ -65863,7 +67726,7 @@ const types_1 = __nccwpck_require__(37858);
 const version_1 = __nccwpck_require__(57627);
 const hooks = ['Before', 'BeforeStep', 'AfterStep', 'After'];
 const steps = ['Given', 'When', 'Then'];
-const supportedVersions = ['>=8.0.0 <12'];
+const supportedVersions = ['>=8.0.0 <13'];
 class CucumberInstrumentation extends instrumentation_1.InstrumentationBase {
     module;
     constructor(config = {}) {
@@ -65957,10 +67820,9 @@ class CucumberInstrumentation extends instrumentation_1.InstrumentationBase {
                 return instrumentation.tracer.startActiveSpan(`Feature: ${feature.name}. Scenario: ${pickle.name}`, {
                     kind: api_1.SpanKind.CLIENT,
                     attributes: {
-                        [semantic_conventions_1.SEMATTRS_CODE_FILEPATH]: gherkinDocument.uri,
-                        [semantic_conventions_1.SEMATTRS_CODE_LINENO]: scenario.location.line,
-                        [semantic_conventions_1.SEMATTRS_CODE_FUNCTION]: scenario.name,
-                        [semantic_conventions_1.SEMATTRS_CODE_NAMESPACE]: feature.name,
+                        [semantic_conventions_1.ATTR_CODE_FILE_PATH]: gherkinDocument.uri,
+                        [semantic_conventions_1.ATTR_CODE_LINE_NUMBER]: scenario.location.line,
+                        [semantic_conventions_1.ATTR_CODE_FUNCTION_NAME]: `${feature.name} ${scenario.name}`,
                         [types_1.AttributeNames.FEATURE_TAGS]: CucumberInstrumentation.mapTags(feature.tags),
                         [types_1.AttributeNames.FEATURE_LANGUAGE]: feature.language,
                         [types_1.AttributeNames.FEATURE_DESCRIPTION]: feature.description,
@@ -65996,9 +67858,21 @@ class CucumberInstrumentation extends instrumentation_1.InstrumentationBase {
                     },
                 }, async (span) => {
                     try {
-                        const result = await original.apply(this, args);
+                        const runStepResult = await original.apply(this, args);
+                        const { result, error } = (() => {
+                            if ('result' in runStepResult) {
+                                return runStepResult;
+                            }
+                            return {
+                                result: runStepResult,
+                                error: undefined,
+                            };
+                        })();
                         instrumentation.setSpanToStepStatus(span, result.status, result.message);
-                        return result;
+                        if (error) {
+                            CucumberInstrumentation.setSpanToError(span, error);
+                        }
+                        return runStepResult;
                     }
                     catch (error) {
                         CucumberInstrumentation.setSpanToError(span, error);
@@ -66183,7 +68057,7 @@ var AttributeNames;
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.PACKAGE_NAME = exports.PACKAGE_VERSION = void 0;
 // this is autogenerated file, see scripts/version-update.js
-exports.PACKAGE_VERSION = '0.18.0';
+exports.PACKAGE_VERSION = '0.19.0';
 exports.PACKAGE_NAME = '@opentelemetry/instrumentation-cucumber';
 //# sourceMappingURL=version.js.map
 
@@ -66244,20 +68118,28 @@ const api_1 = __nccwpck_require__(63914);
 /** @knipignore */
 const version_1 = __nccwpck_require__(6444);
 const MODULE_NAME = 'dataloader';
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function extractModuleExports(module) {
+    return module[Symbol.toStringTag] === 'Module'
+        ? module.default // ESM
+        : module; // CommonJS
+}
 class DataloaderInstrumentation extends instrumentation_1.InstrumentationBase {
     constructor(config = {}) {
         super(version_1.PACKAGE_NAME, version_1.PACKAGE_VERSION, config);
     }
     init() {
         return [
-            new instrumentation_1.InstrumentationNodeModuleDefinition(MODULE_NAME, ['>=2.0.0 <3'], dataloader => {
+            new instrumentation_1.InstrumentationNodeModuleDefinition(MODULE_NAME, ['>=2.0.0 <3'], module => {
+                const dataloader = extractModuleExports(module);
                 this._patchLoad(dataloader.prototype);
                 this._patchLoadMany(dataloader.prototype);
                 this._patchPrime(dataloader.prototype);
                 this._patchClear(dataloader.prototype);
                 this._patchClearAll(dataloader.prototype);
                 return this._getPatchedConstructor(dataloader);
-            }, dataloader => {
+            }, module => {
+                const dataloader = extractModuleExports(module);
                 ['load', 'loadMany', 'prime', 'clear', 'clearAll'].forEach(method => {
                     if ((0, instrumentation_1.isWrapped)(dataloader.prototype[method])) {
                         this._unwrap(dataloader.prototype, method);
@@ -66482,7 +68364,7 @@ exports.DataloaderInstrumentation = DataloaderInstrumentation;
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.PACKAGE_NAME = exports.PACKAGE_VERSION = void 0;
 // this is autogenerated file, see scripts/version-update.js
-exports.PACKAGE_VERSION = '0.21.0';
+exports.PACKAGE_VERSION = '0.21.1';
 exports.PACKAGE_NAME = '@opentelemetry/instrumentation-dataloader';
 //# sourceMappingURL=version.js.map
 
@@ -73485,11 +75367,15 @@ class KafkaJsInstrumentation extends instrumentation_1.InstrumentationBase {
                 if ((0, instrumentation_1.isWrapped)(newProducer.sendBatch)) {
                     instrumentation._unwrap(newProducer, 'sendBatch');
                 }
-                instrumentation._wrap(newProducer, 'sendBatch', instrumentation._getProducerSendBatchPatch());
+                instrumentation._wrap(newProducer, 'sendBatch', instrumentation._getSendBatchPatch());
                 if ((0, instrumentation_1.isWrapped)(newProducer.send)) {
                     instrumentation._unwrap(newProducer, 'send');
                 }
-                instrumentation._wrap(newProducer, 'send', instrumentation._getProducerSendPatch());
+                instrumentation._wrap(newProducer, 'send', instrumentation._getSendPatch());
+                if ((0, instrumentation_1.isWrapped)(newProducer.transaction)) {
+                    instrumentation._unwrap(newProducer, 'transaction');
+                }
+                instrumentation._wrap(newProducer, 'transaction', instrumentation._getProducerTransactionPatch());
                 instrumentation._setKafkaEventListeners(newProducer);
                 return newProducer;
             };
@@ -73613,7 +75499,70 @@ class KafkaJsInstrumentation extends instrumentation_1.InstrumentationBase {
             };
         };
     }
-    _getProducerSendBatchPatch() {
+    _getProducerTransactionPatch() {
+        const instrumentation = this;
+        return (original) => {
+            return function transaction(...args) {
+                const transactionSpan = instrumentation.tracer.startSpan('transaction');
+                const transactionPromise = original.apply(this, args);
+                transactionPromise
+                    .then((transaction) => {
+                    const originalSend = transaction.send;
+                    transaction.send = function send(...args) {
+                        return api_1.context.with(api_1.trace.setSpan(api_1.context.active(), transactionSpan), () => {
+                            const patched = instrumentation._getSendPatch()(originalSend);
+                            return patched.apply(this, args).catch(err => {
+                                transactionSpan.setStatus({
+                                    code: api_1.SpanStatusCode.ERROR,
+                                    message: err?.message,
+                                });
+                                transactionSpan.recordException(err);
+                                throw err;
+                            });
+                        });
+                    };
+                    const originalSendBatch = transaction.sendBatch;
+                    transaction.sendBatch = function sendBatch(...args) {
+                        return api_1.context.with(api_1.trace.setSpan(api_1.context.active(), transactionSpan), () => {
+                            const patched = instrumentation._getSendBatchPatch()(originalSendBatch);
+                            return patched.apply(this, args).catch(err => {
+                                transactionSpan.setStatus({
+                                    code: api_1.SpanStatusCode.ERROR,
+                                    message: err?.message,
+                                });
+                                transactionSpan.recordException(err);
+                                throw err;
+                            });
+                        });
+                    };
+                    const originalCommit = transaction.commit;
+                    transaction.commit = function commit(...args) {
+                        const originCommitPromise = originalCommit
+                            .apply(this, args)
+                            .then(() => {
+                            transactionSpan.setStatus({ code: api_1.SpanStatusCode.OK });
+                        });
+                        return instrumentation._endSpansOnPromise([transactionSpan], [], originCommitPromise);
+                    };
+                    const originalAbort = transaction.abort;
+                    transaction.abort = function abort(...args) {
+                        const originAbortPromise = originalAbort.apply(this, args);
+                        return instrumentation._endSpansOnPromise([transactionSpan], [], originAbortPromise);
+                    };
+                })
+                    .catch(err => {
+                    transactionSpan.setStatus({
+                        code: api_1.SpanStatusCode.ERROR,
+                        message: err?.message,
+                    });
+                    transactionSpan.recordException(err);
+                    transactionSpan.end();
+                });
+                return transactionPromise;
+            };
+        };
+    }
+    _getSendBatchPatch() {
         const instrumentation = this;
         return (original) => {
             return function sendBatch(...args) {
@@ -73641,7 +75590,7 @@ class KafkaJsInstrumentation extends instrumentation_1.InstrumentationBase {
             };
         };
     }
-    _getProducerSendPatch() {
+    _getSendPatch() {
         const instrumentation = this;
         return (original) => {
             return function send(...args) {
@@ -74004,7 +75953,7 @@ exports.METRIC_MESSAGING_PROCESS_DURATION = 'messaging.process.duration';
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.PACKAGE_NAME = exports.PACKAGE_VERSION = void 0;
 // this is autogenerated file, see scripts/version-update.js
-exports.PACKAGE_VERSION = '0.12.0';
+exports.PACKAGE_VERSION = '0.13.0';
 exports.PACKAGE_NAME = '@opentelemetry/instrumentation-kafkajs';
 //# sourceMappingURL=version.js.map
 
@@ -76994,12 +78943,13 @@ class MySQL2Instrumentation extends instrumentation_1.InstrumentationBase {
                 else if (arguments[2]) {
                     values = [_valuesOrCallback];
                 }
+                const { maskStatement, maskStatementHook, responseHook } = thisPlugin.getConfig();
                 const span = thisPlugin.tracer.startSpan((0, utils_1.getSpanName)(query), {
                     kind: api.SpanKind.CLIENT,
                     attributes: {
                         ...MySQL2Instrumentation.COMMON_ATTRIBUTES,
                         ...(0, utils_1.getConnectionAttributes)(this.config),
-                        [semantic_conventions_1.SEMATTRS_DB_STATEMENT]: (0, utils_1.getDbStatement)(query, format, values),
+                        [semantic_conventions_1.SEMATTRS_DB_STATEMENT]: (0, utils_1.getDbStatement)(query, format, values, maskStatement, maskStatementHook),
                     },
                 });
                 if (!isPrepared &&
@@ -77019,7 +78969,6 @@ class MySQL2Instrumentation extends instrumentation_1.InstrumentationBase {
                         });
                     }
                     else {
-                        const { responseHook } = thisPlugin.getConfig();
                         if (typeof responseHook === 'function') {
                             (0, instrumentation_1.safeExecuteInTheMiddle)(() => {
                                 responseHook(span, {
@@ -77140,22 +79089,47 @@ function getJDBCString(host, port, database) {
  *
  * @returns the database statement being executed.
  */
-function getDbStatement(query, format, values) {
-    if (!format) {
-        return typeof query === 'string' ? query : query.sql;
+function getDbStatement(query, format, values, maskStatement = false, maskStatementHook = defaultMaskingHook) {
+    const [querySql, queryValues] = typeof query === 'string'
+        ? [query, values]
+        : [query.sql, hasValues(query) ? values || query.values : values];
+    try {
+        if (maskStatement) {
+            return maskStatementHook(querySql);
+        }
+        else if (format && queryValues) {
+            return format(querySql, queryValues);
+        }
+        else {
+            return querySql;
+        }
     }
-    if (typeof query === 'string') {
-        return values ? format(query, values) : query;
-    }
-    else {
-        // According to https://github.com/mysqljs/mysql#performing-queries
-        // The values argument will override the values in the option object.
-        return values || query.values
-            ? format(query.sql, values || query.values)
-            : query.sql;
+    catch (e) {
+        return 'Could not determine the query due to an error in masking or formatting';
     }
 }
 exports.getDbStatement = getDbStatement;
+/**
+ * Replaces numeric values and quoted strings in the query with placeholders ('?').
+ *
+ * - `\b\d+\b`: Matches whole numbers (integers) and replaces them with '?'.
+ * - `(["'])(?:(?=(\\?))\2.)*?\1`:
+ *   - Matches quoted strings (both single `'` and double `"` quotes).
+ *   - Uses a lookahead `(?=(\\?))` to detect an optional backslash without consuming it immediately.
+ *   - Captures the optional backslash `\2` and ensures escaped quotes inside the string are handled correctly.
+ *   - Ensures that only complete quoted strings are replaced with '?'.
+ *
+ * This prevents accidental replacement of escaped quotes within strings and ensures that the
+ * query structure remains intact while masking sensitive data.
+ */
+function defaultMaskingHook(query) {
+    return query
+        .replace(/\b\d+\b/g, '?')
+        .replace(/(["'])(?:(?=(\\?))\2.)*?\1/g, '?');
+}
+function hasValues(obj) {
+    return 'values' in obj;
+}
 /**
  * The span name SHOULD be set to a low cardinality value
  * representing the statement executed on the database.
@@ -77224,7 +79198,7 @@ exports.getConnectionPrototypeToInstrument = getConnectionPrototypeToInstrument;
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.PACKAGE_NAME = exports.PACKAGE_VERSION = void 0;
 // this is autogenerated file, see scripts/version-update.js
-exports.PACKAGE_VERSION = '0.49.0';
+exports.PACKAGE_VERSION = '0.50.0';
 exports.PACKAGE_NAME = '@opentelemetry/instrumentation-mysql2';
 //# sourceMappingURL=version.js.map
 
@@ -78738,11 +80712,13 @@ class PgInstrumentation extends instrumentation_1.InstrumentationBase {
         idle: 0,
         pending: 0,
     };
+    _semconvStability;
     constructor(config = {}) {
         super(version_1.PACKAGE_NAME, version_1.PACKAGE_VERSION, config);
+        this._semconvStability = (0, instrumentation_1.semconvStabilityFromStr)('database', process.env.OTEL_SEMCONV_STABILITY_OPT_IN);
     }
     _updateMetricInstruments() {
-        this._operationDuration = this.meter.createHistogram(semconv_1.METRIC_DB_CLIENT_OPERATION_DURATION, {
+        this._operationDuration = this.meter.createHistogram(semantic_conventions_1.METRIC_DB_CLIENT_OPERATION_DURATION, {
             description: 'Duration of database client operations.',
             unit: 's',
             valueType: api_1.ValueType.DOUBLE,
@@ -78829,7 +80805,7 @@ class PgInstrumentation extends instrumentation_1.InstrumentationBase {
                 }
                 const span = plugin.tracer.startSpan(SpanNames_1.SpanNames.CONNECT, {
                     kind: api_1.SpanKind.CLIENT,
-                    attributes: utils.getSemanticAttributesFromConnection(this),
+                    attributes: utils.getSemanticAttributesFromConnection(this, plugin._semconvStability),
                 });
                 if (callback) {
                     const parentSpan = api_1.trace.getSpan(api_1.context.active());
@@ -78848,13 +80824,18 @@ class PgInstrumentation extends instrumentation_1.InstrumentationBase {
     recordOperationDuration(attributes, startTime) {
         const metricsAttributes = {};
         const keysToCopy = [
-            semantic_conventions_1.SEMATTRS_DB_SYSTEM,
-            semconv_1.ATTR_DB_NAMESPACE,
+            semantic_conventions_1.ATTR_DB_NAMESPACE,
             semantic_conventions_1.ATTR_ERROR_TYPE,
             semantic_conventions_1.ATTR_SERVER_PORT,
             semantic_conventions_1.ATTR_SERVER_ADDRESS,
-            semconv_1.ATTR_DB_OPERATION_NAME,
+            semantic_conventions_1.ATTR_DB_OPERATION_NAME,
         ];
+        if (this._semconvStability & instrumentation_1.SemconvStability.OLD) {
+            keysToCopy.push(semconv_1.ATTR_DB_SYSTEM);
+        }
+        if (this._semconvStability & instrumentation_1.SemconvStability.STABLE) {
+            keysToCopy.push(semantic_conventions_1.ATTR_DB_SYSTEM_NAME);
+        }
         keysToCopy.forEach(key => {
             if (key in attributes) {
                 metricsAttributes[key] = attributes[key];
@@ -78894,20 +80875,20 @@ class PgInstrumentation extends instrumentation_1.InstrumentationBase {
                         ? arg0
                         : undefined;
                 const attributes = {
-                    [semantic_conventions_1.SEMATTRS_DB_SYSTEM]: semantic_conventions_1.DBSYSTEMVALUES_POSTGRESQL,
-                    [semconv_1.ATTR_DB_NAMESPACE]: this.database,
+                    [semconv_1.ATTR_DB_SYSTEM]: semconv_1.DB_SYSTEM_VALUE_POSTGRESQL,
+                    [semantic_conventions_1.ATTR_DB_NAMESPACE]: this.database,
                     [semantic_conventions_1.ATTR_SERVER_PORT]: this.connectionParameters.port,
                     [semantic_conventions_1.ATTR_SERVER_ADDRESS]: this.connectionParameters.host,
                 };
                 if (queryConfig?.text) {
-                    attributes[semconv_1.ATTR_DB_OPERATION_NAME] =
+                    attributes[semantic_conventions_1.ATTR_DB_OPERATION_NAME] =
                         utils.parseNormalizedOperationName(queryConfig?.text);
                 }
                 const recordDuration = () => {
                     plugin.recordOperationDuration(attributes, startTime);
                 };
                 const instrumentationConfig = plugin.getConfig();
-                const span = utils.handleConfigQuery.call(this, plugin.tracer, instrumentationConfig, queryConfig);
+                const span = utils.handleConfigQuery.call(this, plugin.tracer, instrumentationConfig, plugin._semconvStability, queryConfig);
                 // Modify query text w/ a tracing comment before invoking original for
                 // tracing, but only if args[0] has one of our expected shapes.
                 if (instrumentationConfig.addSqlCommenterCommentToQueries) {
@@ -79052,7 +81033,7 @@ class PgInstrumentation extends instrumentation_1.InstrumentationBase {
                 // setup span
                 const span = plugin.tracer.startSpan(SpanNames_1.SpanNames.POOL_CONNECT, {
                     kind: api_1.SpanKind.CLIENT,
-                    attributes: utils.getSemanticAttributesFromPool(this.options),
+                    attributes: utils.getSemanticAttributesFromPoolConnection(this.options, plugin._semconvStability),
                 });
                 plugin._setPoolConnectEventListeners(this);
                 if (callback) {
@@ -79143,7 +81124,12 @@ exports.EVENT_LISTENERS_SET = Symbol('opentelemetry.instrumentation.pg.eventList
  * limitations under the License.
  */
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.METRIC_DB_CLIENT_OPERATION_DURATION = exports.METRIC_DB_CLIENT_CONNECTION_PENDING_REQUESTS = exports.METRIC_DB_CLIENT_CONNECTION_COUNT = exports.DB_CLIENT_CONNECTION_STATE_VALUE_IDLE = exports.DB_CLIENT_CONNECTION_STATE_VALUE_USED = exports.ATTR_DB_OPERATION_NAME = exports.ATTR_DB_NAMESPACE = exports.ATTR_DB_CLIENT_CONNECTION_STATE = exports.ATTR_DB_CLIENT_CONNECTION_POOL_NAME = void 0;
+exports.METRIC_DB_CLIENT_CONNECTION_PENDING_REQUESTS = exports.METRIC_DB_CLIENT_CONNECTION_COUNT = exports.DB_SYSTEM_VALUE_POSTGRESQL = exports.DB_CLIENT_CONNECTION_STATE_VALUE_USED = exports.DB_CLIENT_CONNECTION_STATE_VALUE_IDLE = exports.ATTR_NET_PEER_PORT = exports.ATTR_NET_PEER_NAME = exports.ATTR_DB_USER = exports.ATTR_DB_SYSTEM = exports.ATTR_DB_STATEMENT = exports.ATTR_DB_NAME = exports.ATTR_DB_CONNECTION_STRING = exports.ATTR_DB_CLIENT_CONNECTION_STATE = exports.ATTR_DB_CLIENT_CONNECTION_POOL_NAME = void 0;
+/*
+ * This file contains a copy of unstable semantic convention definitions
+ * used by this package.
+ * @see https://github.com/open-telemetry/opentelemetry-js/tree/main/semantic-conventions#unstable-semconv
+ */
 /**
  * The name of the connection pool; unique within the instrumented application. In case the connection pool implementation doesn't provide a name, instrumentation **SHOULD** use a combination of parameters that would make the name unique, for example, combining attributes `server.address`, `server.port`, and `db.namespace`, formatted as `server.address:server.port/db.namespace`. Instrumentations that generate connection pool name following different patterns **SHOULD** document it.
  *
@@ -79161,42 +81147,88 @@ exports.ATTR_DB_CLIENT_CONNECTION_POOL_NAME = 'db.client.connection.pool.name';
  */
 exports.ATTR_DB_CLIENT_CONNECTION_STATE = 'db.client.connection.state';
 /**
- * The name of the database, fully qualified within the server address and port.
+ * Deprecated, use `server.address`, `server.port` attributes instead.
+ *
+ * @example "Server=(localdb)\\v11.0;Integrated Security=true;"
+ *
+ * @experimental This attribute is experimental and is subject to breaking changes in minor releases of `@opentelemetry/semantic-conventions`.
+ *
+ * @deprecated Replaced by `server.address` and `server.port`.
+ */
+exports.ATTR_DB_CONNECTION_STRING = 'db.connection_string';
+/**
+ * Deprecated, use `db.namespace` instead.
  *
  * @example customers
- * @example test.users
- *
- * @note If a database system has multiple namespace components, they **SHOULD** be concatenated (potentially using database system specific conventions) from most general to most specific namespace component, and more specific namespaces **SHOULD NOT** be captured without the more general namespaces, to ensure that "startswith" queries for the more general namespaces will be valid.
- * Semantic conventions for individual database systems **SHOULD** document what `db.namespace` means in the context of that system.
- * It is **RECOMMENDED** to capture the value as provided by the application without attempting to do any case normalization.
- * This attribute has stability level RELEASE CANDIDATE.
+ * @example main
  *
  * @experimental This attribute is experimental and is subject to breaking changes in minor releases of `@opentelemetry/semantic-conventions`.
+ *
+ * @deprecated Replaced by `db.namespace`.
  */
-exports.ATTR_DB_NAMESPACE = 'db.namespace';
+exports.ATTR_DB_NAME = 'db.name';
 /**
- * The name of the operation or command being executed.
+ * The database statement being executed.
  *
- * @example findAndModify
- * @example HMSET
- * @example SELECT
- *
- * @note It is **RECOMMENDED** to capture the value as provided by the application without attempting to do any case normalization.
- * If the operation name is parsed from the query text, it **SHOULD** be the first operation name found in the query.
- * For batch operations, if the individual operations are known to have the same operation name then that operation name **SHOULD** be used prepended by `BATCH `, otherwise `db.operation.name` **SHOULD** be `BATCH` or some other database system specific term if more applicable.
- * This attribute has stability level RELEASE CANDIDATE.
+ * @example SELECT * FROM wuser_table
+ * @example SET mykey "WuValue"
  *
  * @experimental This attribute is experimental and is subject to breaking changes in minor releases of `@opentelemetry/semantic-conventions`.
+ *
+ * @deprecated Replaced by `db.query.text`.
  */
-exports.ATTR_DB_OPERATION_NAME = 'db.operation.name';
+exports.ATTR_DB_STATEMENT = 'db.statement';
+/**
+ * Deprecated, use `db.system.name` instead.
+ *
+ * @experimental This attribute is experimental and is subject to breaking changes in minor releases of `@opentelemetry/semantic-conventions`.
+ *
+ * @deprecated Replaced by `db.system.name`.
+ */
+exports.ATTR_DB_SYSTEM = 'db.system';
+/**
+ * Deprecated, no replacement at this time.
+ *
+ * @example readonly_user
+ * @example reporting_user
+ *
+ * @experimental This attribute is experimental and is subject to breaking changes in minor releases of `@opentelemetry/semantic-conventions`.
+ *
+ * @deprecated Removed, no replacement at this time.
+ */
+exports.ATTR_DB_USER = 'db.user';
+/**
+ * Deprecated, use `server.address` on client spans and `client.address` on server spans.
+ *
+ * @example example.com
+ *
+ * @experimental This attribute is experimental and is subject to breaking changes in minor releases of `@opentelemetry/semantic-conventions`.
+ *
+ * @deprecated Replaced by `server.address` on client spans and `client.address` on server spans.
+ */
+exports.ATTR_NET_PEER_NAME = 'net.peer.name';
+/**
+ * Deprecated, use `server.port` on client spans and `client.port` on server spans.
+ *
+ * @example 8080
+ *
+ * @experimental This attribute is experimental and is subject to breaking changes in minor releases of `@opentelemetry/semantic-conventions`.
+ *
+ * @deprecated Replaced by `server.port` on client spans and `client.port` on server spans.
+ */
+exports.ATTR_NET_PEER_PORT = 'net.peer.port';
+/**
+ * Enum value "idle" for attribute {@link ATTR_DB_CLIENT_CONNECTION_STATE}.
+ */
+exports.DB_CLIENT_CONNECTION_STATE_VALUE_IDLE = 'idle';
 /**
  * Enum value "used" for attribute {@link ATTR_DB_CLIENT_CONNECTION_STATE}.
  */
 exports.DB_CLIENT_CONNECTION_STATE_VALUE_USED = 'used';
 /**
- * Enum value "idle" for attribute {@link ATTR_DB_CLIENT_CONNECTION_STATE}.
+ * Enum value "postgresql" for attribute {@link ATTR_DB_SYSTEM}.
  */
-exports.DB_CLIENT_CONNECTION_STATE_VALUE_IDLE = 'idle';
+exports.DB_SYSTEM_VALUE_POSTGRESQL = 'postgresql';
 /**
  * The number of connections that are currently in state described by the `state` attribute
  *
@@ -79209,14 +81241,6 @@ exports.METRIC_DB_CLIENT_CONNECTION_COUNT = 'db.client.connection.count';
  * @experimental This metric is experimental and is subject to breaking changes in minor releases of `@opentelemetry/semantic-conventions`.
  */
 exports.METRIC_DB_CLIENT_CONNECTION_PENDING_REQUESTS = 'db.client.connection.pending_requests';
-/**
- * Duration of database client operations.
- *
- * @note Batch operations **SHOULD** be recorded as a single operation.
- *
- * @experimental This metric is experimental and is subject to breaking changes in minor releases of `@opentelemetry/semantic-conventions`.
- */
-exports.METRIC_DB_CLIENT_OPERATION_DURATION = 'db.client.operation.duration';
 //# sourceMappingURL=semconv.js.map
 
 /***/ }),
@@ -79242,7 +81266,7 @@ exports.METRIC_DB_CLIENT_OPERATION_DURATION = 'db.client.operation.duration';
  * limitations under the License.
  */
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.isObjectWithTextString = exports.getErrorMessage = exports.patchClientConnectCallback = exports.patchCallbackPGPool = exports.updateCounter = exports.getPoolName = exports.patchCallback = exports.handleExecutionResult = exports.handleConfigQuery = exports.shouldSkipInstrumentation = exports.getSemanticAttributesFromPool = exports.getSemanticAttributesFromConnection = exports.getConnectionString = exports.parseAndMaskConnectionString = exports.parseNormalizedOperationName = exports.getQuerySpanName = void 0;
+exports.isObjectWithTextString = exports.getErrorMessage = exports.patchClientConnectCallback = exports.patchCallbackPGPool = exports.updateCounter = exports.getPoolName = exports.patchCallback = exports.handleExecutionResult = exports.handleConfigQuery = exports.shouldSkipInstrumentation = exports.getSemanticAttributesFromPoolConnection = exports.getSemanticAttributesFromConnection = exports.getConnectionString = exports.parseAndMaskConnectionString = exports.parseNormalizedOperationName = exports.getQuerySpanName = void 0;
 const api_1 = __nccwpck_require__(63914);
 const AttributeNames_1 = __nccwpck_require__(18491);
 const semantic_conventions_1 = __nccwpck_require__(13695);
@@ -79326,18 +81350,32 @@ function getPort(port) {
     // Unable to find the default used in pg code, so falling back to 'undefined'.
     return undefined;
 }
-function getSemanticAttributesFromConnection(params) {
-    return {
-        [semantic_conventions_1.SEMATTRS_DB_SYSTEM]: semantic_conventions_1.DBSYSTEMVALUES_POSTGRESQL,
-        [semantic_conventions_1.SEMATTRS_DB_NAME]: params.database,
-        [semantic_conventions_1.SEMATTRS_DB_CONNECTION_STRING]: getConnectionString(params),
-        [semantic_conventions_1.SEMATTRS_NET_PEER_NAME]: params.host,
-        [semantic_conventions_1.SEMATTRS_NET_PEER_PORT]: getPort(params.port),
-        [semantic_conventions_1.SEMATTRS_DB_USER]: params.user,
-    };
+function getSemanticAttributesFromConnection(params, semconvStability) {
+    let attributes = {};
+    if (semconvStability & instrumentation_1.SemconvStability.OLD) {
+        attributes = {
+            ...attributes,
+            [semconv_1.ATTR_DB_SYSTEM]: semconv_1.DB_SYSTEM_VALUE_POSTGRESQL,
+            [semconv_1.ATTR_DB_NAME]: params.database,
+            [semconv_1.ATTR_DB_CONNECTION_STRING]: getConnectionString(params),
+            [semconv_1.ATTR_DB_USER]: params.user,
+            [semconv_1.ATTR_NET_PEER_NAME]: params.host,
+            [semconv_1.ATTR_NET_PEER_PORT]: getPort(params.port),
+        };
+    }
+    if (semconvStability & instrumentation_1.SemconvStability.STABLE) {
+        attributes = {
+            ...attributes,
+            [semantic_conventions_1.ATTR_DB_SYSTEM_NAME]: semantic_conventions_1.DB_SYSTEM_NAME_VALUE_POSTGRESQL,
+            [semantic_conventions_1.ATTR_DB_NAMESPACE]: params.namespace,
+            [semantic_conventions_1.ATTR_SERVER_ADDRESS]: params.host,
+            [semantic_conventions_1.ATTR_SERVER_PORT]: getPort(params.port),
+        };
+    }
+    return attributes;
 }
 exports.getSemanticAttributesFromConnection = getSemanticAttributesFromConnection;
-function getSemanticAttributesFromPool(params) {
+function getSemanticAttributesFromPoolConnection(params, semconvStability) {
     let url;
     try {
         url = params.connectionString
@@ -79347,18 +81385,33 @@ function getSemanticAttributesFromPool(params) {
     catch (e) {
         url = undefined;
     }
-    return {
-        [semantic_conventions_1.SEMATTRS_DB_SYSTEM]: semantic_conventions_1.DBSYSTEMVALUES_POSTGRESQL,
-        [semantic_conventions_1.SEMATTRS_DB_NAME]: url?.pathname.slice(1) ?? params.database,
-        [semantic_conventions_1.SEMATTRS_DB_CONNECTION_STRING]: getConnectionString(params),
-        [semantic_conventions_1.SEMATTRS_NET_PEER_NAME]: url?.hostname ?? params.host,
-        [semantic_conventions_1.SEMATTRS_NET_PEER_PORT]: Number(url?.port) || getPort(params.port),
-        [semantic_conventions_1.SEMATTRS_DB_USER]: url?.username ?? params.user,
+    let attributes = {
         [AttributeNames_1.AttributeNames.IDLE_TIMEOUT_MILLIS]: params.idleTimeoutMillis,
         [AttributeNames_1.AttributeNames.MAX_CLIENT]: params.maxClient,
     };
+    if (semconvStability & instrumentation_1.SemconvStability.OLD) {
+        attributes = {
+            ...attributes,
+            [semconv_1.ATTR_DB_SYSTEM]: semconv_1.DB_SYSTEM_VALUE_POSTGRESQL,
+            [semconv_1.ATTR_DB_NAME]: url?.pathname.slice(1) ?? params.database,
+            [semconv_1.ATTR_DB_CONNECTION_STRING]: getConnectionString(params),
+            [semconv_1.ATTR_NET_PEER_NAME]: url?.hostname ?? params.host,
+            [semconv_1.ATTR_NET_PEER_PORT]: Number(url?.port) || getPort(params.port),
+            [semconv_1.ATTR_DB_USER]: url?.username ?? params.user,
+        };
+    }
+    if (semconvStability & instrumentation_1.SemconvStability.STABLE) {
+        attributes = {
+            ...attributes,
+            [semantic_conventions_1.ATTR_DB_SYSTEM_NAME]: semantic_conventions_1.DB_SYSTEM_NAME_VALUE_POSTGRESQL,
+            [semantic_conventions_1.ATTR_DB_NAMESPACE]: params.namespace,
+            [semantic_conventions_1.ATTR_SERVER_ADDRESS]: url?.hostname ?? params.host,
+            [semantic_conventions_1.ATTR_SERVER_PORT]: Number(url?.port) || getPort(params.port),
+        };
+    }
+    return attributes;
 }
-exports.getSemanticAttributesFromPool = getSemanticAttributesFromPool;
+exports.getSemanticAttributesFromPoolConnection = getSemanticAttributesFromPoolConnection;
 function shouldSkipInstrumentation(instrumentationConfig) {
     return (instrumentationConfig.requireParentSpan === true &&
         api_1.trace.getSpan(api_1.context.active()) === undefined);
@@ -79366,21 +81419,26 @@ function shouldSkipInstrumentation(instrumentationConfig) {
 exports.shouldSkipInstrumentation = shouldSkipInstrumentation;
 // Create a span from our normalized queryConfig object,
 // or return a basic span if no queryConfig was given/could be created.
-function handleConfigQuery(tracer, instrumentationConfig, queryConfig) {
+function handleConfigQuery(tracer, instrumentationConfig, semconvStability, queryConfig) {
     // Create child span.
     const { connectionParameters } = this;
     const dbName = connectionParameters.database;
     const spanName = getQuerySpanName(dbName, queryConfig);
     const span = tracer.startSpan(spanName, {
         kind: api_1.SpanKind.CLIENT,
-        attributes: getSemanticAttributesFromConnection(connectionParameters),
+        attributes: getSemanticAttributesFromConnection(connectionParameters, semconvStability),
     });
     if (!queryConfig) {
         return span;
     }
     // Set attributes
     if (queryConfig.text) {
-        span.setAttribute(semantic_conventions_1.SEMATTRS_DB_STATEMENT, queryConfig.text);
+        if (semconvStability & instrumentation_1.SemconvStability.OLD) {
+            span.setAttribute(semconv_1.ATTR_DB_STATEMENT, queryConfig.text);
+        }
+        if (semconvStability & instrumentation_1.SemconvStability.STABLE) {
+            span.setAttribute(semantic_conventions_1.ATTR_DB_QUERY_TEXT, queryConfig.text);
+        }
     }
     if (instrumentationConfig.enhancedDatabaseReporting &&
         Array.isArray(queryConfig.values)) {
@@ -79546,7 +81604,7 @@ exports.isObjectWithTextString = isObjectWithTextString;
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.PACKAGE_NAME = exports.PACKAGE_VERSION = void 0;
 // this is autogenerated file, see scripts/version-update.js
-exports.PACKAGE_VERSION = '0.55.0';
+exports.PACKAGE_VERSION = '0.56.1';
 exports.PACKAGE_NAME = '@opentelemetry/instrumentation-pg';
 //# sourceMappingURL=version.js.map
 
@@ -79638,8 +81696,8 @@ class PinoInstrumentation extends instrumentation_1.InstrumentationBase {
                         logger[mixinSym] = otelMixin;
                     }
                     else {
-                        logger[mixinSym] = (ctx, level) => {
-                            return Object.assign(otelMixin(ctx, level), origMixin(ctx, level));
+                        logger[mixinSym] = (ctx, level, ...rest) => {
+                            return Object.assign(otelMixin(ctx, level), origMixin(ctx, level, ...rest));
                         };
                     }
                     // Setup "log sending" -- sending log records to the Logs API.
@@ -79975,7 +82033,7 @@ exports.OTelPinoStream = OTelPinoStream;
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.PACKAGE_NAME = exports.PACKAGE_VERSION = void 0;
 // this is autogenerated file, see scripts/version-update.js
-exports.PACKAGE_VERSION = '0.50.0';
+exports.PACKAGE_VERSION = '0.50.1';
 exports.PACKAGE_NAME = '@opentelemetry/instrumentation-pino';
 //# sourceMappingURL=version.js.map
 
@@ -80035,14 +82093,14 @@ const instrumentation_1 = __nccwpck_require__(99272);
 /** @knipignore */
 const version_1 = __nccwpck_require__(57818);
 const instrumentation_2 = __nccwpck_require__(65123);
-const instrumentation_3 = __nccwpck_require__(91827);
+const instrumentation_3 = __nccwpck_require__(93451);
 const DEFAULT_CONFIG = {
     requireParentSpan: false,
 };
 // Wrapper RedisInstrumentation that address all supported versions
 class RedisInstrumentation extends instrumentation_1.InstrumentationBase {
     instrumentationV2_V3;
-    instrumentationV4;
+    instrumentationV4_V5;
     // this is used to bypass a flaw in the base class constructor, which is calling
     // member functions before the constructor has a chance to fully initialize the member variables.
     initialized = false;
@@ -80050,7 +82108,7 @@ class RedisInstrumentation extends instrumentation_1.InstrumentationBase {
         const resolvedConfig = { ...DEFAULT_CONFIG, ...config };
         super(version_1.PACKAGE_NAME, version_1.PACKAGE_VERSION, resolvedConfig);
         this.instrumentationV2_V3 = new instrumentation_2.RedisInstrumentationV2_V3(this.getConfig());
-        this.instrumentationV4 = new instrumentation_3.RedisInstrumentationV4(this.getConfig());
+        this.instrumentationV4_V5 = new instrumentation_3.RedisInstrumentationV4_V5(this.getConfig());
         this.initialized = true;
     }
     setConfig(config = {}) {
@@ -80060,7 +82118,7 @@ class RedisInstrumentation extends instrumentation_1.InstrumentationBase {
             return;
         }
         this.instrumentationV2_V3.setConfig(newConfig);
-        this.instrumentationV4.setConfig(newConfig);
+        this.instrumentationV4_V5.setConfig(newConfig);
     }
     init() { }
     setTracerProvider(tracerProvider) {
@@ -80069,7 +82127,7 @@ class RedisInstrumentation extends instrumentation_1.InstrumentationBase {
             return;
         }
         this.instrumentationV2_V3.setTracerProvider(tracerProvider);
-        this.instrumentationV4.setTracerProvider(tracerProvider);
+        this.instrumentationV4_V5.setTracerProvider(tracerProvider);
     }
     enable() {
         super.enable();
@@ -80077,7 +82135,7 @@ class RedisInstrumentation extends instrumentation_1.InstrumentationBase {
             return;
         }
         this.instrumentationV2_V3.enable();
-        this.instrumentationV4.enable();
+        this.instrumentationV4_V5.enable();
     }
     disable() {
         super.disable();
@@ -80085,7 +82143,7 @@ class RedisInstrumentation extends instrumentation_1.InstrumentationBase {
             return;
         }
         this.instrumentationV2_V3.disable();
-        this.instrumentationV4.disable();
+        this.instrumentationV4_V5.disable();
     }
 }
 exports.RedisInstrumentation = RedisInstrumentation;
@@ -80124,8 +82182,18 @@ const semantic_conventions_1 = __nccwpck_require__(13695);
 const redis_common_1 = __nccwpck_require__(89737);
 class RedisInstrumentationV2_V3 extends instrumentation_1.InstrumentationBase {
     static COMPONENT = 'redis';
+    _semconvStability;
     constructor(config = {}) {
         super(version_1.PACKAGE_NAME, version_1.PACKAGE_VERSION, config);
+        this._semconvStability = config.semconvStability
+            ? config.semconvStability
+            : (0, instrumentation_1.semconvStabilityFromStr)('database', process.env.OTEL_SEMCONV_STABILITY_OPT_IN);
+    }
+    setConfig(config = {}) {
+        super.setConfig(config);
+        this._semconvStability = config.semconvStability
+            ? config.semconvStability
+            : (0, instrumentation_1.semconvStabilityFromStr)('database', process.env.OTEL_SEMCONV_STABILITY_OPT_IN);
     }
     init() {
         return [
@@ -80171,21 +82239,43 @@ class RedisInstrumentationV2_V3 extends instrumentation_1.InstrumentationBase {
                     return original.apply(this, arguments);
                 }
                 const dbStatementSerializer = config?.dbStatementSerializer || redis_common_1.defaultDbStatementSerializer;
-                const span = instrumentation.tracer.startSpan(`${RedisInstrumentationV2_V3.COMPONENT}-${cmd.command}`, {
-                    kind: api_1.SpanKind.CLIENT,
-                    attributes: {
+                const attributes = {};
+                if (instrumentation._semconvStability & instrumentation_1.SemconvStability.OLD) {
+                    Object.assign(attributes, {
                         [semantic_conventions_1.SEMATTRS_DB_SYSTEM]: semantic_conventions_1.DBSYSTEMVALUES_REDIS,
                         [semantic_conventions_1.SEMATTRS_DB_STATEMENT]: dbStatementSerializer(cmd.command, cmd.args),
-                    },
+                    });
+                }
+                if (instrumentation._semconvStability & instrumentation_1.SemconvStability.STABLE) {
+                    Object.assign(attributes, {
+                        [semantic_conventions_1.ATTR_DB_SYSTEM_NAME]: 'redis',
+                        [semantic_conventions_1.ATTR_DB_OPERATION_NAME]: cmd.command,
+                        [semantic_conventions_1.ATTR_DB_QUERY_TEXT]: dbStatementSerializer(cmd.command, cmd.args),
+                    });
+                }
+                const span = instrumentation.tracer.startSpan(`${RedisInstrumentationV2_V3.COMPONENT}-${cmd.command}`, {
+                    kind: api_1.SpanKind.CLIENT,
+                    attributes,
                 });
                 // Set attributes for not explicitly typed RedisPluginClientTypes
                 if (this.connection_options) {
-                    span.setAttributes({
-                        [semantic_conventions_1.SEMATTRS_NET_PEER_NAME]: this.connection_options.host,
-                        [semantic_conventions_1.SEMATTRS_NET_PEER_PORT]: this.connection_options.port,
-                    });
+                    const connectionAttributes = {};
+                    if (instrumentation._semconvStability & instrumentation_1.SemconvStability.OLD) {
+                        Object.assign(connectionAttributes, {
+                            [semantic_conventions_1.SEMATTRS_NET_PEER_NAME]: this.connection_options.host,
+                            [semantic_conventions_1.SEMATTRS_NET_PEER_PORT]: this.connection_options.port,
+                        });
+                    }
+                    if (instrumentation._semconvStability & instrumentation_1.SemconvStability.STABLE) {
+                        Object.assign(connectionAttributes, {
+                            [semantic_conventions_1.ATTR_SERVER_ADDRESS]: this.connection_options.host,
+                            [semantic_conventions_1.ATTR_SERVER_PORT]: this.connection_options.port,
+                        });
+                    }
+                    span.setAttributes(connectionAttributes);
                 }
-                if (this.address) {
+                if (this.address &&
+                    instrumentation._semconvStability & instrumentation_1.SemconvStability.OLD) {
                     span.setAttribute(semantic_conventions_1.SEMATTRS_DB_CONNECTION_STRING, `redis://${this.address}`);
                 }
                 const originalCallback = arguments[0].callback;
@@ -80294,7 +82384,7 @@ exports.getTracedCreateStreamTrace = getTracedCreateStreamTrace;
 
 /***/ }),
 
-/***/ 91827:
+/***/ 93451:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 "use strict";
@@ -80315,20 +82405,30 @@ exports.getTracedCreateStreamTrace = getTracedCreateStreamTrace;
  * limitations under the License.
  */
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.RedisInstrumentationV4 = void 0;
+exports.RedisInstrumentationV4_V5 = void 0;
 const api_1 = __nccwpck_require__(63914);
 const instrumentation_1 = __nccwpck_require__(99272);
-const utils_1 = __nccwpck_require__(33184);
+const utils_1 = __nccwpck_require__(26568);
 const redis_common_1 = __nccwpck_require__(89737);
 /** @knipignore */
 const version_1 = __nccwpck_require__(57818);
 const semantic_conventions_1 = __nccwpck_require__(13695);
 const OTEL_OPEN_SPANS = Symbol('opentelemetry.instrumentation.redis.open_spans');
 const MULTI_COMMAND_OPTIONS = Symbol('opentelemetry.instrumentation.redis.multi_command_options');
-class RedisInstrumentationV4 extends instrumentation_1.InstrumentationBase {
+class RedisInstrumentationV4_V5 extends instrumentation_1.InstrumentationBase {
     static COMPONENT = 'redis';
+    _semconvStability;
     constructor(config = {}) {
         super(version_1.PACKAGE_NAME, version_1.PACKAGE_VERSION, config);
+        this._semconvStability = config.semconvStability
+            ? config.semconvStability
+            : (0, instrumentation_1.semconvStabilityFromStr)('database', process.env.OTEL_SEMCONV_STABILITY_OPT_IN);
+    }
+    setConfig(config = {}) {
+        super.setConfig(config);
+        this._semconvStability = config.semconvStability
+            ? config.semconvStability
+            : (0, instrumentation_1.semconvStabilityFromStr)('database', process.env.OTEL_SEMCONV_STABILITY_OPT_IN);
     }
     init() {
         // @node-redis/client is a new package introduced and consumed by 'redis 4.0.x'
@@ -80366,7 +82466,7 @@ class RedisInstrumentationV4 extends instrumentation_1.InstrumentationBase {
                 this._unwrap(moduleExports, 'attachCommands');
             }
         });
-        const multiCommanderModule = new instrumentation_1.InstrumentationNodeModuleFile(`${basePackageName}/dist/lib/client/multi-command.js`, ['^1.0.0'], (moduleExports) => {
+        const multiCommanderModule = new instrumentation_1.InstrumentationNodeModuleFile(`${basePackageName}/dist/lib/client/multi-command.js`, ['^1.0.0', '^5.0.0'], (moduleExports) => {
             const redisClientMultiCommandPrototype = moduleExports?.default?.prototype;
             if ((0, instrumentation_1.isWrapped)(redisClientMultiCommandPrototype?.exec)) {
                 this._unwrap(redisClientMultiCommandPrototype, 'exec');
@@ -80386,7 +82486,7 @@ class RedisInstrumentationV4 extends instrumentation_1.InstrumentationBase {
                 this._unwrap(redisClientMultiCommandPrototype, 'addCommand');
             }
         });
-        const clientIndexModule = new instrumentation_1.InstrumentationNodeModuleFile(`${basePackageName}/dist/lib/client/index.js`, ['^1.0.0'], (moduleExports) => {
+        const clientIndexModule = new instrumentation_1.InstrumentationNodeModuleFile(`${basePackageName}/dist/lib/client/index.js`, ['^1.0.0', '^5.0.0'], (moduleExports) => {
             const redisClientPrototype = moduleExports?.default?.prototype;
             // In some @redis/client versions 'multi' is a method. In later
             // versions, as of https://github.com/redis/node-redis/pull/2324,
@@ -80423,7 +82523,7 @@ class RedisInstrumentationV4 extends instrumentation_1.InstrumentationBase {
                 this._unwrap(redisClientPrototype, 'sendCommand');
             }
         });
-        return new instrumentation_1.InstrumentationNodeModuleDefinition(basePackageName, ['^1.0.0'], (moduleExports) => {
+        return new instrumentation_1.InstrumentationNodeModuleDefinition(basePackageName, ['^1.0.0', '^5.0.0'], (moduleExports) => {
             return moduleExports;
         }, () => { }, [commanderModuleFile, multiCommanderModule, clientIndexModule]);
     }
@@ -80506,8 +82606,8 @@ class RedisInstrumentationV4 extends instrumentation_1.InstrumentationBase {
         return function connectWrapper(original) {
             return function patchedConnect() {
                 const options = this.options;
-                const attributes = (0, utils_1.getClientAttributes)(plugin._diag, options);
-                const span = plugin.tracer.startSpan(`${RedisInstrumentationV4.COMPONENT}-connect`, {
+                const attributes = (0, utils_1.getClientAttributes)(plugin._diag, options, plugin._semconvStability);
+                const span = plugin.tracer.startSpan(`${RedisInstrumentationV4_V5.COMPONENT}-connect`, {
                     kind: api_1.SpanKind.CLIENT,
                     attributes,
                 });
@@ -80540,11 +82640,19 @@ class RedisInstrumentationV4 extends instrumentation_1.InstrumentationBase {
         const commandName = redisCommandArguments[0]; // types also allows it to be a Buffer, but in practice it only string
         const commandArgs = redisCommandArguments.slice(1);
         const dbStatementSerializer = this.getConfig().dbStatementSerializer || redis_common_1.defaultDbStatementSerializer;
-        const attributes = (0, utils_1.getClientAttributes)(this._diag, clientOptions);
+        const attributes = (0, utils_1.getClientAttributes)(this._diag, clientOptions, this._semconvStability);
+        if (this._semconvStability & instrumentation_1.SemconvStability.STABLE) {
+            attributes[semantic_conventions_1.ATTR_DB_OPERATION_NAME] = commandName;
+        }
         try {
             const dbStatement = dbStatementSerializer(commandName, commandArgs);
             if (dbStatement != null) {
-                attributes[semantic_conventions_1.SEMATTRS_DB_STATEMENT] = dbStatement;
+                if (this._semconvStability & instrumentation_1.SemconvStability.OLD) {
+                    attributes[semantic_conventions_1.SEMATTRS_DB_STATEMENT] = dbStatement;
+                }
+                if (this._semconvStability & instrumentation_1.SemconvStability.STABLE) {
+                    attributes[semantic_conventions_1.ATTR_DB_QUERY_TEXT] = dbStatement;
+                }
             }
         }
         catch (e) {
@@ -80552,7 +82660,7 @@ class RedisInstrumentationV4 extends instrumentation_1.InstrumentationBase {
                 commandName,
             });
         }
-        const span = this.tracer.startSpan(`${RedisInstrumentationV4.COMPONENT}-${commandName}`, {
+        const span = this.tracer.startSpan(`${RedisInstrumentationV4_V5.COMPONENT}-${commandName}`, {
             kind: api_1.SpanKind.CLIENT,
             attributes,
         });
@@ -80611,12 +82719,12 @@ class RedisInstrumentationV4 extends instrumentation_1.InstrumentationBase {
         span.end();
     }
 }
-exports.RedisInstrumentationV4 = RedisInstrumentationV4;
+exports.RedisInstrumentationV4_V5 = RedisInstrumentationV4_V5;
 //# sourceMappingURL=instrumentation.js.map
 
 /***/ }),
 
-/***/ 33184:
+/***/ 26568:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 "use strict";
@@ -80624,13 +82732,25 @@ exports.RedisInstrumentationV4 = RedisInstrumentationV4;
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.getClientAttributes = void 0;
 const semantic_conventions_1 = __nccwpck_require__(13695);
-function getClientAttributes(diag, options) {
-    return {
-        [semantic_conventions_1.SEMATTRS_DB_SYSTEM]: semantic_conventions_1.DBSYSTEMVALUES_REDIS,
-        [semantic_conventions_1.SEMATTRS_NET_PEER_NAME]: options?.socket?.host,
-        [semantic_conventions_1.SEMATTRS_NET_PEER_PORT]: options?.socket?.port,
-        [semantic_conventions_1.SEMATTRS_DB_CONNECTION_STRING]: removeCredentialsFromDBConnectionStringAttribute(diag, options?.url),
-    };
+const instrumentation_1 = __nccwpck_require__(99272);
+function getClientAttributes(diag, options, semconvStability) {
+    const attributes = {};
+    if (semconvStability & instrumentation_1.SemconvStability.OLD) {
+        Object.assign(attributes, {
+            [semantic_conventions_1.SEMATTRS_DB_SYSTEM]: semantic_conventions_1.DBSYSTEMVALUES_REDIS,
+            [semantic_conventions_1.SEMATTRS_NET_PEER_NAME]: options?.socket?.host,
+            [semantic_conventions_1.SEMATTRS_NET_PEER_PORT]: options?.socket?.port,
+            [semantic_conventions_1.SEMATTRS_DB_CONNECTION_STRING]: removeCredentialsFromDBConnectionStringAttribute(diag, options?.url),
+        });
+    }
+    if (semconvStability & instrumentation_1.SemconvStability.STABLE) {
+        Object.assign(attributes, {
+            [semantic_conventions_1.ATTR_DB_SYSTEM_NAME]: 'redis',
+            [semantic_conventions_1.ATTR_SERVER_ADDRESS]: options?.socket?.host,
+            [semantic_conventions_1.ATTR_SERVER_PORT]: options?.socket?.port,
+        });
+    }
+    return attributes;
 }
 exports.getClientAttributes = getClientAttributes;
 /**
@@ -80683,7 +82803,7 @@ function removeCredentialsFromDBConnectionStringAttribute(diag, url) {
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.PACKAGE_NAME = exports.PACKAGE_VERSION = void 0;
 // this is autogenerated file, see scripts/version-update.js
-exports.PACKAGE_VERSION = '0.51.0';
+exports.PACKAGE_VERSION = '0.52.0';
 exports.PACKAGE_NAME = '@opentelemetry/instrumentation-redis';
 //# sourceMappingURL=version.js.map
 
@@ -81538,6 +83658,7 @@ class RuntimeNodeInstrumentation extends instrumentation_1.InstrumentationBase {
         // Not instrumenting or patching a Node.js module
     }
     enable() {
+        super.enable();
         if (!this._collectors)
             return;
         for (const collector of this._collectors) {
@@ -81545,6 +83666,7 @@ class RuntimeNodeInstrumentation extends instrumentation_1.InstrumentationBase {
         }
     }
     disable() {
+        super.disable();
         for (const collector of this._collectors) {
             collector.disable();
         }
@@ -82017,7 +84139,7 @@ var ConventionalNamePrefix;
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.PACKAGE_NAME = exports.PACKAGE_VERSION = void 0;
 // this is autogenerated file, see scripts/version-update.js
-exports.PACKAGE_VERSION = '0.17.0';
+exports.PACKAGE_VERSION = '0.17.1';
 exports.PACKAGE_NAME = '@opentelemetry/instrumentation-runtime-node';
 //# sourceMappingURL=version.js.map
 
@@ -83746,7 +85868,7 @@ exports.WinstonInstrumentation = WinstonInstrumentation;
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.PACKAGE_NAME = exports.PACKAGE_VERSION = void 0;
 // this is autogenerated file, see scripts/version-update.js
-exports.PACKAGE_VERSION = '0.48.0';
+exports.PACKAGE_VERSION = '0.48.1';
 exports.PACKAGE_NAME = '@opentelemetry/instrumentation-winston';
 //# sourceMappingURL=version.js.map
 
@@ -101762,185 +103884,6 @@ exports.ProtobufTraceSerializer = {
     },
 };
 //# sourceMappingURL=trace.js.map
-
-/***/ }),
-
-/***/ 30784:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.pubsubPropagation = void 0;
-/*
- * Copyright The OpenTelemetry Authors
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      https://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-var pubsub_propagation_1 = __nccwpck_require__(64334);
-Object.defineProperty(exports, "pubsubPropagation", ({ enumerable: true, get: function () { return pubsub_propagation_1.default; } }));
-//# sourceMappingURL=index.js.map
-
-/***/ }),
-
-/***/ 64334:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-/*
- * Copyright The OpenTelemetry Authors
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      https://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-const api_1 = __nccwpck_require__(63914);
-const START_SPAN_FUNCTION = Symbol('opentelemetry.pubsub-propagation.start_span');
-const END_SPAN_FUNCTION = Symbol('opentelemetry.pubsub-propagation.end_span');
-const patchArrayFilter = (messages, tracer, loopContext) => {
-    const origFunc = messages.filter;
-    const patchedFunc = function (...args) {
-        const newArray = origFunc.apply(this, args);
-        patchArrayForProcessSpans(newArray, tracer, loopContext);
-        return newArray;
-    };
-    Object.defineProperty(messages, 'filter', {
-        enumerable: false,
-        value: patchedFunc,
-    });
-};
-function isPromise(value) {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    return typeof value?.then === 'function';
-}
-const patchArrayFunction = (messages, functionName, tracer, loopContext) => {
-    const origFunc = messages[functionName];
-    const patchedFunc = function (...arrFuncArgs) {
-        const callback = arrFuncArgs[0];
-        const wrappedCallback = function (...callbackArgs) {
-            const message = callbackArgs[0];
-            const messageSpan = message?.[START_SPAN_FUNCTION]?.();
-            if (!messageSpan)
-                return callback.apply(this, callbackArgs);
-            const res = api_1.context.with(api_1.trace.setSpan(loopContext, messageSpan), () => {
-                let result;
-                try {
-                    result = callback.apply(this, callbackArgs);
-                    if (isPromise(result)) {
-                        const endSpan = () => message[END_SPAN_FUNCTION]?.();
-                        result.then(endSpan, endSpan);
-                    }
-                    return result;
-                }
-                finally {
-                    if (!isPromise(result)) {
-                        message[END_SPAN_FUNCTION]?.();
-                    }
-                }
-            });
-            if (typeof res === 'object') {
-                const startSpanFunction = Object.getOwnPropertyDescriptor(message, START_SPAN_FUNCTION);
-                startSpanFunction &&
-                    Object.defineProperty(res, START_SPAN_FUNCTION, startSpanFunction);
-                const endSpanFunction = Object.getOwnPropertyDescriptor(message, END_SPAN_FUNCTION);
-                endSpanFunction &&
-                    Object.defineProperty(res, END_SPAN_FUNCTION, endSpanFunction);
-            }
-            return res;
-        };
-        arrFuncArgs[0] = wrappedCallback;
-        const funcResult = origFunc.apply(this, arrFuncArgs);
-        if (Array.isArray(funcResult))
-            patchArrayForProcessSpans(funcResult, tracer, loopContext);
-        return funcResult;
-    };
-    Object.defineProperty(messages, functionName, {
-        enumerable: false,
-        value: patchedFunc,
-    });
-};
-const patchArrayForProcessSpans = (messages, tracer, loopContext = api_1.context.active()) => {
-    patchArrayFunction(messages, 'forEach', tracer, loopContext);
-    patchArrayFunction(messages, 'map', tracer, loopContext);
-    patchArrayFilter(messages, tracer, loopContext);
-};
-const startMessagingProcessSpan = (message, name, attributes, parentContext, propagatedContext, tracer, processHook) => {
-    const links = [];
-    const spanContext = api_1.trace.getSpanContext(propagatedContext);
-    if (spanContext) {
-        links.push({
-            context: spanContext,
-        });
-    }
-    const spanName = `${name} process`;
-    const processSpan = tracer.startSpan(spanName, {
-        kind: api_1.SpanKind.CONSUMER,
-        attributes: {
-            ...attributes,
-            ['messaging.operation']: 'process',
-        },
-        links,
-    }, parentContext);
-    Object.defineProperty(message, START_SPAN_FUNCTION, {
-        enumerable: false,
-        writable: true,
-        value: () => processSpan,
-    });
-    Object.defineProperty(message, END_SPAN_FUNCTION, {
-        enumerable: false,
-        writable: true,
-        value: () => {
-            processSpan.end();
-            Object.defineProperty(message, END_SPAN_FUNCTION, {
-                enumerable: false,
-                writable: true,
-                value: () => { },
-            });
-        },
-    });
-    try {
-        processHook?.(processSpan, message);
-    }
-    catch (err) {
-        api_1.diag.error('opentelemetry-pubsub-propagation: process hook error', err);
-    }
-    return processSpan;
-};
-const patchMessagesArrayToStartProcessSpans = ({ messages, tracer, parentContext, messageToSpanDetails, processHook, }) => {
-    messages.forEach(message => {
-        const { attributes, name, parentContext: propagatedContext, } = messageToSpanDetails(message);
-        Object.defineProperty(message, START_SPAN_FUNCTION, {
-            enumerable: false,
-            writable: true,
-            value: () => startMessagingProcessSpan(message, name, attributes, parentContext, propagatedContext, tracer, processHook),
-        });
-    });
-};
-exports["default"] = {
-    patchMessagesArrayToStartProcessSpans,
-    patchArrayForProcessSpans,
-};
-//# sourceMappingURL=pubsub-propagation.js.map
 
 /***/ }),
 
@@ -120297,6 +122240,8 @@ base64.test = function test(string) {
 
 module.exports = codegen;
 
+var reservedRe = /^(?:do|if|in|for|let|new|try|var|case|else|enum|eval|false|null|this|true|void|with|break|catch|class|const|super|throw|while|yield|delete|export|import|public|return|static|switch|typeof|default|extends|finally|package|private|continue|debugger|function|arguments|interface|protected|implements|instanceof)$/;
+
 /**
  * Begins generating a function.
  * @memberof util
@@ -120371,7 +122316,7 @@ function codegen(functionParams, functionName) {
     }
 
     function toString(functionNameOverride) {
-        return "function " + (functionNameOverride || functionName || "") + "(" + (functionParams && functionParams.join(",") || "") + "){\n  " + body.join("\n  ") + "\n}";
+        return "function " + safeFunctionName(functionNameOverride || functionName) + "(" + (functionParams && functionParams.join(",") || "") + "){\n  " + body.join("\n  ") + "\n}";
     }
 
     Codegen.toString = toString;
@@ -120393,6 +122338,17 @@ function codegen(functionParams, functionName) {
  * @type {boolean}
  */
 codegen.verbose = false;
+
+function safeFunctionName(name) {
+    if (!name)
+        return "";
+    name = String(name).replace(/[^\w$]/g, "");
+    if (!name)
+        return "";
+    if (/^\d/.test(name))
+        name = "_" + name;
+    return reservedRe.test(name) ? name + "_" : name;
+}
 
 
 /***/ }),
@@ -120417,15 +122373,23 @@ function EventEmitter() {
      * @type {Object.<string,*>}
      * @private
      */
-    this._listeners = {};
+    this._listeners = Object.create(null);
 }
+
+/**
+ * Event listener as used by {@link util.EventEmitter}.
+ * @typedef EventEmitterListener
+ * @type {function}
+ * @param {...*} args Arguments
+ * @returns {undefined}
+ */
 
 /**
  * Registers an event listener.
  * @param {string} evt Event name
- * @param {function} fn Listener
+ * @param {EventEmitterListener} fn Listener
  * @param {*} [ctx] Listener context
- * @returns {util.EventEmitter} `this`
+ * @returns {this} `this`
  */
 EventEmitter.prototype.on = function on(evt, fn, ctx) {
     (this._listeners[evt] || (this._listeners[evt] = [])).push({
@@ -120438,17 +122402,19 @@ EventEmitter.prototype.on = function on(evt, fn, ctx) {
 /**
  * Removes an event listener or any matching listeners if arguments are omitted.
  * @param {string} [evt] Event name. Removes all listeners if omitted.
- * @param {function} [fn] Listener to remove. Removes all listeners of `evt` if omitted.
- * @returns {util.EventEmitter} `this`
+ * @param {EventEmitterListener} [fn] Listener to remove. Removes all listeners of `evt` if omitted.
+ * @returns {this} `this`
  */
 EventEmitter.prototype.off = function off(evt, fn) {
     if (evt === undefined)
-        this._listeners = {};
+        this._listeners = Object.create(null);
     else {
         if (fn === undefined)
             this._listeners[evt] = [];
         else {
             var listeners = this._listeners[evt];
+            if (!listeners)
+                return this;
             for (var i = 0; i < listeners.length;)
                 if (listeners[i].fn === fn)
                     listeners.splice(i, 1);
@@ -120463,7 +122429,7 @@ EventEmitter.prototype.off = function off(evt, fn) {
  * Emits an event by calling its listeners with the specified arguments.
  * @param {string} evt Event name
  * @param {...*} args Arguments
- * @returns {util.EventEmitter} `this`
+ * @returns {this} `this`
  */
 EventEmitter.prototype.emit = function emit(evt) {
     var listeners = this._listeners[evt];
@@ -120489,9 +122455,7 @@ EventEmitter.prototype.emit = function emit(evt) {
 module.exports = fetch;
 
 var asPromise = __nccwpck_require__(92222),
-    inquire   = __nccwpck_require__(77206);
-
-var fs = inquire("fs");
+    fs        = __nccwpck_require__(20193);
 
 /**
  * Node-style callback as used by {@link util.fetch}.
@@ -120504,8 +122468,7 @@ var fs = inquire("fs");
 
 /**
  * Options as used by {@link util.fetch}.
- * @typedef FetchOptions
- * @type {Object}
+ * @interface IFetchOptions
  * @property {boolean} [binary=false] Whether expecting a binary response
  * @property {boolean} [xhr=false] If `true`, forces the use of XMLHttpRequest
  */
@@ -120514,7 +122477,7 @@ var fs = inquire("fs");
  * Fetches the contents of a file.
  * @memberof util
  * @param {string} filename File path or url
- * @param {FetchOptions} options Fetch options
+ * @param {IFetchOptions} options Fetch options
  * @param {FetchCallback} callback Callback function
  * @returns {undefined}
  */
@@ -120557,7 +122520,7 @@ function fetch(filename, options, callback) {
  * @name util.fetch
  * @function
  * @param {string} path File path or url
- * @param {FetchOptions} [options] Fetch options
+ * @param {IFetchOptions} [options] Fetch options
  * @returns {Promise<string|Uint8Array>} Promise
  * @variation 3
  */
@@ -120600,6 +122563,25 @@ fetch.xhr = function fetch_xhr(filename, options, callback) {
     xhr.open("GET", filename);
     xhr.send();
 };
+
+
+/***/ }),
+
+/***/ 20193:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+"use strict";
+
+
+var fs = null;
+try {
+    fs = __nccwpck_require__(/* webpackIgnore: true */ 79896);
+    if (!fs || !fs.readFile || !fs.readFileSync)
+        fs = null;
+} catch (e) {
+    // `fs` is unavailable in browsers and browser-like bundles.
+}
+module.exports = fs;
 
 
 /***/ }),
@@ -120947,31 +122929,6 @@ function readUintBE(buf, pos) {
 
 /***/ }),
 
-/***/ 77206:
-/***/ ((module) => {
-
-"use strict";
-
-module.exports = inquire;
-
-/**
- * Requires a module only if available.
- * @memberof util
- * @param {string} moduleName Module to require
- * @returns {?Object} Required module if available and not empty, otherwise `null`
- */
-function inquire(moduleName) {
-    try {
-        var mod = eval("quire".replace(/^/,"re"))(moduleName); // eslint-disable-line no-eval
-        if (mod && (mod.length || Object.keys(mod).length))
-            return mod;
-    } catch (e) {} // eslint-disable-line no-empty
-    return null;
-}
-
-
-/***/ }),
-
 /***/ 66090:
 /***/ ((__unused_webpack_module, exports) => {
 
@@ -121112,7 +123069,8 @@ function pool(alloc, slice, size) {
  * @memberof util
  * @namespace
  */
-var utf8 = exports;
+var utf8 = exports,
+    replacementChar = "\ufffd";
 
 /**
  * Calculates the UTF8 byte length of a string.
@@ -121145,36 +123103,34 @@ utf8.length = function utf8_length(string) {
  * @returns {string} String read
  */
 utf8.read = function utf8_read(buffer, start, end) {
-    var len = end - start;
-    if (len < 1)
+    if (end - start < 1) {
         return "";
-    var parts = null,
-        chunk = [],
-        i = 0, // char offset
-        t;     // temporary
-    while (start < end) {
-        t = buffer[start++];
-        if (t < 128)
-            chunk[i++] = t;
-        else if (t > 191 && t < 224)
-            chunk[i++] = (t & 31) << 6 | buffer[start++] & 63;
-        else if (t > 239 && t < 365) {
-            t = ((t & 7) << 18 | (buffer[start++] & 63) << 12 | (buffer[start++] & 63) << 6 | buffer[start++] & 63) - 0x10000;
-            chunk[i++] = 0xD800 + (t >> 10);
-            chunk[i++] = 0xDC00 + (t & 1023);
-        } else
-            chunk[i++] = (t & 15) << 12 | (buffer[start++] & 63) << 6 | buffer[start++] & 63;
-        if (i > 8191) {
-            (parts || (parts = [])).push(String.fromCharCode.apply(String, chunk));
-            i = 0;
+    }
+
+    var str = "";
+    for (var i = start; i < end;) {
+        var t = buffer[i++];
+        if (t <= 0x7F) {
+            str += String.fromCharCode(t);
+        } else if (t >= 0xC0 && t < 0xE0) {
+            var c2 = (t & 0x1F) << 6 | buffer[i++] & 0x3F;
+            str += c2 >= 0x80 ? String.fromCharCode(c2) : replacementChar;
+        } else if (t >= 0xE0 && t < 0xF0) {
+            var c3 = (t & 0xF) << 12 | (buffer[i++] & 0x3F) << 6 | buffer[i++] & 0x3F;
+            str += c3 >= 0x800 ? String.fromCharCode(c3) : replacementChar;
+        } else if (t >= 0xF0) {
+            var t2 = (t & 7) << 18 | (buffer[i++] & 0x3F) << 12 | (buffer[i++] & 0x3F) << 6 | buffer[i++] & 0x3F;
+            if (t2 < 0x10000 || t2 > 0x10FFFF)
+                str += replacementChar;
+            else {
+                t2 -= 0x10000;
+                str += String.fromCharCode(0xD800 + (t2 >> 10));
+                str += String.fromCharCode(0xDC00 + (t2 & 0x3FF));
+            }
         }
     }
-    if (parts) {
-        if (i)
-            parts.push(String.fromCharCode.apply(String, chunk.slice(0, i)));
-        return parts.join("");
-    }
-    return String.fromCharCode.apply(String, chunk.slice(0, i));
+
+    return str;
 };
 
 /**
@@ -127406,6 +129362,18 @@ var hasOwn = __nccwpck_require__(54076);
 var populate = __nccwpck_require__(11835);
 
 /**
+ * Escape CR, LF, and `"` in a multipart `name`/`filename` parameter, so a field
+ * name or filename can not break out of its header line to inject headers or
+ * smuggle additional parts. Matches the WHATWG HTML multipart/form-data encoding.
+ *
+ * @param {string} str - the parameter value to escape
+ * @returns {string} the escaped value
+ */
+function escapeHeaderParam(str) {
+  return String(str).replace(/\r/g, '%0D').replace(/\n/g, '%0A').replace(/"/g, '%22');
+}
+
+/**
  * Create readable "multipart/form-data" streams.
  * Can be used to submit forms
  * and file uploads to other web applications.
@@ -127570,7 +129538,7 @@ FormData.prototype._multiPartHeader = function (field, value, options) {
   var contents = '';
   var headers = {
     // add custom disposition as third element or keep it two elements if not
-    'Content-Disposition': ['form-data', 'name="' + field + '"'].concat(contentDisposition || []),
+    'Content-Disposition': ['form-data', 'name="' + escapeHeaderParam(field) + '"'].concat(contentDisposition || []),
     // if no content type. allow it to be empty array
     'Content-Type': [].concat(contentType || [])
   };
@@ -127624,7 +129592,7 @@ FormData.prototype._getContentDisposition = function (value, options) { // eslin
   }
 
   if (filename) {
-    return 'filename="' + filename + '"';
+    return 'filename="' + escapeHeaderParam(filename) + '"';
   }
 };
 
@@ -135532,7 +137500,11 @@ var Namespace = $protobuf.Namespace,
     MapField  = $protobuf.MapField,
     OneOf     = $protobuf.OneOf,
     Service   = $protobuf.Service,
-    Method    = $protobuf.Method;
+    Method    = $protobuf.Method,
+    patterns  = $protobuf.util.patterns;
+
+var numberRe  = patterns.numberRe,
+    typeRefRe = patterns.typeRefRe;
 
 // --- Root ---
 
@@ -135741,9 +137713,14 @@ var unnamedMessageIndex = 0;
  * @param {IDescriptorProto|Reader|Uint8Array} descriptor Descriptor
  * @param {string} [edition="proto2"] The syntax or edition to use
  * @param {boolean} [nested=false] Whether or not this is a nested object
+ * @param {number} [depth] Current nesting depth, defaults to `0`
  * @returns {Type} Type instance
  */
-Type.fromDescriptor = function fromDescriptor(descriptor, edition, nested) {
+Type.fromDescriptor = function fromDescriptor(descriptor, edition, nested, depth) {
+    if (depth === undefined)
+        depth = 0;
+    if (depth > $protobuf.util.nestingLimit)
+        throw Error("max depth exceeded");
     // Decode the descriptor message if specified as a buffer:
     if (typeof descriptor.length === "number")
         descriptor = exports.DescriptorProto.decode(descriptor);
@@ -135770,7 +137747,7 @@ Type.fromDescriptor = function fromDescriptor(descriptor, edition, nested) {
             type.add(Field.fromDescriptor(descriptor.extension[i], edition, true));
     /* Nested types */ if (descriptor.nestedType)
         for (i = 0; i < descriptor.nestedType.length; ++i) {
-            type.add(Type.fromDescriptor(descriptor.nestedType[i], edition, true));
+            type.add(Type.fromDescriptor(descriptor.nestedType[i], edition, true, depth + 1));
             if (descriptor.nestedType[i].options && descriptor.nestedType[i].options.mapEntry)
                 type.setOption("map_entry", true);
         }
@@ -135915,9 +137892,6 @@ Type.prototype.toDescriptor = function toDescriptor(edition) {
  * @property {number} JS_NUMBER=2
  */
 
-// copied here from parse.js
-var numberRe = /^(?![eE])[0-9]*(?:\.[0-9]*)?(?:[eE][+-]?[0-9]+)?$/;
-
 /**
  * Creates a field from a descriptor.
  *
@@ -135938,10 +137912,13 @@ Field.fromDescriptor = function fromDescriptor(descriptor, edition, nested) {
         throw Error("missing field id");
 
     // Rewire field type
-    var fieldType;
-    if (descriptor.typeName && descriptor.typeName.length)
-        fieldType = descriptor.typeName;
-    else
+    var typeName = descriptor.typeName,
+        fieldType;
+    if (typeName != null && typeName !== "") {
+        if (typeof typeName !== "string" || !typeRefRe.test(typeName))
+            throw Error("illegal type name: " + typeName);
+        fieldType = typeName;
+    } else
         fieldType = fromDescriptorType(descriptor.type);
 
     // Rewire field rule
@@ -135954,10 +137931,12 @@ Field.fromDescriptor = function fromDescriptor(descriptor, edition, nested) {
         default: throw Error("illegal label: " + descriptor.label);
     }
 
-	var extendee = descriptor.extendee;
-	if (descriptor.extendee !== undefined) {
-		extendee = extendee.length ? extendee : undefined;
-	}
+    var extendee = descriptor.extendee;
+    if (extendee != null && extendee !== "") {
+        if (typeof extendee !== "string" || !typeRefRe.test(extendee))
+            throw Error("illegal type name: " + extendee);
+    } else
+        extendee = undefined;
     var field = new Field(
         descriptor.name.length ? descriptor.name : "field" + descriptor.number,
         descriptor.number,
@@ -136040,10 +138019,11 @@ Field.prototype.toDescriptor = function toDescriptor(edition) {
     // Handle extension field
     descriptor.extendee = this.extensionField ? this.extensionField.parent.fullName : this.extend;
 
-    // Handle part of oneof
-    if (this.partOf)
+    // Handle part of oneof (only meaningful for message types)
+    if (this.partOf && this.parent instanceof Type) {
         if ((descriptor.oneofIndex = this.parent.oneofsArray.indexOf(this.partOf)) < 0)
             throw Error("missing oneof");
+    }
 
     if (this.options) {
         descriptor.options = toDescriptorOptions(this.options, exports.FieldOptions);
@@ -136284,12 +138264,24 @@ Method.fromDescriptor = function fromDescriptor(descriptor) {
     if (typeof descriptor.length === "number")
         descriptor = exports.MethodDescriptorProto.decode(descriptor);
 
+    var inputType = descriptor.inputType,
+        outputType = descriptor.outputType;
+
+    if (inputType != null && inputType !== "") {
+        if (typeof inputType !== "string" || !typeRefRe.test(inputType))
+            throw Error("illegal type name: " + inputType);
+    }
+    if (outputType != null && outputType !== "") {
+        if (typeof outputType !== "string" || !typeRefRe.test(outputType))
+            throw Error("illegal type name: " + outputType);
+    }
+
     return new Method(
         // unnamedMethodIndex is global, not per service, because we have no ref to a service here
         descriptor.name && descriptor.name.length ? descriptor.name : "Method" + unnamedMethodIndex++,
         "rpc",
-        descriptor.inputType,
-        descriptor.outputType,
+        inputType,
+        outputType,
         Boolean(descriptor.clientStreaming),
         Boolean(descriptor.serverStreaming),
         fromDescriptorOptions(descriptor.options, exports.MethodOptions)
@@ -137164,9 +139156,9 @@ function genValuePartial_fromObject(gen, field, fieldIndex, prop) {
             } gen
             ("}");
         } else gen
-            ("if(typeof d%s!==\"object\")", prop)
+            ("if(!util.isObject(d%s))", prop)
                 ("throw TypeError(%j)", field.fullName + ": object expected")
-            ("m%s=types[%i].fromObject(d%s)", prop, fieldIndex, prop);
+            ("m%s=types[%i].fromObject(d%s,n+1)", prop, fieldIndex, prop);
     } else {
         var isUnsigned = false;
         switch (field.type) {
@@ -137184,14 +139176,14 @@ function genValuePartial_fromObject(gen, field, fieldIndex, prop) {
                 ("m%s=d%s|0", prop, prop);
                 break;
             case "uint64":
+            case "fixed64":
                 isUnsigned = true;
                 // eslint-disable-next-line no-fallthrough
             case "int64":
             case "sint64":
-            case "fixed64":
             case "sfixed64": gen
                 ("if(util.Long)")
-                    ("(m%s=util.Long.fromValue(d%s)).unsigned=%j", prop, prop, isUnsigned)
+                    ("m%s=util.Long.fromValue(d%s,%j)", prop, prop, isUnsigned)
                 ("else if(typeof d%s===\"string\")", prop)
                     ("m%s=parseInt(d%s,10)", prop, prop)
                 ("else if(typeof d%s===\"number\")", prop)
@@ -137228,11 +139220,17 @@ function genValuePartial_fromObject(gen, field, fieldIndex, prop) {
 converter.fromObject = function fromObject(mtype) {
     /* eslint-disable no-unexpected-multiline, block-scoped-var, no-redeclare */
     var fields = mtype.fieldsArray;
-    var gen = util.codegen(["d"], mtype.name + "$fromObject")
+    var gen = util.codegen(["d", "n"], mtype.name + "$fromObject")
     ("if(d instanceof this.ctor)")
         ("return d");
     if (!fields.length) return gen
     ("return new this.ctor");
+    gen
+    ("if(!util.isObject(d))")
+        ("throw TypeError(%j)", mtype.fullName + ": object expected")
+    ("if(n===undefined)n=0")
+    ("if(n>util.recursionLimit)")
+        ("throw Error(\"maximum nesting depth exceeded\")");
     gen
     ("var m=new this.ctor");
     for (var i = 0; i < fields.length; ++i) {
@@ -137242,10 +139240,13 @@ converter.fromObject = function fromObject(mtype) {
         // Map fields
         if (field.map) { gen
     ("if(d%s){", prop)
-        ("if(typeof d%s!==\"object\")", prop)
+        ("if(!util.isObject(d%s))", prop)
             ("throw TypeError(%j)", field.fullName + ": object expected")
         ("m%s={}", prop)
         ("for(var ks=Object.keys(d%s),i=0;i<ks.length;++i){", prop);
+            gen
+        ("if(ks[i]===\"__proto__\")")
+            ("util.makeProp(m%s,ks[i])", prop);
             genValuePartial_fromObject(gen, field, /* not sorted */ i, prop + "[ks[i]]")
         ("}")
     ("}");
@@ -137289,7 +139290,7 @@ function genValuePartial_toObject(gen, field, fieldIndex, prop) {
         if (field.resolvedType instanceof Enum) gen
             ("d%s=o.enums===String?(types[%i].values[m%s]===undefined?m%s:types[%i].values[m%s]):m%s", prop, fieldIndex, prop, prop, fieldIndex, prop, prop);
         else gen
-            ("d%s=types[%i].toObject(m%s,o)", prop, fieldIndex, prop);
+            ("d%s=types[%i].toObject(m%s,o,q+1)", prop, fieldIndex, prop);
     } else {
         var isUnsigned = false;
         switch (field.type) {
@@ -137298,13 +139299,15 @@ function genValuePartial_toObject(gen, field, fieldIndex, prop) {
             ("d%s=o.json&&!isFinite(m%s)?String(m%s):m%s", prop, prop, prop, prop);
                 break;
             case "uint64":
+            case "fixed64":
                 isUnsigned = true;
                 // eslint-disable-next-line no-fallthrough
             case "int64":
             case "sint64":
-            case "fixed64":
             case "sfixed64": gen
-            ("if(typeof m%s===\"number\")", prop)
+            ("if(typeof BigInt!==\"undefined\"&&o.longs===BigInt)")
+                ("d%s=typeof m%s===\"number\"?BigInt(m%s):util.Long.fromBits(m%s.low>>>0,m%s.high>>>0,%j).toBigInt()", prop, prop, prop, prop, prop, isUnsigned)
+            ("else if(typeof m%s===\"number\")", prop)
                 ("d%s=o.longs===String?String(m%s):m%s", prop, prop, prop)
             ("else") // Long-like
                 ("d%s=o.longs===String?util.Long.prototype.toString.call(m%s):o.longs===Number?new util.LongBits(m%s.low>>>0,m%s.high>>>0).toNumber(%s):m%s", prop, prop, prop, prop, isUnsigned ? "true": "", prop);
@@ -137331,9 +139334,12 @@ converter.toObject = function toObject(mtype) {
     var fields = mtype.fieldsArray.slice().sort(util.compareFieldsById);
     if (!fields.length)
         return util.codegen()("return {}");
-    var gen = util.codegen(["m", "o"], mtype.name + "$toObject")
+    var gen = util.codegen(["m", "o", "q"], mtype.name + "$toObject")
     ("if(!o)")
         ("o={}")
+    ("if(q===undefined)q=0")
+    ("if(q>util.recursionLimit)")
+        ("throw Error(\"max depth exceeded\")")
     ("var d={}");
 
     var repeatedFields = [],
@@ -137372,15 +139378,15 @@ converter.toObject = function toObject(mtype) {
             else if (field.long) gen
         ("if(util.Long){")
             ("var n=new util.Long(%i,%i,%j)", field.typeDefault.low, field.typeDefault.high, field.typeDefault.unsigned)
-            ("d%s=o.longs===String?n.toString():o.longs===Number?n.toNumber():n", prop)
+            ("d%s=o.longs===String?n.toString():o.longs===Number?n.toNumber():typeof BigInt!==\"undefined\"&&o.longs===BigInt?n.toBigInt():n", prop)
         ("}else")
-            ("d%s=o.longs===String?%j:%i", prop, field.typeDefault.toString(), field.typeDefault.toNumber());
+            ("d%s=o.longs===String?%j:typeof BigInt!==\"undefined\"&&o.longs===BigInt?BigInt(%j):%i", prop, field.typeDefault.toString(), field.typeDefault.toString(), field.typeDefault.toNumber());
             else if (field.bytes) {
-                var arrayDefault = "[" + Array.prototype.slice.call(field.typeDefault).join(",") + "]";
+                var arrayDefault = Array.prototype.slice.call(field.typeDefault);
                 gen
         ("if(o.bytes===String)d%s=%j", prop, String.fromCharCode.apply(String, field.typeDefault))
         ("else{")
-            ("d%s=%s", prop, arrayDefault)
+            ("d%s=%j", prop, arrayDefault)
             ("if(o.bytes!==Array)d%s=util.newBuffer(d%s)", prop, prop)
         ("}");
             } else gen
@@ -137400,6 +139406,9 @@ converter.toObject = function toObject(mtype) {
     ("if(m%s&&(ks2=Object.keys(m%s)).length){", prop, prop)
         ("d%s={}", prop)
         ("for(var j=0;j<ks2.length;++j){");
+            gen
+        ("if(ks2[j]===\"__proto__\")")
+            ("util.makeProp(d%s,ks2[j])", prop);
             genValuePartial_toObject(gen, field, /* sorted */ index, prop + "[ks2[j]]")
         ("}");
         } else if (field.repeated) { gen
@@ -137409,7 +139418,7 @@ converter.toObject = function toObject(mtype) {
             genValuePartial_toObject(gen, field, /* sorted */ index, prop + "[j]")
         ("}");
         } else { gen
-    ("if(m%s!=null&&m.hasOwnProperty(%j)){", prop, field.name); // !== undefined && !== null
+    ("if(m%s!=null&&Object.hasOwnProperty.call(m,%j)){", prop, field.name); // !== undefined && !== null
         genValuePartial_toObject(gen, field, /* sorted */ index, prop);
         if (field.partOf) gen
         ("if(o.oneofs)")
@@ -137448,9 +139457,12 @@ function missing(field) {
  */
 function decoder(mtype) {
     /* eslint-disable no-unexpected-multiline */
-    var gen = util.codegen(["r", "l", "e"], mtype.name + "$decode")
+    var gen = util.codegen(["r", "l", "e", "n"], mtype.name + "$decode")
     ("if(!(r instanceof Reader))")
         ("r=Reader.create(r)")
+    ("if(n===undefined)n=0")
+    ("if(n>Reader.recursionLimit)")
+        ("throw Error(\"maximum nesting depth exceeded\")")
     ("var c=l===undefined?r.len:r.pos+l,m=new this.ctor" + (mtype.fieldsArray.filter(function(field) { return field.map; }).length ? ",k,value" : ""))
     ("while(r.pos<c){")
         ("var t=r.uint32()")
@@ -137489,22 +139501,27 @@ function decoder(mtype) {
                         ("case 2:");
 
             if (types.basic[type] === undefined) gen
-                            ("value=types[%i].decode(r,r.uint32())", i); // can't be groups
+                            ("value=types[%i].decode(r,r.uint32(),undefined,n+1)", i); // can't be groups
             else gen
                             ("value=r.%s()", type);
 
             gen
                             ("break")
                         ("default:")
-                            ("r.skipType(tag2&7)")
+                            ("r.skipType(tag2&7,n)")
                             ("break")
                     ("}")
                 ("}");
 
             if (types.long[field.keyType] !== undefined) gen
                 ("%s[typeof k===\"object\"?util.longToHash(k):k]=value", ref);
-            else gen
+            else {
+                if (field.keyType === "string") gen
+                ("if(k===\"__proto__\")")
+                    ("util.makeProp(%s,k)", ref);
+                gen
                 ("%s[k]=value", ref);
+            }
 
         // Repeated fields
         } else if (field.repeated) { gen
@@ -137522,15 +139539,15 @@ function decoder(mtype) {
 
             // Non-packed
             if (types.basic[type] === undefined) gen(field.delimited
-                    ? "%s.push(types[%i].decode(r,undefined,((t&~7)|4)))"
-                    : "%s.push(types[%i].decode(r,r.uint32()))", ref, i);
+                    ? "%s.push(types[%i].decode(r,undefined,((t&~7)|4),n+1))"
+                    : "%s.push(types[%i].decode(r,r.uint32(),undefined,n+1))", ref, i);
             else gen
                     ("%s.push(r.%s())", ref, type);
 
         // Non-repeated
         } else if (types.basic[type] === undefined) gen(field.delimited
-                ? "%s=types[%i].decode(r,undefined,((t&~7)|4))"
-                : "%s=types[%i].decode(r,r.uint32())", ref, i);
+                ? "%s=types[%i].decode(r,undefined,((t&~7)|4),n+1)"
+                : "%s=types[%i].decode(r,r.uint32(),undefined,n+1)", ref, i);
         else gen
                 ("%s=r.%s()", ref, type);
         gen
@@ -137539,7 +139556,7 @@ function decoder(mtype) {
         // Unknown fields
     } gen
             ("default:")
-                ("r.skipType(t&7)")
+                ("r.skipType(t&7,n)")
                 ("break")
 
         ("}")
@@ -137549,7 +139566,7 @@ function decoder(mtype) {
     for (i = 0; i < mtype._fieldsArray.length; ++i) {
         var rfield = mtype._fieldsArray[i];
         if (rfield.required) gen
-    ("if(!m.hasOwnProperty(%j))", rfield.name)
+            ("if(!Object.hasOwnProperty.call(m,%j))", rfield.name)
         ("throw util.ProtocolError(%j,{instance:m})", missing(rfield));
     }
 
@@ -137583,8 +139600,8 @@ var Enum     = __nccwpck_require__(73528),
  */
 function genTypePartial(gen, field, fieldIndex, ref) {
     return field.delimited
-        ? gen("types[%i].encode(%s,w.uint32(%i)).uint32(%i)", fieldIndex, ref, (field.id << 3 | 3) >>> 0, (field.id << 3 | 4) >>> 0)
-        : gen("types[%i].encode(%s,w.uint32(%i).fork()).ldelim()", fieldIndex, ref, (field.id << 3 | 2) >>> 0);
+        ? gen("types[%i].encode(%s,w.uint32(%i),q+1).uint32(%i)", fieldIndex, ref, (field.id << 3 | 3) >>> 0, (field.id << 3 | 4) >>> 0)
+        : gen("types[%i].encode(%s,w.uint32(%i).fork(),q+1).ldelim()", fieldIndex, ref, (field.id << 3 | 2) >>> 0);
 }
 
 /**
@@ -137594,9 +139611,12 @@ function genTypePartial(gen, field, fieldIndex, ref) {
  */
 function encoder(mtype) {
     /* eslint-disable no-unexpected-multiline, block-scoped-var, no-redeclare */
-    var gen = util.codegen(["m", "w"], mtype.name + "$encode")
+    var gen = util.codegen(["m", "w", "q"], mtype.name + "$encode")
     ("if(!w)")
-        ("w=Writer.create()");
+        ("w=Writer.create()")
+    ("if(q===undefined)q=0")
+    ("if(q>util.recursionLimit)")
+        ("throw Error(\"max depth exceeded\")");
 
     var i, ref;
 
@@ -137617,7 +139637,7 @@ function encoder(mtype) {
         ("for(var ks=Object.keys(%s),i=0;i<ks.length;++i){", ref)
             ("w.uint32(%i).fork().uint32(%i).%s(ks[i])", (field.id << 3 | 2) >>> 0, 8 | types.mapKey[field.keyType], field.keyType);
             if (wireType === undefined) gen
-            ("types[%i].encode(%s[ks[i]],w.uint32(18).fork()).ldelim().ldelim()", index, ref); // can't be groups
+            ("types[%i].encode(%s[ks[i]],w.uint32(18).fork(),q+1).ldelim().ldelim()", index, ref); // can't be groups
             else gen
             (".uint32(%i).%s(%s[ks[i]]).ldelim()", 16 | wireType, type, ref);
             gen
@@ -137749,7 +139769,7 @@ function Enum(name, values, options, comment, comments, valuesOptions) {
 
     if (values)
         for (var keys = Object.keys(values), i = 0; i < keys.length; ++i)
-            if (typeof values[keys[i]] === "number") // use forward entries only
+            if (keys[i] !== "__proto__" && typeof values[keys[i]] === "number") // use forward entries only
                 this.valuesById[ this.values[keys[i]] = values[keys[i]] ] = keys[i];
 }
 
@@ -137761,8 +139781,8 @@ Enum.prototype._resolveFeatures = function _resolveFeatures(edition) {
     ReflectionObject.prototype._resolveFeatures.call(this, edition);
 
     Object.keys(this.values).forEach(key => {
-        var parentFeaturesCopy = Object.assign({}, this._features);
-        this._valuesFeatures[key] = Object.assign(parentFeaturesCopy, this.valuesOptions && this.valuesOptions[key] && this.valuesOptions[key].features);
+        var parentFeaturesCopy = util.merge({}, this._features);
+        this._valuesFeatures[key] = util.merge(parentFeaturesCopy, this.valuesOptions && this.valuesOptions[key] && this.valuesOptions[key].features || {});
     });
 
     return this;
@@ -137827,6 +139847,9 @@ Enum.prototype.add = function add(name, id, comment, options) {
 
     if (!util.isInteger(id))
         throw TypeError("id must be an integer");
+
+    if (name === "__proto__")
+        return this;
 
     if (this.values[name] !== undefined)
         throw Error("duplicate name '" + name + "' in " + this);
@@ -138234,7 +140257,7 @@ Field.prototype.resolve = function resolve() {
 
     // convert to internal data type if necesssary
     if (this.long) {
-        this.typeDefault = util.Long.fromNumber(this.typeDefault, this.type.charAt(0) === "u");
+        this.typeDefault = util.Long.fromNumber(this.typeDefault, this.type === "uint64" || this.type === "fixed64");
 
         /* istanbul ignore else */
         if (Object.freeze)
@@ -139025,11 +141048,13 @@ var Type,    // cyclic
  * @function
  * @param {string} name Namespace name
  * @param {Object.<string,*>} json JSON object
+ * @param {number} [depth] Current nesting depth, defaults to `0`
  * @returns {Namespace} Created namespace
  * @throws {TypeError} If arguments are invalid
  */
-Namespace.fromJSON = function fromJSON(name, json) {
-    return new Namespace(name, json.options).addJSON(json.nested);
+Namespace.fromJSON = function fromJSON(name, json, depth) {
+    depth = util.checkDepth(depth);
+    return new Namespace(name, json.options).addJSON(json.nested, depth);
 };
 
 /**
@@ -139112,7 +141137,7 @@ function Namespace(name, options) {
      * @type {Object.<string,ReflectionObject|null>}
      * @private
      */
-    this._lookupCache = {};
+    this._lookupCache = Object.create(null);
 
     /**
      * Whether or not objects contained in this namespace need feature resolution.
@@ -139131,12 +141156,12 @@ function Namespace(name, options) {
 
 function clearCache(namespace) {
     namespace._nestedArray = null;
-    namespace._lookupCache = {};
+    namespace._lookupCache = Object.create(null);
 
     // Also clear parent caches, since they include nested lookups.
     var parent = namespace;
     while(parent = parent.parent) {
-        parent._lookupCache = {};
+        parent._lookupCache = Object.create(null);
     }
     return namespace;
 }
@@ -139187,9 +141212,11 @@ Namespace.prototype.toJSON = function toJSON(toJSONOptions) {
 /**
  * Adds nested objects to this namespace from nested object descriptors.
  * @param {Object.<string,AnyNestedObject>} nestedJson Any nested object descriptors
+ * @param {number} [depth] Current nesting depth, defaults to `0`
  * @returns {Namespace} `this`
  */
-Namespace.prototype.addJSON = function addJSON(nestedJson) {
+Namespace.prototype.addJSON = function addJSON(nestedJson, depth) {
+    depth = util.checkDepth(depth);
     var ns = this;
     /* istanbul ignore else */
     if (nestedJson) {
@@ -139204,7 +141231,7 @@ Namespace.prototype.addJSON = function addJSON(nestedJson) {
                 ? Service.fromJSON
                 : nested.id !== undefined
                 ? Field.fromJSON
-                : Namespace.fromJSON )(names[i], nested)
+                : Namespace.fromJSON )(names[i], nested, depth + 1)
             );
         }
     }
@@ -139217,8 +141244,9 @@ Namespace.prototype.addJSON = function addJSON(nestedJson) {
  * @returns {ReflectionObject|null} The reflection object or `null` if it doesn't exist
  */
 Namespace.prototype.get = function get(name) {
-    return this.nested && this.nested[name]
-        || null;
+    return this.nested && Object.prototype.hasOwnProperty.call(this.nested, name)
+        ? this.nested[name]
+        : null;
 };
 
 /**
@@ -139229,7 +141257,7 @@ Namespace.prototype.get = function get(name) {
  * @throws {Error} If there is no such enum
  */
 Namespace.prototype.getEnum = function getEnum(name) {
-    if (this.nested && this.nested[name] instanceof Enum)
+    if (this.nested && Object.prototype.hasOwnProperty.call(this.nested, name) && this.nested[name] instanceof Enum)
         return this.nested[name].values;
     throw Error("no such enum: " + name);
 };
@@ -139245,6 +141273,9 @@ Namespace.prototype.add = function add(object) {
 
     if (!(object instanceof Field && object.extend !== undefined || object instanceof Type  || object instanceof OneOf || object instanceof Enum || object instanceof Service || object instanceof Namespace))
         throw TypeError("object must be a valid nested object");
+
+    if (object.name === "__proto__")
+        return this;
 
     if (!this.nested)
         this.nested = {};
@@ -139325,6 +141356,8 @@ Namespace.prototype.define = function define(path, json) {
         throw TypeError("illegal path");
     if (path && path.length && path[0] === "")
         throw Error("path must be relative");
+    if (path.length > util.recursionLimit)
+        throw Error("max depth exceeded");
 
     var ptr = this;
     while (path.length > 0) {
@@ -139458,8 +141491,10 @@ Namespace.prototype._lookupImpl = function lookup(path, flatPath) {
     // Otherwise try each nested namespace
     } else {
         for (var i = 0; i < this.nestedArray.length; ++i)
-            if (this._nestedArray[i] instanceof Namespace && (found = this._nestedArray[i]._lookupImpl(path, flatPath)))
+            if (this._nestedArray[i] instanceof Namespace && (found = this._nestedArray[i]._lookupImpl(path, flatPath))) {
                 exact = found;
+                break;
+            }
     }
 
     // Set this even when null, so that when we walk up the tree we can quickly bail on repeated checks back down.
@@ -139763,7 +141798,7 @@ ReflectionObject.prototype._resolveFeatures = function _resolveFeatures(edition)
         throw new Error("Unknown edition for " + this.fullName);
     }
 
-    var protoFeatures = Object.assign(this.options ? Object.assign({},  this.options.features) : {},
+    var protoFeatures = util.merge({}, this.options && this.options.features,
         this._inferLegacyProtoFeatures(edition));
 
     if (this._edition) {
@@ -139778,7 +141813,7 @@ ReflectionObject.prototype._resolveFeatures = function _resolveFeatures(edition)
         } else {
             throw new Error("Unknown edition: " + edition);
         }
-        this._features = Object.assign(defaults, protoFeatures || {});
+        this._features = util.merge(defaults, protoFeatures);
         this._featuresResolved = true;
         return;
     }
@@ -139787,13 +141822,13 @@ ReflectionObject.prototype._resolveFeatures = function _resolveFeatures(edition)
     // special-case it
     /* istanbul ignore else */
     if (this.partOf instanceof OneOf) {
-        var lexicalParentFeaturesCopy = Object.assign({}, this.partOf._features);
-        this._features = Object.assign(lexicalParentFeaturesCopy, protoFeatures || {});
+        var lexicalParentFeaturesCopy = util.merge({}, this.partOf._features);
+        this._features = util.merge(lexicalParentFeaturesCopy, protoFeatures);
     } else if (this.declaringField) {
         // Skip feature resolution of sister fields.
     } else if (this.parent) {
-        var parentFeaturesCopy = Object.assign({}, this.parent._features);
-        this._features = Object.assign(parentFeaturesCopy, protoFeatures || {});
+        var parentFeaturesCopy = util.merge({}, this.parent._features);
+        this._features = util.merge(parentFeaturesCopy, protoFeatures);
     } else {
         throw new Error("Unable to find a parent for " + this.fullName);
     }
@@ -139833,6 +141868,8 @@ ReflectionObject.prototype.getOption = function getOption(name) {
  * @returns {ReflectionObject} `this`
  */
 ReflectionObject.prototype.setOption = function setOption(name, value, ifNotSet) {
+    if (name === "__proto__")
+        return this;
     if (!this.options)
         this.options = {};
     if (/^features\./.test(name)) {
@@ -139853,6 +141890,8 @@ ReflectionObject.prototype.setOption = function setOption(name, value, ifNotSet)
  * @returns {ReflectionObject} `this`
  */
 ReflectionObject.prototype.setParsedOption = function setParsedOption(name, value, propName) {
+    if (name === "__proto__")
+        return this;
     if (!this.parsedOptions) {
         this.parsedOptions = [];
     }
@@ -140189,9 +142228,9 @@ var base10Re    = /^[1-9][0-9]*$/,
     base16NegRe = /^-?0[x][0-9a-fA-F]+$/,
     base8Re     = /^0[0-7]+$/,
     base8NegRe  = /^-?0[0-7]+$/,
-    numberRe    = /^(?![eE])[0-9]*(?:\.[0-9]*)?(?:[eE][+-]?[0-9]+)?$/,
+    numberRe    = util.patterns.numberRe,
     nameRe      = /^[a-zA-Z_][a-zA-Z_0-9]*$/,
-    typeRefRe   = /^(?:\.?[a-zA-Z_][a-zA-Z_0-9]*)(?:\.[a-zA-Z_][a-zA-Z_0-9]*)*$/;
+    typeRefRe   = util.patterns.typeRefRe;
 
 /**
  * Result object returned from {@link parse}.
@@ -140467,7 +142506,10 @@ function parse(source, root, options) {
     }
 
 
-    function parseCommon(parent, token) {
+    function parseCommon(parent, token, depth) {
+        if (depth === undefined)
+            depth = 0;
+        // depth is checked by dispatched functions
         switch (token) {
 
             case "option":
@@ -140476,7 +142518,7 @@ function parse(source, root, options) {
                 return true;
 
             case "message":
-                parseType(parent, token);
+                parseType(parent, token, depth + 1);
                 return true;
 
             case "enum":
@@ -140484,11 +142526,11 @@ function parse(source, root, options) {
                 return true;
 
             case "service":
-                parseService(parent, token);
+                parseService(parent, token, depth + 1);
                 return true;
 
             case "extend":
-                parseExtension(parent, token);
+                parseExtension(parent, token, depth);
                 return true;
         }
         return false;
@@ -140516,7 +142558,11 @@ function parse(source, root, options) {
         }
     }
 
-    function parseType(parent, token) {
+    function parseType(parent, token, depth) {
+        if (depth === undefined)
+            depth = 0;
+        if (depth > util.nestingLimit)
+            throw Error("max depth exceeded");
 
         /* istanbul ignore if */
         if (!nameRe.test(token = next()))
@@ -140524,7 +142570,7 @@ function parse(source, root, options) {
 
         var type = new Type(token);
         ifBlock(type, function parseType_block(token) {
-            if (parseCommon(type, token))
+            if (parseCommon(type, token, depth))
                 return;
 
             switch (token) {
@@ -140538,22 +142584,22 @@ function parse(source, root, options) {
                         throw illegal(token);
                 /* eslint-disable no-fallthrough */
                 case "repeated":
-                    parseField(type, token);
+                    parseField(type, token, undefined, depth + 1);
                     break;
 
                 case "optional":
                     /* istanbul ignore if */
                     if (edition === "proto3") {
-                        parseField(type, "proto3_optional");
+                        parseField(type, "proto3_optional", undefined, depth + 1);
                     } else if (edition !== "proto2") {
                         throw illegal(token);
                     } else {
-                        parseField(type, "optional");
+                        parseField(type, "optional", undefined, depth + 1);
                     }
                     break;
 
                 case "oneof":
-                    parseOneOf(type, token);
+                    parseOneOf(type, token, depth + 1);
                     break;
 
                 case "extensions":
@@ -140571,7 +142617,7 @@ function parse(source, root, options) {
                     }
 
                     push(token);
-                    parseField(type, "optional");
+                    parseField(type, "optional", undefined, depth + 1);
                     break;
             }
         });
@@ -140581,10 +142627,10 @@ function parse(source, root, options) {
         }
     }
 
-    function parseField(parent, rule, extend) {
+    function parseField(parent, rule, extend, depth) {
         var type = next();
         if (type === "group") {
-            parseGroup(parent, rule);
+            parseGroup(parent, rule, depth);
             return;
         }
         // Type names can consume multiple tokens, in multiple variants:
@@ -140641,7 +142687,11 @@ function parse(source, root, options) {
         }
     }
 
-    function parseGroup(parent, rule) {
+    function parseGroup(parent, rule, depth) {
+        if (depth === undefined)
+            depth = 0;
+        if (depth > util.nestingLimit)
+            throw Error("max depth exceeded");
         if (edition >= 2023) {
             throw illegal("group");
         }
@@ -140669,20 +142719,20 @@ function parse(source, root, options) {
                     break;
                 case "required":
                 case "repeated":
-                    parseField(type, token);
+                    parseField(type, token, undefined, depth + 1);
                     break;
 
                 case "optional":
                     /* istanbul ignore if */
                     if (edition === "proto3") {
-                        parseField(type, "proto3_optional");
+                        parseField(type, "proto3_optional", undefined, depth + 1);
                     } else {
-                        parseField(type, "optional");
+                        parseField(type, "optional", undefined, depth + 1);
                     }
                     break;
 
                 case "message":
-                    parseType(type, token);
+                    parseType(type, token, depth + 1);
                     break;
 
                 case "enum":
@@ -140741,7 +142791,7 @@ function parse(source, root, options) {
         parent.add(field);
     }
 
-    function parseOneOf(parent, token) {
+    function parseOneOf(parent, token, depth) {
 
         /* istanbul ignore if */
         if (!nameRe.test(token = next()))
@@ -140754,7 +142804,7 @@ function parse(source, root, options) {
                 skip(";");
             } else {
                 push(token);
-                parseField(oneof, "optional");
+                parseField(oneof, "optional", undefined, depth);
             }
         });
         parent.add(oneof);
@@ -140833,6 +142883,9 @@ function parse(source, root, options) {
             }
 
             while (token !== "=") {
+                if (token === null) {
+                    throw illegal(token, "end of input");
+                }
                 if (token === "(") {
                     var parensValue = next();
                     skip(")");
@@ -140859,7 +142912,11 @@ function parse(source, root, options) {
             setParsedOption(parent, option, optionValue, propName);
     }
 
-    function parseOptionValue(parent, name) {
+    function parseOptionValue(parent, name, depth) {
+        if (depth === undefined)
+            depth = 0;
+        if (depth > util.recursionLimit)
+            throw Error("max depth exceeded");
         // { a: "foo" b { c: "bar" } }
         if (skip("{", true)) {
             var objectResult = {};
@@ -140882,7 +142939,7 @@ function parse(source, root, options) {
                     // option (my_option) = {
                     //     repeated_value: [ "foo", "bar" ]
                     // };
-                    value = parseOptionValue(parent, name + "." + token);
+                    value = parseOptionValue(parent, name + "." + token, depth + 1);
                 } else if (peek() === "[") {
                     value = [];
                     var lastValue;
@@ -140906,7 +142963,8 @@ function parse(source, root, options) {
                 if (prevValue)
                     value = [].concat(prevValue).concat(value);
 
-                objectResult[propName] = value;
+                if (propName !== "__proto__")
+                    objectResult[propName] = value;
 
                 // Semicolons and commas can be optional
                 skip(",", true);
@@ -140946,7 +143004,11 @@ function parse(source, root, options) {
         return parent;
     }
 
-    function parseService(parent, token) {
+    function parseService(parent, token, depth) {
+        if (depth === undefined)
+            depth = 0;
+        if (depth > util.recursionLimit)
+            throw Error("max depth exceeded");
 
         /* istanbul ignore if */
         if (!nameRe.test(token = next()))
@@ -140954,7 +143016,7 @@ function parse(source, root, options) {
 
         var service = new Service(token);
         ifBlock(service, function parseService_block(token) {
-            if (parseCommon(service, token)) {
+            if (parseCommon(service, token, depth)) {
                 return;
             }
 
@@ -141020,7 +143082,7 @@ function parse(source, root, options) {
         parent.add(method);
     }
 
-    function parseExtension(parent, token) {
+    function parseExtension(parent, token, depth) {
 
         /* istanbul ignore if */
         if (!typeRefRe.test(token = next()))
@@ -141032,15 +143094,15 @@ function parse(source, root, options) {
 
                 case "required":
                 case "repeated":
-                    parseField(parent, token, reference);
+                    parseField(parent, token, reference, depth + 1);
                     break;
 
                 case "optional":
                     /* istanbul ignore if */
                     if (edition === "proto3") {
-                        parseField(parent, "proto3_optional", reference);
+                        parseField(parent, "proto3_optional", reference, depth + 1);
                     } else {
-                        parseField(parent, "optional", reference);
+                        parseField(parent, "optional", reference, depth + 1);
                     }
                     break;
 
@@ -141049,7 +143111,7 @@ function parse(source, root, options) {
                     if (edition === "proto2" || !typeRefRe.test(token))
                         throw illegal(token);
                     push(token);
-                    parseField(parent, "optional", reference);
+                    parseField(parent, "optional", reference, depth + 1);
                     break;
             }
         });
@@ -141101,7 +143163,7 @@ function parse(source, root, options) {
             default:
 
                 /* istanbul ignore else */
-                if (parseCommon(ptr, token)) {
+                if (parseCommon(ptr, token, 0)) {
                     head = false;
                     continue;
                 }
@@ -141496,11 +143558,21 @@ Reader.prototype.skip = function skip(length) {
 };
 
 /**
+ * Recursion limit.
+ * @type {number}
+ */
+Reader.recursionLimit = util.recursionLimit;
+
+/**
  * Skips the next element of the specified wire type.
  * @param {number} wireType Wire type received
+ * @param {number} [depth] Depth of recursion to control nested calls; 0 if omitted
  * @returns {Reader} `this`
  */
-Reader.prototype.skipType = function(wireType) {
+Reader.prototype.skipType = function(wireType, depth) {
+    if (depth === undefined) depth = 0;
+    if (depth > Reader.recursionLimit)
+        throw Error("maximum nesting depth exceeded");
     switch (wireType) {
         case 0:
             this.skip();
@@ -141513,7 +143585,7 @@ Reader.prototype.skipType = function(wireType) {
             break;
         case 3:
             while ((wireType = this.uint32() & 7) !== 4) {
-                this.skipType(wireType);
+                this.skipType(wireType, depth + 1);
             }
             break;
         case 5:
@@ -141681,14 +143753,16 @@ function Root(options) {
  * Loads a namespace descriptor into a root namespace.
  * @param {INamespace} json Namespace descriptor
  * @param {Root} [root] Root namespace, defaults to create a new one if omitted
+ * @param {number} [depth] Current nesting depth, defaults to `0`
  * @returns {Root} Root namespace
  */
-Root.fromJSON = function fromJSON(json, root) {
+Root.fromJSON = function fromJSON(json, root, depth) {
+    depth = util.checkDepth(depth);
     if (!root)
         root = new Root();
     if (json.options)
         root.setOptions(json.options);
-    return root.addJSON(json.nested).resolveAll();
+    return root.addJSON(json.nested, depth).resolveAll();
 };
 
 /**
@@ -141762,8 +143836,12 @@ Root.prototype.load = function load(filename, options, callback) {
     }
 
     // Processes a single file
-    function process(filename, source) {
+    function process(filename, source, depth) {
+        if (depth === undefined)
+            depth = 0;
         try {
+            if (depth > util.recursionLimit)
+                throw Error("max depth exceeded");
             if (util.isString(source) && source.charAt(0) === "{")
                 source = JSON.parse(source);
             if (!util.isString(source))
@@ -141776,11 +143854,11 @@ Root.prototype.load = function load(filename, options, callback) {
                 if (parsed.imports)
                     for (; i < parsed.imports.length; ++i)
                         if (resolved = getBundledFileName(parsed.imports[i]) || self.resolvePath(filename, parsed.imports[i]))
-                            fetch(resolved);
+                            fetch(resolved, false, depth + 1);
                 if (parsed.weakImports)
                     for (i = 0; i < parsed.weakImports.length; ++i)
                         if (resolved = getBundledFileName(parsed.weakImports[i]) || self.resolvePath(filename, parsed.weakImports[i]))
-                            fetch(resolved, true);
+                            fetch(resolved, true, depth + 1);
             }
         } catch (err) {
             finish(err);
@@ -141791,7 +143869,9 @@ Root.prototype.load = function load(filename, options, callback) {
     }
 
     // Fetches a single file
-    function fetch(filename, weak) {
+    function fetch(filename, weak, depth) {
+        if (depth === undefined)
+            depth = 0;
         filename = getBundledFileName(filename) || filename;
 
         // Skip if already loaded / attempted
@@ -141803,12 +143883,12 @@ Root.prototype.load = function load(filename, options, callback) {
         // Shortcut bundled definitions
         if (filename in common) {
             if (sync) {
-                process(filename, common[filename]);
+                process(filename, common[filename], depth);
             } else {
                 ++queued;
                 setTimeout(function() {
                     --queued;
-                    process(filename, common[filename]);
+                    process(filename, common[filename], depth);
                 });
             }
             return;
@@ -141824,7 +143904,7 @@ Root.prototype.load = function load(filename, options, callback) {
                     finish(err);
                 return;
             }
-            process(filename, source);
+            process(filename, source, depth);
         } else {
             ++queued;
             self.fetch(filename, function(err, source) {
@@ -141841,7 +143921,7 @@ Root.prototype.load = function load(filename, options, callback) {
                         finish(null, self);
                     return;
                 }
-                process(filename, source);
+                process(filename, source, depth);
             });
         }
     }
@@ -142037,7 +144117,7 @@ Root._configure = function(Type_, parse_, common_) {
 
 "use strict";
 
-module.exports = {};
+module.exports = Object.create(null);
 
 /**
  * Named roots.
@@ -142304,17 +144384,19 @@ function Service(name, options) {
  * Constructs a service from a service descriptor.
  * @param {string} name Service name
  * @param {IService} json Service descriptor
+ * @param {number} [depth] Current nesting depth, defaults to `0`
  * @returns {Service} Created service
  * @throws {TypeError} If arguments are invalid
  */
-Service.fromJSON = function fromJSON(name, json) {
+Service.fromJSON = function fromJSON(name, json, depth) {
+    depth = util.checkDepth(depth);
     var service = new Service(name, json.options);
     /* istanbul ignore else */
     if (json.methods)
         for (var names = Object.keys(json.methods), i = 0; i < names.length; ++i)
             service.add(Method.fromJSON(names[i], json.methods[names[i]]));
     if (json.nested)
-        service.addJSON(json.nested);
+        service.addJSON(json.nested, depth);
     if (json.edition)
         service._edition = json.edition;
     service.comment = json.comment;
@@ -142360,8 +144442,9 @@ function clearCache(service) {
  * @override
  */
 Service.prototype.get = function get(name) {
-    return this.methods[name]
-        || Namespace.prototype.get.call(this, name);
+    return Object.prototype.hasOwnProperty.call(this.methods, name)
+        ? this.methods[name]
+        : Namespace.prototype.get.call(this, name);
 };
 
 /**
@@ -142396,12 +144479,13 @@ Service.prototype._resolveFeaturesRecursive = function _resolveFeaturesRecursive
  * @override
  */
 Service.prototype.add = function add(object) {
-
     /* istanbul ignore if */
     if (this.get(object.name))
         throw Error("duplicate name '" + object.name + "' in " + this);
 
     if (object instanceof Method) {
+        if (object.name === "__proto__")
+            return this;
         this.methods[object.name] = object;
         object.parent = this;
         return clearCache(this);
@@ -142437,11 +144521,11 @@ Service.prototype.create = function create(rpcImpl, requestDelimited, responseDe
     var rpcService = new rpc.Service(rpcImpl, requestDelimited, responseDelimited);
     for (var i = 0, method; i < /* initializes */ this.methodsArray.length; ++i) {
         var methodName = util.lcFirst((method = this._methodsArray[i]).resolve().name).replace(/[^$\w_]/g, "");
-        rpcService[methodName] = util.codegen(["r","c"], util.isReserved(methodName) ? methodName + "_" : methodName)("return this.rpcCall(m,q,s,r,c)")({
-            m: method,
-            q: method.resolvedRequestType.ctor,
-            s: method.resolvedResponseType.ctor
-        });
+        rpcService[methodName] = (function(method, requestType, responseType) {
+            return function rpcMethod(request, callback) {
+                return rpc.Service.prototype.rpcCall.call(this, method, requestType, responseType, request, callback);
+            };
+        })(method, method.resolvedRequestType.ctor, method.resolvedResponseType.ctor);
     }
     return rpcService;
 };
@@ -143084,7 +145168,7 @@ Type.generateConstructor = function generateConstructor(mtype) {
         else if (field.repeated) gen
             ("this%s=[]", util.safeProp(field.name));
     return gen
-    ("if(p)for(var ks=Object.keys(p),i=0;i<ks.length;++i)if(p[ks[i]]!=null)") // omit undefined or null
+    ("if(p)for(var ks=Object.keys(p),i=0;i<ks.length;++i)if(p[ks[i]]!=null&&ks[i]!==\"__proto__\")") // omit undefined or null
         ("this[ks[i]]=p[ks[i]]");
     /* eslint-enable no-unexpected-multiline */
 };
@@ -143112,9 +145196,14 @@ function clearCache(type) {
  * Creates a message type from a message type descriptor.
  * @param {string} name Message name
  * @param {IType} json Message type descriptor
+ * @param {number} [depth] Current nesting depth, defaults to `0`
  * @returns {Type} Created message type
  */
-Type.fromJSON = function fromJSON(name, json) {
+Type.fromJSON = function fromJSON(name, json, depth) {
+    if (depth === undefined)
+        depth = 0;
+    if (depth > util.nestingLimit)
+        throw Error("max depth exceeded");
     var type = new Type(name, json.options);
     type.extensions = json.extensions;
     type.reserved = json.reserved;
@@ -143141,7 +145230,7 @@ Type.fromJSON = function fromJSON(name, json) {
                 ? Enum.fromJSON
                 : nested.methods !== undefined
                 ? Service.fromJSON
-                : Namespace.fromJSON )(names[i], nested)
+                : Namespace.fromJSON )(names[i], nested, depth + 1)
             );
         }
     if (json.extensions && json.extensions.length)
@@ -143217,10 +145306,13 @@ Type.prototype._resolveFeaturesRecursive = function _resolveFeaturesRecursive(ed
  * @override
  */
 Type.prototype.get = function get(name) {
-    return this.fields[name]
-        || this.oneofs && this.oneofs[name]
-        || this.nested && this.nested[name]
-        || null;
+    if (Object.prototype.hasOwnProperty.call(this.fields, name))
+        return this.fields[name];
+    if (this.oneofs && Object.prototype.hasOwnProperty.call(this.oneofs, name))
+        return this.oneofs[name];
+    if (this.nested && Object.prototype.hasOwnProperty.call(this.nested, name))
+        return this.nested[name];
+    return null;
 };
 
 /**
@@ -143231,7 +145323,6 @@ Type.prototype.get = function get(name) {
  * @throws {Error} If there is already a nested object with this name or, if a field, when there is already a field with this id
  */
 Type.prototype.add = function add(object) {
-
     if (this.get(object.name))
         throw Error("duplicate name '" + object.name + "' in " + this);
 
@@ -143245,8 +145336,10 @@ Type.prototype.add = function add(object) {
             throw Error("duplicate id " + object.id + " in " + this);
         if (this.isReservedId(object.id))
             throw Error("id " + object.id + " is reserved in " + this);
-        if (this.isReservedName(object.name))
+        if (this.isReservedName(object.name) || object.name.charAt(0) === "$")
             throw Error("name '" + object.name + "' is reserved in " + this);
+        if (object.name === "__proto__")
+            return this;
 
         if (object.parent)
             object.parent.remove(object);
@@ -143256,6 +145349,10 @@ Type.prototype.add = function add(object) {
         return clearCache(this);
     }
     if (object instanceof OneOf) {
+        if (object.name.charAt(0) === "$")
+            throw Error("name '" + object.name + "' is reserved in " + this);
+        if (object.name === "__proto__")
+            return this;
         if (!this.oneofs)
             this.oneofs = {};
         this.oneofs[object.name] = object;
@@ -143386,8 +145483,8 @@ Type.prototype.setup = function setup() {
  * @param {Writer} [writer] Writer to encode to
  * @returns {Writer} writer
  */
-Type.prototype.encode = function encode_setup(message, writer) {
-    return this.setup().encode(message, writer); // overrides this method
+Type.prototype.encode = function encode_setup(message, writer) { // eslint-disable-line no-unused-vars
+    return this.setup().encode.apply(this, arguments); // overrides this method
 };
 
 /**
@@ -143404,12 +145501,14 @@ Type.prototype.encodeDelimited = function encodeDelimited(message, writer) {
  * Decodes a message of this type.
  * @param {Reader|Uint8Array} reader Reader or buffer to decode from
  * @param {number} [length] Length of the message, if known beforehand
+ * @param {number} [end] Expected group end tag, if decoding a group
+ * @param {number} [depth] Current nesting depth
  * @returns {Message<{}>} Decoded message
  * @throws {Error} If the payload is not a reader or valid buffer
  * @throws {util.ProtocolError<{}>} If required fields are missing
  */
-Type.prototype.decode = function decode_setup(reader, length) {
-    return this.setup().decode(reader, length); // overrides this method
+Type.prototype.decode = function decode_setup(reader, length, end, depth) {
+    return this.setup().decode(reader, length, end, depth); // overrides this method
 };
 
 /**
@@ -143428,26 +145527,28 @@ Type.prototype.decodeDelimited = function decodeDelimited(reader) {
 /**
  * Verifies that field values are valid and that required fields are present.
  * @param {Object.<string,*>} message Plain object to verify
+ * @param {number} [depth] Current nesting depth
  * @returns {null|string} `null` if valid, otherwise the reason why it is not
  */
-Type.prototype.verify = function verify_setup(message) {
-    return this.setup().verify(message); // overrides this method
+Type.prototype.verify = function verify_setup(message, depth) {
+    return this.setup().verify(message, depth); // overrides this method
 };
 
 /**
  * Creates a new message of this type from a plain object. Also converts values to their respective internal types.
  * @param {Object.<string,*>} object Plain object to convert
+ * @param {number} [depth] Current nesting depth
  * @returns {Message<{}>} Message instance
  */
-Type.prototype.fromObject = function fromObject(object) {
-    return this.setup().fromObject(object);
+Type.prototype.fromObject = function fromObject(object, depth) {
+    return this.setup().fromObject(object, depth);
 };
 
 /**
  * Conversion options as used by {@link Type#toObject} and {@link Message.toObject}.
  * @interface IConversionOptions
  * @property {Function} [longs] Long conversion type.
- * Valid values are `String` and `Number` (the global types).
+ * Valid values are `BigInt`, `String` and `Number` (the global types).
  * Defaults to copy the present value, which is a possibly unsafe number without and a {@link Long} with a long library.
  * @property {Function} [enums] Enum value conversion type.
  * Only valid value is `String` (the global type).
@@ -143468,8 +145569,8 @@ Type.prototype.fromObject = function fromObject(object) {
  * @param {IConversionOptions} [options] Conversion options
  * @returns {Object.<string,*>} Plain object
  */
-Type.prototype.toObject = function toObject(message, options) {
-    return this.setup().toObject(message, options);
+Type.prototype.toObject = function toObject(message, options) { // eslint-disable-line no-unused-vars
+    return this.setup().toObject.apply(this, arguments);
 };
 
 /**
@@ -143529,7 +145630,7 @@ var s = [
 ];
 
 function bake(values, offset) {
-    var i = 0, o = {};
+    var i = 0, o = Object.create(null);
     offset |= 0;
     while (i < values.length) o[s[i + offset]] = values[i++];
     return o;
@@ -143720,12 +145821,29 @@ var Type, // cyclic
 util.codegen = __nccwpck_require__(25346);
 util.fetch   = __nccwpck_require__(44279);
 util.path    = __nccwpck_require__(66090);
+util.patterns = __nccwpck_require__(91991);
+
+var reservedRe = util.patterns.reservedRe;
 
 /**
  * Node's fs module if available.
  * @type {Object.<string,*>}
  */
-util.fs = util.inquire("fs");
+util.fs = __nccwpck_require__(35763);
+
+/**
+ * Checks a recursion depth.
+ * @param {number|undefined} depth Depth of recursion
+ * @returns {number} Depth of recursion
+ * @throws {Error} If depth exceeds util.recursionLimit
+ */
+util.checkDepth = function checkDepth(depth) {
+    if (depth === undefined)
+        depth = 0;
+    if (depth > util.recursionLimit)
+        throw Error("max depth exceeded");
+    return depth;
+};
 
 /**
  * Converts an object's values to an array.
@@ -143761,16 +145879,13 @@ util.toObject = function toObject(array) {
     return object;
 };
 
-var safePropBackslashRe = /\\/g,
-    safePropQuoteRe     = /"/g;
-
 /**
  * Tests whether the specified name is a reserved word in JS.
  * @param {string} name Name to test
  * @returns {boolean} `true` if reserved, otherwise `false`
  */
 util.isReserved = function isReserved(name) {
-    return /^(?:do|if|in|for|let|new|try|var|case|else|enum|eval|false|null|this|true|void|with|break|catch|class|const|super|throw|while|yield|delete|export|import|public|return|static|switch|typeof|default|extends|finally|package|private|continue|debugger|function|arguments|interface|protected|implements|instanceof)$/.test(name);
+    return reservedRe.test(name);
 };
 
 /**
@@ -143779,8 +145894,8 @@ util.isReserved = function isReserved(name) {
  * @returns {string} Safe accessor
  */
 util.safeProp = function safeProp(prop) {
-    if (!/^[$\w_]+$/.test(prop) || util.isReserved(prop))
-        return "[\"" + prop.replace(safePropBackslashRe, "\\\\").replace(safePropQuoteRe, "\\\"") + "\"]";
+    if (!/^[$\w_]+$/.test(prop) || reservedRe.test(prop))
+        return "[" + JSON.stringify(prop) + "]";
     return "." + prop;
 };
 
@@ -143883,9 +145998,8 @@ util.decorateEnum = function decorateEnum(object) {
 util.setProperty = function setProperty(dst, path, value, ifNotSet) {
     function setProp(dst, path, value) {
         var part = path.shift();
-        if (part === "__proto__" || part === "prototype") {
-          return dst;
-        }
+        if (util.isUnsafeProperty(part))
+            return dst;
         if (path.length > 0) {
             dst[part] = setProp(dst[part] || {}, path, value);
         } else {
@@ -143905,6 +146019,8 @@ util.setProperty = function setProperty(dst, path, value, ifNotSet) {
         throw TypeError("path must be specified");
 
     path = path.split(".");
+    if (path.length > util.recursionLimit)
+        throw Error("max depth exceeded");
     return setProp(dst, path, value);
 };
 
@@ -143919,6 +146035,25 @@ Object.defineProperty(util, "decorateRoot", {
         return roots["decorated"] || (roots["decorated"] = new (__nccwpck_require__(8185))());
     }
 });
+
+
+/***/ }),
+
+/***/ 35763:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+"use strict";
+
+
+var fs = null;
+try {
+    fs = __nccwpck_require__(/* webpackIgnore: true */ 79896);
+    if (!fs || !fs.readFile || !fs.readFileSync)
+        fs = null;
+} catch (e) {
+    // `fs` is unavailable in browsers and browser-like bundles.
+}
+module.exports = fs;
 
 
 /***/ }),
@@ -144150,9 +146285,6 @@ util.EventEmitter = __nccwpck_require__(32491);
 // float handling accross browsers
 util.float = __nccwpck_require__(8597);
 
-// requires modules optionally and hides the call from bundlers
-util.inquire = __nccwpck_require__(77206);
-
 // converts to / from utf8 encoded strings
 util.utf8 = __nccwpck_require__(70958);
 
@@ -144161,6 +146293,18 @@ util.pool = __nccwpck_require__(56239);
 
 // utility to work with the low and high bits of a 64 bit value
 util.LongBits = __nccwpck_require__(70994);
+
+/**
+ * Tests if the specified key can affect object prototypes.
+ * @memberof util
+ * @param {string} key Key to test
+ * @returns {boolean} `true` if the key is unsafe
+ */
+function isUnsafeProperty(key) {
+    return key === "__proto__" || key === "prototype" || key === "constructor";
+}
+
+util.isUnsafeProperty = isUnsafeProperty;
 
 /**
  * Whether running within node or not.
@@ -144244,7 +146388,7 @@ util.isset =
  */
 util.isSet = function isSet(obj, prop) {
     var value = obj[prop];
-    if (value != null && obj.hasOwnProperty(prop)) // eslint-disable-line eqeqeq, no-prototype-builtins
+    if (value != null && Object.hasOwnProperty.call(obj, prop)) // eslint-disable-line eqeqeq
         return typeof value !== "object" || (Array.isArray(value) ? value.length : Object.keys(value).length) > 0;
     return false;
 };
@@ -144262,7 +146406,7 @@ util.isSet = function isSet(obj, prop) {
  */
 util.Buffer = (function() {
     try {
-        var Buffer = util.inquire("buffer").Buffer;
+        var Buffer = util.global.Buffer;
         // refuse to use non-node buffers if not explicitly assigned (perf reasons):
         return Buffer.prototype.utf8Write ? Buffer : /* istanbul ignore next */ null;
     } catch (e) {
@@ -144316,7 +146460,15 @@ util.Array = typeof Uint8Array !== "undefined" ? Uint8Array /* istanbul ignore n
  */
 util.Long = /* istanbul ignore next */ util.global.dcodeIO && /* istanbul ignore next */ util.global.dcodeIO.Long
          || /* istanbul ignore next */ util.global.Long
-         || util.inquire("long");
+         || (function() {
+                try {
+                    var Long = __nccwpck_require__(66390);
+                    return Long && Long.isLong ? Long : null;
+                } catch (e) {
+                    /* istanbul ignore next */
+                    return null;
+                }
+            })();
 
 /**
  * Regular expression used to verify 2 bit (`bool`) map keys.
@@ -144367,18 +146519,54 @@ util.longFromHash = function longFromHash(hash, unsigned) {
  * Merges the properties of the source object into the destination object.
  * @memberof util
  * @param {Object.<string,*>} dst Destination object
- * @param {Object.<string,*>} src Source object
- * @param {boolean} [ifNotSet=false] Merges only if the key is not already set
+ * @param {...(Object.<string,*>|boolean)} src Source objects, optionally followed by an `ifNotSet` flag
  * @returns {Object.<string,*>} Destination object
  */
-function merge(dst, src, ifNotSet) { // used by converters
-    for (var keys = Object.keys(src), i = 0; i < keys.length; ++i)
-        if (dst[keys[i]] === undefined || !ifNotSet)
-            dst[keys[i]] = src[keys[i]];
+function merge(dst) { // used by converters
+    var ifNotSet = typeof arguments[arguments.length - 1] === "boolean",
+        limit = ifNotSet ? arguments.length - 1 : arguments.length;
+    ifNotSet = ifNotSet && arguments[arguments.length - 1];
+    for (var a = 1; a < limit; ++a) {
+        var src = arguments[a];
+        if (!src)
+            continue;
+        for (var keys = Object.keys(src), i = 0; i < keys.length; ++i)
+            if (!isUnsafeProperty(keys[i]) && (dst[keys[i]] === undefined || !ifNotSet))
+                dst[keys[i]] = src[keys[i]];
+    }
     return dst;
 }
 
 util.merge = merge;
+
+/**
+ * Schema declaration nesting limit.
+ * @memberof util
+ * @type {number}
+ */
+util.nestingLimit = 32; // protoc: MaxMessageDeclarationNestingDepth
+
+/**
+ * Recursion limit.
+ * @memberof util
+ * @type {number}
+ */
+util.recursionLimit = 100; // protoc: CodedInputStream::default_recursion_limit_
+
+/**
+ * Makes a property safe for assignment as an own property.
+ * @memberof util
+ * @param {Object.<string,*>} obj Object
+ * @param {string} key Property key
+ * @returns {undefined}
+ */
+util.makeProp = function makeProp(obj, key) {
+    Object.defineProperty(obj, key, {
+        enumerable: true,
+        configurable: true,
+        writable: true
+    });
+};
 
 /**
  * Converts the first character of a string to lower case.
@@ -144577,6 +146765,21 @@ util._configure = function() {
 
 /***/ }),
 
+/***/ 91991:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+
+var patterns = exports;
+
+patterns.numberRe    = /^(?![eE])[0-9]*(?:\.[0-9]*)?(?:[eE][+-]?[0-9]+)?$/;
+patterns.typeRefRe   = /^(?:\.?[a-zA-Z_][a-zA-Z_0-9]*)(?:\.[a-zA-Z_][a-zA-Z_0-9]*)*$/;
+patterns.reservedRe  = /^(?:do|if|in|for|let|new|try|var|case|else|enum|eval|false|null|this|true|void|with|break|catch|class|const|super|throw|while|yield|delete|export|import|public|return|static|switch|typeof|default|extends|finally|package|private|continue|debugger|function|arguments|interface|protected|implements|instanceof)$/;
+
+
+/***/ }),
+
 /***/ 7639:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
@@ -144615,7 +146818,7 @@ function genVerifyValue(gen, field, fieldIndex, ref) {
         } else {
             gen
             ("{")
-                ("var e=types[%i].verify(%s);", fieldIndex, ref)
+                ("var e=types[%i].verify(%s,n+1);", fieldIndex, ref)
                 ("if(e)")
                     ("return%j+e", field.name + ".")
             ("}");
@@ -144705,9 +146908,12 @@ function genVerifyKey(gen, field, ref) {
 function verifier(mtype) {
     /* eslint-disable no-unexpected-multiline */
 
-    var gen = util.codegen(["m"], mtype.name + "$verify")
+    var gen = util.codegen(["m", "n"], mtype.name + "$verify")
     ("if(typeof m!==\"object\"||m===null)")
-        ("return%j", "object expected");
+        ("return%j", "object expected")
+    ("if(n===undefined)n=0")
+    ("if(n>util.recursionLimit)")
+        ("return%j", "maximum nesting depth exceeded");
     var oneofs = mtype.oneofsArray,
         seenFirstField = {};
     if (oneofs.length) gen
@@ -144718,7 +146924,7 @@ function verifier(mtype) {
             ref   = "m" + util.safeProp(field.name);
 
         if (field.optional) gen
-        ("if(%s!=null&&m.hasOwnProperty(%j)){", ref, field.name); // !== undefined && !== null
+        ("if(%s!=null&&Object.hasOwnProperty.call(m,%j)){", ref, field.name); // !== undefined && !== null
 
         // map fields
         if (field.map) { gen
@@ -144759,6 +146965,7 @@ function verifier(mtype) {
     /* eslint-enable no-unexpected-multiline */
 }
 
+
 /***/ }),
 
 /***/ 59781:
@@ -144774,7 +146981,8 @@ function verifier(mtype) {
  */
 var wrappers = exports;
 
-var Message = __nccwpck_require__(69450);
+var Message = __nccwpck_require__(69450),
+    util    = __nccwpck_require__(22857);
 
 /**
  * From object converter part of an {@link IWrapper}.
@@ -144805,7 +147013,7 @@ var Message = __nccwpck_require__(69450);
 // Custom wrapper for Any
 wrappers[".google.protobuf.Any"] = {
 
-    fromObject: function(object) {
+    fromObject: function(object, depth) {
 
         // unwrap value type if mapped
         if (object && object["@type"]) {
@@ -144823,15 +147031,19 @@ wrappers[".google.protobuf.Any"] = {
                 }
                 return this.create({
                     type_url: type_url,
-                    value: type.encode(type.fromObject(object)).finish()
+                    value: type.encode(type.fromObject(object, depth === undefined ? 1 : depth + 1)).finish()
                 });
             }
         }
 
-        return this.fromObject(object);
+        return this.fromObject(object, depth);
     },
 
-    toObject: function(message, options) {
+    toObject: function(message, options, depth) {
+        if (depth === undefined)
+            depth = 0;
+        if (depth > util.recursionLimit)
+            throw Error("max depth exceeded");
 
         // Default prefix
         var googleApi = "type.googleapis.com/";
@@ -144847,12 +147059,12 @@ wrappers[".google.protobuf.Any"] = {
             var type = this.lookup(name);
             /* istanbul ignore else */
             if (type)
-                message = type.decode(message.value);
+                message = type.decode(message.value, undefined, undefined, depth + 1);
         }
 
         // wrap value if unmapped
         if (!(message instanceof this.ctor) && message instanceof Message) {
-            var object = message.$type.toObject(message, options);
+            var object = message.$type.toObject(message, options, depth + 1);
             var messageName = message.$type.fullName[0] === "." ?
                 message.$type.fullName.slice(1) : message.$type.fullName;
             // Default to type.googleapis.com prefix if no prefix is used
@@ -144864,7 +147076,7 @@ wrappers[".google.protobuf.Any"] = {
             return object;
         }
 
-        return this.toObject(message, options);
+        return this.toObject(message, options, depth);
     }
 };
 
@@ -145102,7 +147314,7 @@ Writer.prototype.uint32 = function write_uint32(value) {
  * @returns {Writer} `this`
  */
 Writer.prototype.int32 = function write_int32(value) {
-    return value < 0
+    return (value |= 0) < 0
         ? this._push(writeVarint64, 10, LongBits.fromNumber(value)) // 10 bytes per spec
         : this.uint32(value);
 };
@@ -145117,16 +147329,18 @@ Writer.prototype.sint32 = function write_sint32(value) {
 };
 
 function writeVarint64(val, buf, pos) {
-    while (val.hi) {
-        buf[pos++] = val.lo & 127 | 128;
-        val.lo = (val.lo >>> 7 | val.hi << 25) >>> 0;
-        val.hi >>>= 7;
+    var lo = val.lo,
+        hi = val.hi;
+    while (hi) {
+        buf[pos++] = lo & 127 | 128;
+        lo = (lo >>> 7 | hi << 25) >>> 0;
+        hi >>>= 7;
     }
-    while (val.lo > 127) {
-        buf[pos++] = val.lo & 127 | 128;
-        val.lo = val.lo >>> 7;
+    while (lo > 127) {
+        buf[pos++] = lo & 127 | 128;
+        lo = lo >>> 7;
     }
-    buf[pos++] = val.lo;
+    buf[pos++] = lo;
 }
 
 /**
@@ -181105,7 +183319,7 @@ module.exports = axios;
 /***/ ((module) => {
 
 "use strict";
-module.exports = {"rE":"1.13.4"};
+module.exports = {"rE":"1.14.4"};
 
 /***/ }),
 
