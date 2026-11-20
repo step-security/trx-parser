@@ -178,7 +178,7 @@ function getTestResultsMarkup(testData: TrxDataWrapper): string {
       .join('')
       .trim()
   } else {
-    return getSingleTestMarkup(unittests as UnitTest, testData)
+    return getSingleTestMarkup(unittests, testData)
   }
 }
 

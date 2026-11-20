@@ -6583,11 +6583,77 @@ class Request {
     }
   }
 
-  onUpgrade (statusCode, headers, socket) {
+  /**
+   * @param {number|null} statusCode
+   * @param {Buffer[]|null} headers
+   * @param {import('node:stream').Duplex} socket
+   * @param {string} [statusText]
+   */
+  onUpgrade (statusCode, headers, socket, statusText = '') {
+    this.onFinally()
+
     assert(!this.aborted)
     assert(!this.completed)
 
-    return this[kHandler].onUpgrade(statusCode, headers, socket)
+    if (statusCode !== null) {
+      this.#publishUpgradeHeaders(statusCode, headers, statusText)
+    }
+
+    const result = this[kHandler].onUpgrade(statusCode, headers, socket)
+
+    if (!this.aborted) {
+      this.completed = true
+      if (statusCode !== null) {
+        this.#publishUpgradeTrailers()
+      }
+    }
+
+    return result
+  }
+
+  /**
+   * @param {number} statusCode
+   * @param {import('node:http2').IncomingHttpHeaders} headers
+   * @param {(headers: import('node:http2').IncomingHttpHeaders) => Buffer[]} parseHeaders
+   * @param {string} [statusText]
+   */
+  onUpgradeResponse (statusCode, headers, parseHeaders, statusText = '') {
+    assert(!this.aborted)
+    assert(this.completed)
+
+    if (channels.headers.hasSubscribers) {
+      this.#publishUpgradeHeaders(statusCode, parseHeaders(headers), statusText)
+    }
+    this.#publishUpgradeTrailers()
+  }
+
+  /**
+   * @param {Error} error
+   */
+  onUpgradeError (error) {
+    assert(!this.aborted)
+    assert(this.completed)
+
+    if (channels.error.hasSubscribers) {
+      channels.error.publish({ request: this, error })
+    }
+  }
+
+  /**
+   * @param {number} statusCode
+   * @param {Buffer[]} headers
+   * @param {string} statusText
+   */
+  #publishUpgradeHeaders (statusCode, headers, statusText) {
+    if (channels.headers.hasSubscribers) {
+      channels.headers.publish({ request: this, response: { statusCode, headers, statusText } })
+    }
+  }
+
+  #publishUpgradeTrailers () {
+    if (channels.trailers.hasSubscribers) {
+      channels.trailers.publish({ request: this, trailers: [] })
+    }
   }
 
   onComplete (trailers) {
@@ -7728,7 +7794,7 @@ function defaultFactory (origin, opts) {
 }
 
 class Agent extends DispatcherBase {
-  constructor ({ factory = defaultFactory, maxRedirections = 0, connect, ...options } = {}) {
+  constructor ({ factory = defaultFactory, maxRedirections = 0, connect, tls, ...options } = {}) {
     if (typeof factory !== 'function') {
       throw new InvalidArgumentError('factory must be a function.')
     }
@@ -7747,11 +7813,15 @@ class Agent extends DispatcherBase {
       connect = { ...connect }
     }
 
+    if (tls && typeof tls !== 'function') {
+      tls = { ...tls }
+    }
+
     this[kInterceptors] = options.interceptors?.Agent && Array.isArray(options.interceptors.Agent)
       ? options.interceptors.Agent
       : [createRedirectInterceptor({ maxRedirections })]
 
-    this[kOptions] = { ...util.deepClone(options), connect }
+    this[kOptions] = { ...util.deepClone(options), connect, tls }
     this[kOptions].interceptors = options.interceptors
       ? { ...options.interceptors }
       : undefined
@@ -8491,7 +8561,7 @@ class Parser {
   }
 
   onUpgrade (head) {
-    const { upgrade, client, socket, headers, statusCode } = this
+    const { upgrade, client, socket, headers, statusCode, statusText } = this
 
     assert(upgrade)
     assert(client[kSocket] === socket)
@@ -8526,9 +8596,10 @@ class Parser {
     client.emit('disconnect', client[kUrl], [client], new InformationalError('upgrade'))
 
     try {
-      request.onUpgrade(statusCode, headers, socket)
-    } catch (err) {
-      util.destroy(socket, err)
+      request.onUpgrade(statusCode, headers, socket, statusText)
+    } catch (error) {
+      util.errorRequest(client, request, error)
+      util.destroy(socket, error)
     }
 
     client[kResume]()
@@ -8785,8 +8856,6 @@ async function connectH1 (client, socket) {
   socket[kParser] = new Parser(client, socket, llhttpInstance)
 
   addListener(socket, 'error', function (err) {
-    assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID')
-
     const parser = this[kParser]
 
     // On Mac OS, we get an ECONNRESET even if there is a full body to be forwarded
@@ -8935,7 +9004,7 @@ async function connectH1 (client, socket) {
 
 function clearIdleSocketValidation (socket) {
   if (socket[kIdleSocketValidationTimeout]) {
-    clearTimeout(socket[kIdleSocketValidationTimeout])
+    clearImmediate(socket[kIdleSocketValidationTimeout])
     socket[kIdleSocketValidationTimeout] = null
   }
 
@@ -8944,15 +9013,23 @@ function clearIdleSocketValidation (socket) {
 
 function scheduleIdleSocketValidation (client, socket) {
   socket[kIdleSocketValidation] = 1
-  socket[kIdleSocketValidationTimeout] = setTimeout(() => {
+  // Yield to the check phase (after poll) so unsolicited bytes / FIN / RST
+  // already pending on this idle keep-alive socket are processed before the
+  // next request is written (GHSA-35p6-xmwp-9g52).
+  //
+  // setTimeout(0) pays Node's ~1ms timer floor on every sequential reuse
+  // (#5493). setImmediate avoids that, but an *unref'd* Immediate lets poll
+  // block for ~500ms when the event loop is otherwise idle (#5600 / #5606).
+  // A ref'd Immediate both keeps the pending request alive and makes poll
+  // return immediately — the hybrid those issues asked for.
+  socket[kIdleSocketValidationTimeout] = setImmediate(() => {
     socket[kIdleSocketValidationTimeout] = null
     socket[kIdleSocketValidation] = 2
 
     if (client[kSocket] === socket && !socket.destroyed) {
       client[kResume]()
     }
-  }, 0)
-  socket[kIdleSocketValidationTimeout].unref?.()
+  })
 }
 
 /**
@@ -9101,12 +9178,22 @@ function writeH1 (client, request) {
   const socket = client[kSocket]
   clearIdleSocketValidation(socket)
 
-  const abort = (err) => {
-    if (request.aborted || request.completed) {
+  /**
+   * @param {Error} [error]
+   */
+  const abort = (error) => {
+    if (request.aborted) {
       return
     }
 
-    util.errorRequest(client, request, err || new RequestAbortedError())
+    if (request.completed) {
+      if (request.upgrade || request.method === 'CONNECT') {
+        util.destroy(socket, new InformationalError('aborted'))
+      }
+      return
+    }
+
+    util.errorRequest(client, request, error || new RequestAbortedError())
 
     util.destroy(body)
     util.destroy(socket, new InformationalError('aborted'))
@@ -9564,6 +9651,7 @@ module.exports = connectH1
 
 
 const assert = __nccwpck_require__(34589)
+const { errorMonitor } = __nccwpck_require__(78474)
 const { pipeline } = __nccwpck_require__(57075)
 const util = __nccwpck_require__(61671)
 const {
@@ -9640,6 +9728,15 @@ function parseH2Headers (headers) {
   return result
 }
 
+/**
+ * @param {import('node:http2').IncomingHttpHeaders} headers
+ * @returns {Buffer[]}
+ */
+function parseH2ResponseHeaders (headers) {
+  const { [HTTP2_HEADER_STATUS]: _statusCode, ...realHeaders } = headers
+  return parseH2Headers(realHeaders)
+}
+
 async function connectH2 (client, socket) {
   client[kSocket] = socket
 
@@ -9689,8 +9786,6 @@ async function connectH2 (client, socket) {
   socket[kHTTP2Session] = session
 
   util.addListener(socket, 'error', function (err) {
-    assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID')
-
     this[kError] = err
 
     this[kClient][kOnError](err)
@@ -9764,8 +9859,6 @@ function resumeH2 (client) {
 }
 
 function onHttp2SessionError (err) {
-  assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID')
-
   this[kSocket][kError] = err
   this[kClient][kOnError](err)
 }
@@ -9860,22 +9953,32 @@ function writeH2 (client, request) {
   headers[HTTP2_HEADER_AUTHORITY] = host || `${hostname}${port ? `:${port}` : ''}`
   headers[HTTP2_HEADER_METHOD] = method
 
-  const abort = (err) => {
-    if (request.aborted || request.completed) {
+  /**
+   * @param {Error} [error]
+   */
+  const abort = (error) => {
+    if (request.aborted) {
       return
     }
 
-    err = err || new RequestAbortedError()
+    if (request.completed) {
+      if (method === 'CONNECT' && stream != null) {
+        util.destroy(stream, error || new RequestAbortedError())
+      }
+      return
+    }
 
-    util.errorRequest(client, request, err)
+    error = error || new RequestAbortedError()
+
+    util.errorRequest(client, request, error)
 
     if (stream != null) {
-      util.destroy(stream, err)
+      util.destroy(stream, error)
     }
 
     // We do not destroy the socket as we can continue using the session
     // the stream get's destroyed and the session remains to create new streams
-    util.destroy(body, err)
+    util.destroy(body, error)
     client[kQueue][client[kRunningIdx]++] = null
     client[kResume]()
   }
@@ -9894,25 +9997,57 @@ function writeH2 (client, request) {
 
   if (method === 'CONNECT') {
     session.ref()
-    // We are already connected, streams are pending, first request
-    // will create a new stream. We trigger a request to create the stream and wait until
-    // `ready` event is triggered
     // We disabled endStream to allow the user to write to the stream
     stream = session.request(headers, { endStream: false, signal })
+    let upgradeResponseFinished = false
 
-    if (stream.id && !stream.pending) {
-      request.onUpgrade(null, null, stream)
-      ++session[kOpenStreams]
-      client[kQueue][client[kRunningIdx]++] = null
-    } else {
-      stream.once('ready', () => {
-        request.onUpgrade(null, null, stream)
-        ++session[kOpenStreams]
-        client[kQueue][client[kRunningIdx]++] = null
-      })
+    /**
+     * @param {import('node:http2').IncomingHttpHeaders} headers
+     */
+    const onResponse = (headers) => {
+      upgradeResponseFinished = true
+      stream.off(errorMonitor, onUpgradeError)
+      request.onUpgradeResponse(Number(headers[HTTP2_HEADER_STATUS]), headers, parseH2ResponseHeaders)
     }
 
+    /**
+     * @param {Error} error
+     */
+    const onUpgradeError = (error) => {
+      upgradeResponseFinished = true
+      stream.off('response', onResponse)
+      request.onUpgradeError(error)
+    }
+
+    const onReady = () => {
+      try {
+        request.onUpgrade(null, null, stream)
+      } catch (error) {
+        stream.off('response', onResponse)
+        abort(error)
+        return
+      }
+
+      if (request.aborted) {
+        return
+      }
+
+      stream.off('error', abort)
+      stream.once(errorMonitor, onUpgradeError)
+      client[kQueue][client[kRunningIdx]++] = null
+    }
+
+    stream.once('response', onResponse)
+    stream.once('error', abort)
+    ++session[kOpenStreams]
+    onReady()
+
     stream.once('close', () => {
+      if (!upgradeResponseFinished && request.completed) {
+        stream.off('response', onResponse)
+        stream.off(errorMonitor, onUpgradeError)
+        request.onUpgradeError(new InformationalError(`HTTP/2: "stream error" received - code ${stream.rstCode}`))
+      }
       session[kOpenStreams] -= 1
       if (session[kOpenStreams] === 0) session.unref()
     })
@@ -10422,9 +10557,10 @@ class Client extends DispatcherBase {
     // h2
     maxConcurrentStreams,
     allowH2,
-    webSocket
+    webSocket,
+    eventSource
   } = {}) {
-    super({ webSocket })
+    super({ webSocket, eventSource })
 
     if (keepAlive !== undefined) {
       throw new InvalidArgumentError('unsupported keepAlive, use pipelining=0 instead')
@@ -10946,6 +11082,7 @@ module.exports = Client
 "use strict";
 
 
+const buffer = __nccwpck_require__(4573)
 const Dispatcher = __nccwpck_require__(32640)
 const {
   ClientDestroyedError,
@@ -10958,6 +11095,7 @@ const kOnDestroyed = Symbol('onDestroyed')
 const kOnClosed = Symbol('onClosed')
 const kInterceptedDispatch = Symbol('Intercepted Dispatch')
 const kWebSocketOptions = Symbol('webSocketOptions')
+const kEventSourceOptions = Symbol('eventSourceOptions')
 
 class DispatcherBase extends Dispatcher {
   constructor (opts) {
@@ -10968,12 +11106,19 @@ class DispatcherBase extends Dispatcher {
     this[kClosed] = false
     this[kOnClosed] = []
     this[kWebSocketOptions] = opts?.webSocket ?? {}
+    this[kEventSourceOptions] = opts?.eventSource ?? {}
   }
 
   get webSocketOptions () {
     return {
       maxFragments: this[kWebSocketOptions].maxFragments ?? 131072,
       maxPayloadSize: this[kWebSocketOptions].maxPayloadSize ?? 128 * 1024 * 1024
+    }
+  }
+
+  get eventSourceOptions () {
+    return {
+      maxEventSize: this[kEventSourceOptions].maxEventSize ?? buffer.kStringMaxLength
     }
   }
 
@@ -12624,6 +12769,7 @@ class RetryHandler {
     this.end = null
     this.etag = null
     this.resume = null
+    this.headersSent = false
 
     // Handle possible onConnect duplication
     this.handler.onConnect(reason => {
@@ -12634,6 +12780,20 @@ class RetryHandler {
         this.reason = reason
       }
     })
+  }
+
+  checkpointResponseEnd (headers, resume) {
+    if (this.end == null && this.opts.method !== 'HEAD') {
+      const contentLength = headers['content-length']
+      this.end = contentLength != null ? Number(contentLength) - 1 : null
+
+      assert(
+        this.end == null || Number.isFinite(this.end),
+        'invalid content-length'
+      )
+    }
+
+    this.resume = this.end != null ? resume : null
   }
 
   onRequestSent () {
@@ -12724,7 +12884,12 @@ class RetryHandler {
     this.retryCount += 1
 
     if (statusCode >= 300) {
-      if (this.retryOpts.statusCodes.includes(statusCode) === false) {
+      // Only expose a response if no earlier attempt has reached the caller.
+      // Otherwise abort this attempt so the error settles the existing body
+      // instead of replacing it with a new response.
+      if (!this.headersSent && this.retryOpts.statusCodes.includes(statusCode) === false) {
+        this.headersSent = true
+        this.checkpointResponseEnd(headers, resume)
         return this.handler.onHeaders(
           statusCode,
           rawHeaders,
@@ -12793,8 +12958,15 @@ class RetryHandler {
 
       const { start, size, end = size - 1 } = contentRange
 
-      assert(this.start === start, 'content-range mismatch')
-      assert(this.end == null || this.end === end, 'content-range mismatch')
+      if (this.start !== start || (this.end != null && this.end !== end)) {
+        this.abort(
+          new RequestRetryError('Content-Range mismatch', statusCode, {
+            headers,
+            data: { count: this.retryCount }
+          })
+        )
+        return false
+      }
 
       this.resume = resume
       return true
@@ -12806,6 +12978,7 @@ class RetryHandler {
         const range = parseRangeHeader(headers['content-range'])
 
         if (range == null) {
+          this.headersSent = true
           return this.handler.onHeaders(
             statusCode,
             rawHeaders,
@@ -12844,6 +13017,7 @@ class RetryHandler {
       )
 
       this.resume = resume
+      this.headersSent = true
       this.etag = headers.etag != null ? headers.etag : null
 
       // Weak etags are not useful for comparison nor cache
@@ -12883,7 +13057,7 @@ class RetryHandler {
   }
 
   onError (err) {
-    if (this.aborted || isDisturbed(this.opts.body)) {
+    if (this.aborted || isDisturbed(this.opts.body) || (this.headersSent && this.resume == null)) {
       return this.handler.onError(err)
     }
 
@@ -17345,6 +17519,7 @@ module.exports = {
 
 "use strict";
 
+const buffer = __nccwpck_require__(4573)
 const { Transform } = __nccwpck_require__(57075)
 const { isASCIINumber, isValidLastEventId } = __nccwpck_require__(8114)
 
@@ -17368,6 +17543,63 @@ const COLON = 0x3A
  * @type {32} SPACE
  */
 const SPACE = 0x20
+
+const defaultMaxEventSize = buffer.kStringMaxLength
+
+const DATA = Buffer.from('data')
+const EVENT = Buffer.from('event')
+const ID = Buffer.from('id')
+const RETRY = Buffer.from('retry')
+
+// Each data field creates a string node, and each unconsumed input chunk keeps
+// a Buffer wrapper. The absolute ceiling protects the large default byte limit.
+const minParserItems = 1024
+const maxParserItems = 131072
+const bytesPerParserItem = 128
+
+function isASCIINumberBytes (buffer, start) {
+  if (start >= buffer.length) {
+    return false
+  }
+
+  for (let i = start; i < buffer.length; i++) {
+    if (buffer[i] < 0x30 || buffer[i] > 0x39) {
+      return false
+    }
+  }
+
+  return true
+}
+
+function isValidLastEventIdBytes (buffer, start) {
+  for (let i = start; i < buffer.length; i++) {
+    if (buffer[i] === 0x00) {
+      return false
+    }
+  }
+
+  return true
+}
+
+function isFieldName (line, length, field) {
+  if (length !== field.length) {
+    return false
+  }
+
+  for (let i = 0; i < length; i++) {
+    if (line[i] !== field[i]) {
+      return false
+    }
+  }
+
+  return true
+}
+
+function createMaxEventSizeExceededError () {
+  const error = new Error('EventSource message size exceeded')
+  error.aborted = false
+  return error
+}
 
 /**
  * @typedef {object} EventSourceStreamEvent
@@ -17409,11 +17641,21 @@ class EventSourceStream extends Transform {
   eventEndCheck = false
 
   /**
-   * @type {Buffer}
+   * @type {Buffer[]}
    */
-  buffer = null
+  chunks = []
 
+  chunkIndex = 0
   pos = 0
+  lineChunkIndex = 0
+  linePos = 0
+  lineLength = 0
+  eventSize = 0
+  eventFieldSizes = { data: 0, event: 0, id: 0, retry: 0 }
+  dataLineCount = 0
+  maxEventSize
+  maxDataLines
+  maxBufferedChunks
 
   event = {
     data: undefined,
@@ -17424,6 +17666,7 @@ class EventSourceStream extends Transform {
 
   /**
    * @param {object} options
+   * @param {number} [options.maxEventSize]
    * @param {eventSourceSettings} options.eventSourceSettings
    * @param {Function} [options.push]
    */
@@ -17435,6 +17678,12 @@ class EventSourceStream extends Transform {
     super(options)
 
     this.state = options.eventSourceSettings || {}
+    this.maxEventSize = options.maxEventSize ?? defaultMaxEventSize
+    const parserItemLimit = this.maxEventSize > 0
+      ? Math.min(maxParserItems, Math.max(minParserItems, Math.floor(this.maxEventSize / bytesPerParserItem)))
+      : 0
+    this.maxDataLines = parserItemLimit
+    this.maxBufferedChunks = parserItemLimit
     if (options.push) {
       this.push = options.push
     }
@@ -17452,92 +17701,28 @@ class EventSourceStream extends Transform {
       return
     }
 
-    // Cache the chunk in the buffer, as the data might not be complete while
-    // processing it
-    // TODO: Investigate if there is a more performant way to handle
-    // incoming chunks
-    // see: https://github.com/nodejs/undici/issues/2630
-    if (this.buffer) {
-      this.buffer = Buffer.concat([this.buffer, chunk])
-    } else {
-      this.buffer = chunk
+    // A leading line ending can immediately release the currently buffered
+    // line, even when it uses the final allowed chunk slot.
+    if (this.maxEventSize > 0 &&
+        this.chunks.length >= this.maxBufferedChunks &&
+        chunk[0] !== LF && chunk[0] !== CR) {
+      callback(createMaxEventSizeExceededError())
+      return
     }
+    this.chunks.push(chunk)
 
     // Strip leading byte-order-mark if we opened the stream and started
     // the processing of the incoming data
     if (this.checkBOM) {
-      switch (this.buffer.length) {
-        case 1:
-          // Check if the first byte is the same as the first byte of the BOM
-          if (this.buffer[0] === BOM[0]) {
-            // If it is, we need to wait for more data
-            callback()
-            return
-          }
-          // Set the checkBOM flag to false as we don't need to check for the
-          // BOM anymore
-          this.checkBOM = false
-
-          // The buffer only contains one byte so we need to wait for more data
-          callback()
-          return
-        case 2:
-          // Check if the first two bytes are the same as the first two bytes
-          // of the BOM
-          if (
-            this.buffer[0] === BOM[0] &&
-            this.buffer[1] === BOM[1]
-          ) {
-            // If it is, we need to wait for more data, because the third byte
-            // is needed to determine if it is the BOM or not
-            callback()
-            return
-          }
-
-          // Set the checkBOM flag to false as we don't need to check for the
-          // BOM anymore
-          this.checkBOM = false
-          break
-        case 3:
-          // Check if the first three bytes are the same as the first three
-          // bytes of the BOM
-          if (
-            this.buffer[0] === BOM[0] &&
-            this.buffer[1] === BOM[1] &&
-            this.buffer[2] === BOM[2]
-          ) {
-            // If it is, we can drop the buffered data, as it is only the BOM
-            this.buffer = Buffer.alloc(0)
-            // Set the checkBOM flag to false as we don't need to check for the
-            // BOM anymore
-            this.checkBOM = false
-
-            // Await more data
-            callback()
-            return
-          }
-          // If it is not the BOM, we can start processing the data
-          this.checkBOM = false
-          break
-        default:
-          // The buffer is longer than 3 bytes, so we can drop the BOM if it is
-          // present
-          if (
-            this.buffer[0] === BOM[0] &&
-            this.buffer[1] === BOM[1] &&
-            this.buffer[2] === BOM[2]
-          ) {
-            // Remove the BOM from the buffer
-            this.buffer = this.buffer.subarray(3)
-          }
-
-          // Set the checkBOM flag to false as we don't need to check for the
-          this.checkBOM = false
-          break
+      if (this.handleBOM()) {
+        callback()
+        return
       }
     }
 
-    while (this.pos < this.buffer.length) {
+    while (this.hasCurrentByte()) {
+      const byte = this.currentByte()
+
       // If the previous line ended with an end-of-line, we need to check
       // if the next character is also an end-of-line.
       if (this.eventEndCheck) {
@@ -17550,10 +17735,9 @@ class EventSourceStream extends Transform {
         if (this.crlfCheck) {
           // If the current character is a line feed, we can remove it
           // from the buffer and reset the crlfCheck flag
-          if (this.buffer[this.pos] === LF) {
-            this.buffer = this.buffer.subarray(this.pos + 1)
-            this.pos = 0
+          if (byte === LF) {
             this.crlfCheck = false
+            this.consumeCurrentByte()
 
             // It is possible that the line feed is not the end of the
             // event. We need to check if the next character is an
@@ -17569,19 +17753,17 @@ class EventSourceStream extends Transform {
           this.crlfCheck = false
         }
 
-        if (this.buffer[this.pos] === LF || this.buffer[this.pos] === CR) {
+        if (byte === LF || byte === CR) {
           // If the current character is a carriage return, we need to
           // set the crlfCheck flag to true, as we need to check if the
           // next character is a line feed so we can remove it from the
           // buffer
-          if (this.buffer[this.pos] === CR) {
+          if (byte === CR) {
             this.crlfCheck = true
           }
 
-          this.buffer = this.buffer.subarray(this.pos + 1)
-          this.pos = 0
-          if (
-            this.event.data !== undefined || this.event.event || this.event.id || this.event.retry) {
+          this.consumeCurrentByte()
+          if (this.hasPendingEvent()) {
             this.processEvent(this.event)
           }
           this.clearEvent()
@@ -17595,22 +17777,23 @@ class EventSourceStream extends Transform {
 
       // If the current character is an end-of-line, we can process the
       // line
-      if (this.buffer[this.pos] === LF || this.buffer[this.pos] === CR) {
+      if (byte === LF || byte === CR) {
         // If the current character is a carriage return, we need to
         // set the crlfCheck flag to true, as we need to check if the
         // next character is a line feed
-        if (this.buffer[this.pos] === CR) {
+        if (byte === CR) {
           this.crlfCheck = true
         }
 
         // In any case, we can process the line as we reached an
         // end-of-line character
-        this.parseLine(this.buffer.subarray(0, this.pos), this.event)
-
-        // Remove the processed line from the buffer
-        this.buffer = this.buffer.subarray(this.pos + 1)
-        // Reset the position as we removed the processed line from the buffer
-        this.pos = 0
+        try {
+          this.parseLine(this.readLine(), this.event)
+        } catch (error) {
+          callback(error)
+          return
+        }
+        this.consumeCurrentByte()
         // A line was processed and this could be the end of the event. We need
         // to check if the next line is empty to determine if the event is
         // finished.
@@ -17618,15 +17801,28 @@ class EventSourceStream extends Transform {
         continue
       }
 
-      this.pos++
+      // readLine() is only called after CR or LF. Reject an unfinished line
+      // before it can retain an unbounded number of decoded chunks. The seven
+      // extra bytes allow the longest field prefix ("event: " or "retry: ").
+      if (this.maxEventSize > 0 && ++this.lineLength > this.maxEventSize + 7) {
+        callback(createMaxEventSizeExceededError())
+        return
+      }
+      this.advanceCursor()
     }
 
     callback()
   }
 
+  _destroy (error, callback) {
+    this.chunks.length = 0
+    this.clearEvent()
+    super._destroy(error, callback)
+  }
+
   /**
    * @param {Buffer} line
-   * @param {EventStreamEvent} event
+   * @param {EventSourceStreamEvent} event
    */
   parseLine (line, event) {
     // If the line is empty (a blank line)
@@ -17643,65 +17839,72 @@ class EventSourceStream extends Transform {
       return
     }
 
-    let field = ''
-    let value = ''
+    let fieldLength = line.length
+    let valueStart = line.length
 
     // If the line contains a U+003A COLON character (:)
     if (colonPosition !== -1) {
-      // Collect the characters on the line before the first U+003A COLON
-      // character (:), and let field be that string.
-      // TODO: Investigate if there is a more performant way to extract the
-      // field
-      // see: https://github.com/nodejs/undici/issues/2630
-      field = line.subarray(0, colonPosition).toString('utf8')
+      fieldLength = colonPosition
 
       // Collect the characters on the line after the first U+003A COLON
       // character (:), and let value be that string.
       // If value starts with a U+0020 SPACE character, remove it from value.
-      let valueStart = colonPosition + 1
+      valueStart = colonPosition + 1
       if (line[valueStart] === SPACE) {
         ++valueStart
       }
-      // TODO: Investigate if there is a more performant way to extract the
-      // value
-      // see: https://github.com/nodejs/undici/issues/2630
-      value = line.subarray(valueStart).toString('utf8')
-
-      // Otherwise, the string is not empty but does not contain a U+003A COLON
-      // character (:)
-    } else {
-      // Process the field using the steps described below, using the whole
-      // line as the field name, and the empty string as the field value.
-      field = line.toString('utf8')
-      value = ''
     }
 
-    // Modify the event with the field name and value. The value is also
-    // decoded as UTF-8
-    switch (field) {
-      case 'data':
-        if (event[field] === undefined) {
-          event[field] = value
-        } else {
-          event[field] += `\n${value}`
-        }
-        break
-      case 'retry':
-        if (isASCIINumber(value)) {
-          event[field] = value
-        }
-        break
-      case 'id':
-        if (isValidLastEventId(value)) {
-          event[field] = value
-        }
-        break
-      case 'event':
-        if (value.length > 0) {
-          event[field] = value
-        }
-        break
+    if (isFieldName(line, fieldLength, DATA)) {
+      if (this.maxEventSize > 0 && this.dataLineCount >= this.maxDataLines) {
+        throw createMaxEventSizeExceededError()
+      }
+      const valueBytes = line.length - valueStart
+      const dataSize = this.eventFieldSizes.data + (event.data === undefined ? 0 : 1) + valueBytes
+      this.setEventFieldSize('data', dataSize)
+
+      const value = line.toString('utf8', valueStart)
+
+      if (event.data === undefined) {
+        event.data = value
+      } else {
+        event.data += `\n${value}`
+      }
+      this.dataLineCount++
+      return
     }
+
+    if (isFieldName(line, fieldLength, RETRY)) {
+      if (isASCIINumberBytes(line, valueStart)) {
+        this.setEventFieldSize('retry', line.length - valueStart)
+        event.retry = line.toString('utf8', valueStart)
+      }
+      return
+    }
+
+    if (isFieldName(line, fieldLength, ID)) {
+      if (isValidLastEventIdBytes(line, valueStart)) {
+        this.setEventFieldSize('id', line.length - valueStart)
+        event.id = line.toString('utf8', valueStart)
+      }
+      return
+    }
+
+    if (isFieldName(line, fieldLength, EVENT)) {
+      if (valueStart < line.length) {
+        this.setEventFieldSize('event', line.length - valueStart)
+        event.event = line.toString('utf8', valueStart)
+      }
+    }
+  }
+
+  setEventFieldSize (field, size) {
+    const eventSize = this.eventSize - this.eventFieldSizes[field] + size
+    if (this.maxEventSize > 0 && eventSize > this.maxEventSize) {
+      throw createMaxEventSizeExceededError()
+    }
+    this.eventSize = eventSize
+    this.eventFieldSizes[field] = size
   }
 
   /**
@@ -17730,12 +17933,159 @@ class EventSourceStream extends Transform {
   }
 
   clearEvent () {
-    this.event = {
-      data: undefined,
-      event: undefined,
-      id: undefined,
-      retry: undefined
+    this.event.data = undefined
+    this.event.event = undefined
+    this.event.id = undefined
+    this.event.retry = undefined
+    this.eventSize = 0
+    this.dataLineCount = 0
+    this.eventFieldSizes.data = 0
+    this.eventFieldSizes.event = 0
+    this.eventFieldSizes.id = 0
+    this.eventFieldSizes.retry = 0
+  }
+
+  hasPendingEvent () {
+    return this.event.data !== undefined ||
+      this.event.event !== undefined ||
+      this.event.id !== undefined ||
+      this.event.retry !== undefined
+  }
+
+  hasCurrentByte () {
+    return this.chunkIndex < this.chunks.length &&
+      this.pos < this.chunks[this.chunkIndex].length
+  }
+
+  currentByte () {
+    return this.chunks[this.chunkIndex][this.pos]
+  }
+
+  consumeCurrentByte () {
+    this.advanceCursor()
+    this.syncLineStartToCursor()
+  }
+
+  advanceCursor () {
+    this.pos++
+
+    while (this.chunkIndex < this.chunks.length && this.pos >= this.chunks[this.chunkIndex].length) {
+      this.chunkIndex++
+      this.pos = 0
     }
+  }
+
+  syncLineStartToCursor () {
+    this.lineChunkIndex = this.chunkIndex
+    this.linePos = this.pos
+    this.lineLength = 0
+    this.dropConsumedChunks()
+  }
+
+  dropConsumedChunks () {
+    if (this.lineChunkIndex > 0) {
+      const consumed = this.lineChunkIndex
+      this.chunks.splice(0, consumed)
+      this.lineChunkIndex = 0
+      this.chunkIndex -= consumed
+    }
+
+    if (this.chunkIndex === this.chunks.length) {
+      this.chunks.length = 0
+      this.chunkIndex = 0
+      this.pos = 0
+      this.lineChunkIndex = 0
+      this.linePos = 0
+    }
+  }
+
+  readLine () {
+    if (this.lineChunkIndex === this.chunkIndex) {
+      return this.chunks[this.chunkIndex].subarray(this.linePos, this.pos)
+    }
+
+    const chunks = []
+    let length = 0
+
+    for (let i = this.lineChunkIndex; i <= this.chunkIndex; i++) {
+      const chunk = this.chunks[i]
+      const start = i === this.lineChunkIndex ? this.linePos : 0
+      const end = i === this.chunkIndex ? this.pos : chunk.length
+      const slice = chunk.subarray(start, end)
+      length += slice.length
+      chunks.push(slice)
+    }
+
+    return Buffer.concat(chunks, length)
+  }
+
+  peekBufferedByte (offset) {
+    let chunkIndex = this.lineChunkIndex
+    let pos = this.linePos
+
+    while (chunkIndex < this.chunks.length) {
+      const chunk = this.chunks[chunkIndex]
+      const remaining = chunk.length - pos
+
+      if (offset < remaining) {
+        return chunk[pos + offset]
+      }
+
+      offset -= remaining
+      chunkIndex++
+      pos = 0
+    }
+  }
+
+  discardLeadingBytes (count) {
+    while (count > 0 && this.lineChunkIndex < this.chunks.length) {
+      const chunk = this.chunks[this.lineChunkIndex]
+      const remaining = chunk.length - this.linePos
+
+      if (count < remaining) {
+        this.linePos += count
+        count = 0
+      } else {
+        count -= remaining
+        this.lineChunkIndex++
+        this.linePos = 0
+      }
+    }
+
+    this.chunkIndex = this.lineChunkIndex
+    this.pos = this.linePos
+    this.dropConsumedChunks()
+  }
+
+  handleBOM () {
+    const first = this.peekBufferedByte(0)
+    const second = this.peekBufferedByte(1)
+    const third = this.peekBufferedByte(2)
+
+    if (second === undefined) {
+      if (first === BOM[0]) {
+        return true
+      }
+
+      this.checkBOM = false
+      return true
+    }
+
+    if (third === undefined) {
+      if (first === BOM[0] && second === BOM[1]) {
+        return true
+      }
+
+      this.checkBOM = false
+      return false
+    }
+
+    if (first === BOM[0] && second === BOM[1] && third === BOM[2]) {
+      this.discardLeadingBytes(3)
+    }
+
+    this.checkBOM = false
+    return !this.hasCurrentByte()
   }
 }
 
@@ -17763,6 +18113,7 @@ const { isNetworkError } = __nccwpck_require__(60318)
 const { delay } = __nccwpck_require__(8114)
 const { kEnumerableProperty } = __nccwpck_require__(61671)
 const { environmentSettingsObject } = __nccwpck_require__(39921)
+const { getGlobalDispatcher } = __nccwpck_require__(97256)
 
 let experimentalWarned = false
 
@@ -18044,6 +18395,7 @@ class EventSource extends EventTarget {
 
       const eventSourceStream = new EventSourceStream({
         eventSourceSettings: this.#state,
+        maxEventSize: this.#dispatcher.eventSourceOptions?.maxEventSize,
         push: (event) => {
           this.dispatchEvent(createFastMessageEvent(
             event.type,
@@ -18222,7 +18574,8 @@ webidl.converters.EventSourceInitDict = webidl.dictionaryConverter([
   },
   {
     key: 'dispatcher', // undici only
-    converter: webidl.converters.any
+    converter: webidl.converters.any,
+    defaultValue: () => getGlobalDispatcher()
   }
 ])
 
@@ -23329,8 +23682,10 @@ async function httpNetworkFetch (
   // 19. Run these steps in parallel:
 
   //    1. Run these steps, but abort when fetchParams is canceled:
-  fetchParams.controller.onAborted = onAborted
-  fetchParams.controller.on('terminated', onAborted)
+  if (!fetchParams.controller.resume) {
+    fetchParams.controller.on('terminated', onAborted)
+  }
+
   fetchParams.controller.resume = async () => {
     // 1. While true
     while (true) {
@@ -23499,8 +23854,6 @@ async function httpNetworkFetch (
           }
           location = headersList.get('location', true)
 
-          this.body = new Readable({ read: resume })
-
           const decoders = []
 
           const willFollow = location && request.redirect === 'follow' &&
@@ -23518,7 +23871,7 @@ async function httpNetworkFetch (
             // CVE fix similar to urllib3 (GHSA-gm62-xv2j-4w53) and curl (CVE-2022-32206).
             const maxContentEncodings = 5
             if (codings.length > maxContentEncodings) {
-              reject(new Error(`too many content-encodings in response: ${codings.length}, maximum allowed is ${maxContentEncodings}`))
+              this.abort(new Error(`too many content-encodings in response: ${codings.length}, maximum allowed is ${maxContentEncodings}`))
               return true
             }
 
@@ -23550,6 +23903,8 @@ async function httpNetworkFetch (
               }
             }
           }
+
+          this.body = new Readable({ read: resume })
 
           const onError = this.onError.bind(this)
 
@@ -23595,10 +23950,6 @@ async function httpNetworkFetch (
         onComplete () {
           if (this.abort) {
             fetchParams.controller.off('terminated', this.abort)
-          }
-
-          if (fetchParams.controller.onAborted) {
-            fetchParams.controller.off('terminated', fetchParams.controller.onAborted)
           }
 
           fetchParams.controller.ended = true
@@ -29027,7 +29378,7 @@ function establishWebSocketConnection (url, protocols, client, ws, onEstablish, 
         // is specified, the server needs to include the same field and one of
         // the selected subprotocol values in its response for the connection to
         // be established.
-        if (!requestProtocols.includes(secProtocol)) {
+        if (requestProtocols === null || !requestProtocols.includes(secProtocol)) {
           failWebsocketConnection(ws, 'Protocol was not set in the opening handshake.')
           return
         }
@@ -29792,7 +30143,12 @@ class PerMessageDeflate {
 
         if (this.#maxPayloadSize > 0 && this.#inflate[kLength] > this.#maxPayloadSize) {
           callback(new MessageSizeExceededError())
+          // The inflater may still hold buffered input that can emit a late
+          // zlib error. Remove the data listener, then deterministically stop
+          // the stream so a subsequent 'error' cannot fire without a listener
+          // (which would terminate the process as an unhandled error event).
           this.#inflate.removeAllListeners()
+          this.#inflate.destroy()
           this.#inflate = null
           return
         }
@@ -30086,6 +30442,20 @@ class ByteParser extends Writable {
         if (isControlFrame(this.#info.opcode)) {
           this.#loop = this.parseControlFrame(body)
           this.#state = parserStates.INFO
+
+          // If the automatic PONG/CLOSE reply filled the socket's write buffer,
+          // stop parsing and resume on drain so a PING flood cannot grow the
+          // outbound queue without bound.
+          const socket = this.ws[kResponse].socket
+          if (this.#loop && socket.writableNeedDrain) {
+            this.#loop = false
+            socket.once('drain', () => {
+              if (this.destroyed) return
+              this.#loop = true
+              this.run(callback)
+            })
+            return
+          }
         } else {
           if (!this.#info.compressed) {
             if (!this.writeFragments(body)) {
@@ -33866,7 +34236,16 @@ class BackoffTimeout {
                 this.maxDelay = options.maxDelay;
             }
         }
-        this.trace('constructed initialDelay=' + this.initialDelay + ' multiplier=' + this.multiplier + ' jitter=' + this.jitter + ' maxDelay=' + this.maxDelay);
+        if (this.traceEnabled) {
+            this.trace('constructed initialDelay=' +
+                this.initialDelay +
+                ' multiplier=' +
+                this.multiplier +
+                ' jitter=' +
+                this.jitter +
+                ' maxDelay=' +
+                this.maxDelay);
+        }
         this.nextDelay = this.initialDelay;
         this.timerId = setTimeout(() => { }, 0);
         clearTimeout(this.timerId);
@@ -33874,12 +34253,19 @@ class BackoffTimeout {
     static getNextId() {
         return this.nextId++;
     }
+    get traceEnabled() {
+        return logging.isTracerEnabled(TRACER_NAME);
+    }
     trace(text) {
-        logging.trace(constants_1.LogVerbosity.DEBUG, TRACER_NAME, '{' + this.id + '} ' + text);
+        if (this.traceEnabled) {
+            logging.trace(constants_1.LogVerbosity.DEBUG, TRACER_NAME, '{' + this.id + '} ' + text);
+        }
     }
     runTimer(delay) {
         var _a, _b;
-        this.trace('runTimer(delay=' + delay + ')');
+        if (this.traceEnabled) {
+            this.trace('runTimer(delay=' + delay + ')');
+        }
         this.endTime = this.startTime;
         this.endTime.setMilliseconds(this.endTime.getMilliseconds() + delay);
         clearTimeout(this.timerId);
@@ -33919,7 +34305,9 @@ class BackoffTimeout {
      * retroactively apply that reset to the current timer.
      */
     reset() {
-        this.trace('reset() running=' + this.running);
+        if (this.traceEnabled) {
+            this.trace('reset() running=' + this.running);
+        }
         this.nextDelay = this.initialDelay;
         if (this.running) {
             const now = new Date();
@@ -33995,6 +34383,7 @@ BackoffTimeout.nextId = 0;
  */
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.CallCredentials = void 0;
+exports.isEmptyCallCredentials = isEmptyCallCredentials;
 const metadata_1 = __nccwpck_require__(36100);
 function isCurrentOauth2Client(client) {
     return ('getRequestHeaders' in client &&
@@ -34071,6 +34460,9 @@ class ComposedCallCredentials extends CallCredentials {
         return base;
     }
     compose(other) {
+        if (other instanceof EmptyCallCredentials) {
+            return this;
+        }
         return new ComposedCallCredentials(this.creds.concat([other]));
     }
     _equals(other) {
@@ -34103,6 +34495,9 @@ class SingleCallCredentials extends CallCredentials {
         });
     }
     compose(other) {
+        if (other instanceof EmptyCallCredentials) {
+            return this;
+        }
         return new ComposedCallCredentials([this, other]);
     }
     _equals(other) {
@@ -34127,6 +34522,9 @@ class EmptyCallCredentials extends CallCredentials {
     _equals(other) {
         return other instanceof EmptyCallCredentials;
     }
+}
+function isEmptyCallCredentials(callCredentials) {
+    return callCredentials instanceof EmptyCallCredentials;
 }
 //# sourceMappingURL=call-credentials.js.map
 
@@ -34692,6 +35090,7 @@ class InsecureChannelCredentialsImpl extends ChannelCredentials {
         return other instanceof InsecureChannelCredentialsImpl;
     }
     _createSecureConnector(channelTarget, options, callCredentials) {
+        const credentials = callCredentials !== null && callCredentials !== void 0 ? callCredentials : call_credentials_1.CallCredentials.createEmpty();
         return {
             connect(socket) {
                 return Promise.resolve({
@@ -34703,7 +35102,7 @@ class InsecureChannelCredentialsImpl extends ChannelCredentials {
                 return Promise.resolve();
             },
             getCallCredentials: () => {
-                return callCredentials !== null && callCredentials !== void 0 ? callCredentials : call_credentials_1.CallCredentials.createEmpty();
+                return credentials;
             },
             destroy() { }
         };
@@ -35193,6 +35592,7 @@ exports.ChannelImplementation = ChannelImplementation;
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.registerChannelzSocket = exports.registerChannelzServer = exports.registerChannelzSubchannel = exports.registerChannelzChannel = exports.ChannelzCallTrackerStub = exports.ChannelzCallTracker = exports.ChannelzChildrenTrackerStub = exports.ChannelzChildrenTracker = exports.ChannelzTrace = exports.ChannelzTraceStub = void 0;
 exports.unregisterChannelzRef = unregisterChannelzRef;
+exports.dateToProtoTimestamp = dateToProtoTimestamp;
 exports.getChannelzHandlers = getChannelzHandlers;
 exports.getChannelzServiceDefinition = getChannelzServiceDefinition;
 exports.setup = setup;
@@ -35352,7 +35752,7 @@ class ChannelzCallTracker {
     }
     addCallStarted() {
         this.callsStarted += 1;
-        this.lastCallStartedTimestamp = new Date();
+        this.lastCallStartedTimestamp = Date.now();
     }
     addCallSucceeded() {
         this.callsSucceeded += 1;
@@ -35495,12 +35895,12 @@ function connectivityStateToMessage(state) {
     }
 }
 function dateToProtoTimestamp(date) {
-    if (!date) {
+    if (date === null || date === undefined) {
         return null;
     }
-    const millisSinceEpoch = date.getTime();
+    const millisSinceEpoch = typeof date === 'number' ? date : date.getTime();
     return {
-        seconds: (millisSinceEpoch / 1000) | 0,
+        seconds: Math.floor(millisSinceEpoch / 1000),
         nanos: (millisSinceEpoch % 1000) * 1000000,
     };
 }
@@ -37200,7 +37600,7 @@ const units = [
     ['H', 60 * 60 * 1000],
 ];
 function getDeadlineTimeoutString(deadline) {
-    const now = new Date().getTime();
+    const now = Date.now();
     if (deadline instanceof Date) {
         deadline = deadline.getTime();
     }
@@ -37231,7 +37631,7 @@ const MAX_TIMEOUT_TIME = 2147483647;
  */
 function getRelativeTimeout(deadline) {
     const deadlineMs = deadline instanceof Date ? deadline.getTime() : deadline;
-    const now = new Date().getTime();
+    const now = Date.now();
     const timeout = deadlineMs - now;
     if (timeout < 0) {
         return 0;
@@ -37265,7 +37665,9 @@ function deadlineToString(deadline) {
  * @returns
  */
 function formatDateDifference(startDate, endDate) {
-    return ((endDate.getTime() - startDate.getTime()) / 1000).toFixed(3) + 's';
+    const startMs = typeof startDate === 'number' ? startDate : startDate.getTime();
+    const endMs = typeof endDate === 'number' ? endDate : endDate.getTime();
+    return ((endMs - startMs) / 1000).toFixed(3) + 's';
 }
 //# sourceMappingURL=deadline.js.map
 
@@ -37373,10 +37775,11 @@ function durationToString(duration) {
  * limitations under the License.
  *
  */
-var _a;
+var _a, _b;
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.GRPC_NODE_USE_ALTERNATIVE_RESOLVER = void 0;
+exports.GRPC_NODE_DEBUG_SEND_ERROR_DETAILS = exports.GRPC_NODE_USE_ALTERNATIVE_RESOLVER = void 0;
 exports.GRPC_NODE_USE_ALTERNATIVE_RESOLVER = ((_a = process.env.GRPC_NODE_USE_ALTERNATIVE_RESOLVER) !== null && _a !== void 0 ? _a : 'false') === 'true';
+exports.GRPC_NODE_DEBUG_SEND_ERROR_DETAILS = ((_b = process.env.GRPC_NODE_DEBUG_SEND_ERROR_DETAILS) !== null && _b !== void 0 ? _b : 'false') === 'true';
 //# sourceMappingURL=environment.js.map
 
 /***/ }),
@@ -38191,7 +38594,7 @@ class InternalChannel {
          * first time the resolver returns a result, which includes the ConfigSelector.
          */
         this.configSelectionQueue = [];
-        this.pickQueue = [];
+        this.pickQueue = new Set();
         this.connectivityStateWatchers = [];
         /**
          * This timer does not do anything on its own. Its purpose is to hold the
@@ -38222,6 +38625,12 @@ class InternalChannel {
          * 0 and MAX_SAFE_INTEGER.
          */
         this.randomChannelId = Math.floor(Math.random() * Number.MAX_SAFE_INTEGER);
+        /**
+         * Two-level cache mapping host to method name to precomputed service URL
+         * (`https://${hostname}/${serviceName}`) used by call credentials. Nested
+         * maps avoid intermediate composite key string allocations on the hot path.
+         */
+        this.serviceUrlCache = new Map();
         if (typeof target !== 'string') {
             throw new TypeError('Channel target must be a string');
         }
@@ -38284,9 +38693,9 @@ class InternalChannel {
             },
             updateState: (connectivityState, picker) => {
                 this.currentPicker = picker;
-                const queueCopy = this.pickQueue.slice();
-                this.pickQueue = [];
-                if (queueCopy.length > 0) {
+                const queueCopy = this.pickQueue;
+                this.pickQueue = new Set();
+                if (queueCopy.size > 0) {
                     this.callRefTimerUnref();
                 }
                 for (const call of queueCopy) {
@@ -38361,20 +38770,27 @@ class InternalChannel {
         this.filterStackFactory = new filter_stack_1.FilterStackFactory([
             new compression_filter_1.CompressionFilterFactory(this, this.options),
         ]);
-        this.trace('Channel constructed with options ' +
-            JSON.stringify(options, undefined, 2));
-        const error = new Error();
+        if (this.traceEnabled) {
+            this.trace('Channel constructed with options ' +
+                JSON.stringify(options, undefined, 2));
+        }
         if ((0, logging_1.isTracerEnabled)('channel_stacktrace')) {
+            const error = new Error();
             (0, logging_1.trace)(constants_1.LogVerbosity.DEBUG, 'channel_stacktrace', '(' +
                 this.channelzRef.id +
                 ') ' +
                 'Channel constructed \n' +
                 ((_f = error.stack) === null || _f === void 0 ? void 0 : _f.substring(error.stack.indexOf('\n') + 1)));
         }
-        this.lastActivityTimestamp = new Date();
+        this.lastActivityTimestamp = Date.now();
+    }
+    get traceEnabled() {
+        return (0, logging_1.isTracerEnabled)('channel');
     }
     trace(text, verbosityOverride) {
-        (0, logging_1.trace)(verbosityOverride !== null && verbosityOverride !== void 0 ? verbosityOverride : constants_1.LogVerbosity.DEBUG, 'channel', '(' + this.channelzRef.id + ') ' + (0, uri_parser_1.uriToString)(this.target) + ' ' + text);
+        if (this.traceEnabled) {
+            (0, logging_1.trace)(verbosityOverride !== null && verbosityOverride !== void 0 ? verbosityOverride : constants_1.LogVerbosity.DEBUG, 'channel', '(' + this.channelzRef.id + ') ' + (0, uri_parser_1.uriToString)(this.target) + ' ' + text);
+        }
     }
     callRefTimerRef() {
         var _a, _b, _c, _d;
@@ -38383,10 +38799,12 @@ class InternalChannel {
         }
         // If the hasRef function does not exist, always run the code
         if (!((_b = (_a = this.callRefTimer).hasRef) === null || _b === void 0 ? void 0 : _b.call(_a))) {
-            this.trace('callRefTimer.ref | configSelectionQueue.length=' +
-                this.configSelectionQueue.length +
-                ' pickQueue.length=' +
-                this.pickQueue.length);
+            if (this.traceEnabled) {
+                this.trace('callRefTimer.ref | configSelectionQueue.length=' +
+                    this.configSelectionQueue.length +
+                    ' pickQueue.length=' +
+                    this.pickQueue.size);
+            }
             (_d = (_c = this.callRefTimer).ref) === null || _d === void 0 ? void 0 : _d.call(_c);
         }
     }
@@ -38394,10 +38812,12 @@ class InternalChannel {
         var _a, _b, _c;
         // If the timer or the hasRef function does not exist, always run the code
         if (!((_a = this.callRefTimer) === null || _a === void 0 ? void 0 : _a.hasRef) || this.callRefTimer.hasRef()) {
-            this.trace('callRefTimer.unref | configSelectionQueue.length=' +
-                this.configSelectionQueue.length +
-                ' pickQueue.length=' +
-                this.pickQueue.length);
+            if (this.traceEnabled) {
+                this.trace('callRefTimer.unref | configSelectionQueue.length=' +
+                    this.configSelectionQueue.length +
+                    ' pickQueue.length=' +
+                    this.pickQueue.size);
+            }
             (_c = (_b = this.callRefTimer) === null || _b === void 0 ? void 0 : _b.unref) === null || _c === void 0 ? void 0 : _c.call(_b);
         }
     }
@@ -38456,8 +38876,14 @@ class InternalChannel {
         });
     }
     queueCallForPick(call) {
-        this.pickQueue.push(call);
+        this.pickQueue.add(call);
         this.callRefTimerRef();
+    }
+    removeCallFromPickQueue(call) {
+        this.pickQueue.delete(call);
+        if (this.pickQueue.size === 0) {
+            this.callRefTimerUnref();
+        }
     }
     getConfig(method, metadata) {
         if (this.connectivityState !== connectivity_state_1.ConnectivityState.SHUTDOWN) {
@@ -38510,8 +38936,8 @@ class InternalChannel {
                 this.startIdleTimeout(this.idleTimeoutMs);
                 return;
             }
-            const now = new Date();
-            const timeSinceLastActivity = now.valueOf() - this.lastActivityTimestamp.valueOf();
+            const now = Date.now();
+            const timeSinceLastActivity = now - this.lastActivityTimestamp;
             if (timeSinceLastActivity >= this.idleTimeoutMs) {
                 this.trace('Idle timer triggered after ' +
                     this.idleTimeoutMs +
@@ -38550,27 +38976,67 @@ class InternalChannel {
             }
         }
         this.callCount -= 1;
-        this.lastActivityTimestamp = new Date();
+        this.lastActivityTimestamp = Date.now();
         this.maybeStartIdleTimer();
     }
-    createLoadBalancingCall(callConfig, method, host, credentials, deadline) {
-        const callNumber = (0, call_number_1.getNextCallNumber)();
-        this.trace('createLoadBalancingCall [' + callNumber + '] method="' + method + '"');
-        return new load_balancing_call_1.LoadBalancingCall(this, callConfig, method, host, credentials, deadline, callNumber);
+    /**
+     * Returns the precomputed service URL (`https://${hostname}/${serviceName}`)
+     * for the given host and method, using a bounded cache to avoid parsing on
+     * every RPC.
+     */
+    getServiceUrl(host, methodName) {
+        let methodMap = this.serviceUrlCache.get(host);
+        if (methodMap === undefined) {
+            if (this.serviceUrlCache.size < InternalChannel.MAX_CACHED_HOSTS) {
+                methodMap = new Map();
+                this.serviceUrlCache.set(host, methodMap);
+            }
+        }
+        if (methodMap !== undefined) {
+            const serviceUrl = methodMap.get(methodName);
+            if (serviceUrl !== undefined) {
+                return serviceUrl;
+            }
+            const computedServiceUrl = (0, uri_parser_1.computeServiceUrl)(host, methodName);
+            if (methodMap.size < InternalChannel.MAX_METHODS_PER_HOST) {
+                methodMap.set(methodName, computedServiceUrl);
+            }
+            return computedServiceUrl;
+        }
+        return (0, uri_parser_1.computeServiceUrl)(host, methodName);
     }
-    createRetryingCall(callConfig, method, host, credentials, deadline) {
-        const callNumber = (0, call_number_1.getNextCallNumber)();
-        this.trace('createRetryingCall [' + callNumber + '] method="' + method + '"');
-        return new retrying_call_1.RetryingCall(this, callConfig, method, host, credentials, deadline, callNumber, this.retryBufferTracker, RETRY_THROTTLER_MAP.get(this.getTarget()));
+    createLoadBalancingCall(callConfig, method, host, credentials, deadline, callNumber) {
+        const finalCallNumber = callNumber !== null && callNumber !== void 0 ? callNumber : (0, call_number_1.getNextCallNumber)();
+        if (this.traceEnabled) {
+            this.trace('createLoadBalancingCall [' +
+                finalCallNumber +
+                '] method="' +
+                method +
+                '"');
+        }
+        return new load_balancing_call_1.LoadBalancingCall(this, callConfig, method, host, credentials, deadline, finalCallNumber);
+    }
+    createRetryingCall(callConfig, method, host, credentials, deadline, callNumber) {
+        const finalCallNumber = callNumber !== null && callNumber !== void 0 ? callNumber : (0, call_number_1.getNextCallNumber)();
+        if (this.traceEnabled) {
+            this.trace('createRetryingCall [' +
+                finalCallNumber +
+                '] method="' +
+                method +
+                '"');
+        }
+        return new retrying_call_1.RetryingCall(this, callConfig, method, host, credentials, deadline, finalCallNumber, this.retryBufferTracker, RETRY_THROTTLER_MAP.get(this.getTarget()));
     }
     createResolvingCall(method, deadline, host, parentCall, propagateFlags) {
         const callNumber = (0, call_number_1.getNextCallNumber)();
-        this.trace('createResolvingCall [' +
-            callNumber +
-            '] method="' +
-            method +
-            '", deadline=' +
-            (0, deadline_1.deadlineToString)(deadline));
+        if (this.traceEnabled) {
+            this.trace('createResolvingCall [' +
+                callNumber +
+                '] method="' +
+                method +
+                '", deadline=' +
+                (0, deadline_1.deadlineToString)(deadline));
+        }
         const finalOptions = {
             deadline: deadline,
             flags: propagateFlags !== null && propagateFlags !== void 0 ? propagateFlags : constants_1.Propagate.DEFAULTS,
@@ -38596,7 +39062,7 @@ class InternalChannel {
         for (const call of this.pickQueue) {
             call.cancelWithStatus(constants_1.Status.UNAVAILABLE, 'Channel closed before call started');
         }
-        this.pickQueue = [];
+        this.pickQueue.clear();
         if (this.callRefTimer) {
             clearInterval(this.callRefTimer);
         }
@@ -38609,6 +39075,7 @@ class InternalChannel {
         this.subchannelPool.unrefUnusedSubchannels();
         (_a = this.configSelector) === null || _a === void 0 ? void 0 : _a.unref();
         this.configSelector = null;
+        this.serviceUrlCache.clear();
     }
     getTarget() {
         return (0, uri_parser_1.uriToString)(this.target);
@@ -38617,7 +39084,7 @@ class InternalChannel {
         const connectivityState = this.connectivityState;
         if (tryToConnect) {
             this.resolvingLoadBalancer.exitIdle();
-            this.lastActivityTimestamp = new Date();
+            this.lastActivityTimestamp = Date.now();
             this.maybeStartIdleTimer();
         }
         return connectivityState;
@@ -38671,6 +39138,14 @@ class InternalChannel {
     }
 }
 exports.InternalChannel = InternalChannel;
+/**
+ * Maximum number of distinct hosts to cache service URLs for on this channel.
+ */
+InternalChannel.MAX_CACHED_HOSTS = 5;
+/**
+ * Maximum number of distinct method paths to cache per host.
+ */
+InternalChannel.MAX_METHODS_PER_HOST = 100;
 //# sourceMappingURL=internal-channel.js.map
 
 /***/ }),
@@ -40688,19 +41163,19 @@ function selectLbConfigFromList(configs, fallbackTodefault = false) {
  */
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.LoadBalancingCall = void 0;
+const call_credentials_1 = __nccwpck_require__(79190);
 const connectivity_state_1 = __nccwpck_require__(60778);
 const constants_1 = __nccwpck_require__(68288);
 const deadline_1 = __nccwpck_require__(52173);
 const metadata_1 = __nccwpck_require__(36100);
 const picker_1 = __nccwpck_require__(71663);
-const uri_parser_1 = __nccwpck_require__(56027);
 const logging = __nccwpck_require__(8536);
 const control_plane_status_1 = __nccwpck_require__(39962);
 const http2 = __nccwpck_require__(85675);
 const TRACER_NAME = 'load_balancing_call';
+const RESOLVED_EMPTY_METADATA = Promise.resolve(undefined);
 class LoadBalancingCall {
     constructor(channel, callConfig, methodName, host, credentials, deadline, callNumber) {
-        var _a, _b;
         this.channel = channel;
         this.callConfig = callConfig;
         this.methodName = methodName;
@@ -40717,24 +41192,13 @@ class LoadBalancingCall {
         this.listener = null;
         this.onCallEnded = null;
         this.childStartTime = null;
-        const splitPath = this.methodName.split('/');
-        let serviceName = '';
-        /* The standard path format is "/{serviceName}/{methodName}", so if we split
-         * by '/', the first item should be empty and the second should be the
-         * service name */
-        if (splitPath.length >= 2) {
-            serviceName = splitPath[1];
-        }
-        const hostname = (_b = (_a = (0, uri_parser_1.splitHostPort)(this.host)) === null || _a === void 0 ? void 0 : _a.host) !== null && _b !== void 0 ? _b : 'localhost';
-        /* Currently, call credentials are only allowed on HTTPS connections, so we
-         * can assume that the scheme is "https" */
-        this.serviceUrl = `https://${hostname}/${serviceName}`;
-        this.startTime = new Date();
+        this.serviceUrl = this.channel.getServiceUrl(this.host, this.methodName);
+        this.startTime = Date.now();
     }
     getDeadlineInfo() {
         var _a, _b;
         const deadlineInfo = [];
-        if (this.childStartTime) {
+        if (this.childStartTime !== null) {
             if (this.childStartTime > this.startTime) {
                 if ((_a = this.metadata) === null || _a === void 0 ? void 0 : _a.getOptions().waitForReady) {
                     deadlineInfo.push('wait_for_ready');
@@ -40752,23 +41216,47 @@ class LoadBalancingCall {
         }
         return deadlineInfo;
     }
+    get traceEnabled() {
+        return logging.isTracerEnabled(TRACER_NAME);
+    }
     trace(text) {
-        logging.trace(constants_1.LogVerbosity.DEBUG, TRACER_NAME, '[' + this.callNumber + '] ' + text);
+        if (this.traceEnabled) {
+            logging.trace(constants_1.LogVerbosity.DEBUG, TRACER_NAME, '[' + this.callNumber + '] ' + text);
+        }
+    }
+    getSubchannelString(subchannel) {
+        return subchannel
+            ? '(' +
+                subchannel.getChannelzRef().id +
+                ') ' +
+                subchannel.getAddress()
+            : '' + subchannel;
     }
     outputStatus(status, progress) {
         var _a, _b;
         if (!this.ended) {
             this.ended = true;
-            this.trace('ended with status: code=' +
-                status.code +
-                ' details="' +
-                status.details +
-                '" start time=' +
-                this.startTime.toISOString());
+            if (this.traceEnabled) {
+                this.trace('ended with status: code=' +
+                    status.code +
+                    ' details="' +
+                    status.details +
+                    '" start time=' +
+                    new Date(this.startTime).toISOString());
+            }
             const finalStatus = Object.assign(Object.assign({}, status), { progress });
             (_a = this.listener) === null || _a === void 0 ? void 0 : _a.onReceiveStatus(finalStatus);
             (_b = this.onCallEnded) === null || _b === void 0 ? void 0 : _b.call(this, finalStatus.code, finalStatus.details, finalStatus.metadata);
+            this.channel.removeCallFromPickQueue(this);
         }
+    }
+    generateCallCredentialsMetadata(callCredentials) {
+        return (0, call_credentials_1.isEmptyCallCredentials)(callCredentials)
+            ? RESOLVED_EMPTY_METADATA
+            : callCredentials.generateMetadata({
+                method_name: this.methodName,
+                service_url: this.serviceUrl,
+            });
     }
     doPick() {
         var _a, _b;
@@ -40781,25 +41269,19 @@ class LoadBalancingCall {
         this.trace('Pick called');
         const finalMetadata = this.metadata.clone();
         const pickResult = this.channel.doPick(finalMetadata, this.callConfig.pickInformation);
-        const subchannelString = pickResult.subchannel
-            ? '(' +
-                pickResult.subchannel.getChannelzRef().id +
-                ') ' +
-                pickResult.subchannel.getAddress()
-            : '' + pickResult.subchannel;
-        this.trace('Pick result: ' +
-            picker_1.PickResultType[pickResult.pickResultType] +
-            ' subchannel: ' +
-            subchannelString +
-            ' status: ' +
-            ((_a = pickResult.status) === null || _a === void 0 ? void 0 : _a.code) +
-            ' ' +
-            ((_b = pickResult.status) === null || _b === void 0 ? void 0 : _b.details));
+        if (this.traceEnabled) {
+            this.trace('Pick result: ' +
+                picker_1.PickResultType[pickResult.pickResultType] +
+                ' subchannel: ' +
+                this.getSubchannelString(pickResult.subchannel) +
+                ' status: ' +
+                ((_a = pickResult.status) === null || _a === void 0 ? void 0 : _a.code) +
+                ' ' +
+                ((_b = pickResult.status) === null || _b === void 0 ? void 0 : _b.details));
+        }
         switch (pickResult.pickResultType) {
             case picker_1.PickResultType.COMPLETE:
-                const combinedCallCredentials = this.credentials.compose(pickResult.subchannel.getCallCredentials());
-                combinedCallCredentials
-                    .generateMetadata({ method_name: this.methodName, service_url: this.serviceUrl })
+                this.generateCallCredentialsMetadata(this.credentials.compose(pickResult.subchannel.getCallCredentials()))
                     .then(credsMetadata => {
                     var _a;
                     /* If this call was cancelled (e.g. by the deadline) before
@@ -40809,7 +41291,9 @@ class LoadBalancingCall {
                         this.trace('Credentials metadata generation finished after call ended');
                         return;
                     }
-                    finalMetadata.merge(credsMetadata);
+                    if (credsMetadata) {
+                        finalMetadata.merge(credsMetadata);
+                    }
                     if (finalMetadata.get('authorization').length > 1) {
                         this.outputStatus({
                             code: constants_1.Status.INTERNAL,
@@ -40819,11 +41303,13 @@ class LoadBalancingCall {
                     }
                     if (pickResult.subchannel.getConnectivityState() !==
                         connectivity_state_1.ConnectivityState.READY) {
-                        this.trace('Picked subchannel ' +
-                            subchannelString +
-                            ' has state ' +
-                            connectivity_state_1.ConnectivityState[pickResult.subchannel.getConnectivityState()] +
-                            ' after getting credentials metadata. Retrying pick');
+                        if (this.traceEnabled) {
+                            this.trace('Picked subchannel ' +
+                                this.getSubchannelString(pickResult.subchannel) +
+                                ' has state ' +
+                                connectivity_state_1.ConnectivityState[pickResult.subchannel.getConnectivityState()] +
+                                ' after getting credentials metadata. Retrying pick');
+                        }
                         this.doPick();
                         return;
                     }
@@ -40852,14 +41338,16 @@ class LoadBalancingCall {
                                     this.outputStatus(status, 'PROCESSED');
                                 }
                             },
-                        });
-                        this.childStartTime = new Date();
+                        }, this.callNumber);
+                        this.childStartTime = Date.now();
                     }
                     catch (error) {
-                        this.trace('Failed to start call on picked subchannel ' +
-                            subchannelString +
-                            ' with error ' +
-                            error.message);
+                        if (this.traceEnabled) {
+                            this.trace('Failed to start call on picked subchannel ' +
+                                this.getSubchannelString(pickResult.subchannel) +
+                                ' with error ' +
+                                error.message);
+                        }
                         this.outputStatus({
                             code: constants_1.Status.INTERNAL,
                             details: 'Failed to start HTTP/2 stream with error ' +
@@ -40870,7 +41358,9 @@ class LoadBalancingCall {
                     }
                     (_a = pickResult.onCallStarted) === null || _a === void 0 ? void 0 : _a.call(pickResult);
                     this.onCallEnded = pickResult.onCallEnded;
-                    this.trace('Created child call [' + this.child.getCallNumber() + ']');
+                    if (this.traceEnabled) {
+                        this.trace('Created child call [' + this.child.getCallNumber() + ']');
+                    }
                     if (this.readPending) {
                         this.child.startRead();
                     }
@@ -40913,7 +41403,9 @@ class LoadBalancingCall {
     }
     cancelWithStatus(status, details) {
         var _a;
-        this.trace('cancelWithStatus code: ' + status + ' details: "' + details + '"');
+        if (this.traceEnabled) {
+            this.trace('cancelWithStatus code: ' + status + ' details: "' + details + '"');
+        }
         (_a = this.child) === null || _a === void 0 ? void 0 : _a.cancelWithStatus(status, details);
         this.outputStatus({ code: status, details: details, metadata: new metadata_1.Metadata() }, 'PROCESSED');
     }
@@ -40928,7 +41420,9 @@ class LoadBalancingCall {
         this.doPick();
     }
     sendMessageWithContext(context, message) {
-        this.trace('write() called with message of length ' + message.length);
+        if (this.traceEnabled) {
+            this.trace('write() called with message of length ' + message.length);
+        }
         if (this.child) {
             this.child.sendMessageWithContext(context, message);
         }
@@ -41075,6 +41569,9 @@ const tracersString = (_d = (_c = process.env.GRPC_NODE_TRACE) !== null && _c !=
 const enabledTracers = new Set();
 const disabledTracers = new Set();
 for (const tracerName of tracersString.split(',')) {
+    if (tracerName.length === 0) {
+        continue;
+    }
     if (tracerName.startsWith('-')) {
         disabledTracers.add(tracerName.substring(1));
     }
@@ -41083,6 +41580,7 @@ for (const tracerName of tracersString.split(',')) {
     }
 }
 const allEnabled = enabledTracers.has('all');
+const anyTracerEnabled = allEnabled || enabledTracers.size > 0;
 function trace(severity, tracer, text) {
     if (isTracerEnabled(tracer)) {
         (0, exports.log)(severity, new Date().toISOString() +
@@ -41097,6 +41595,9 @@ function trace(severity, tracer, text) {
     }
 }
 function isTracerEnabled(tracer) {
+    if (!anyTracerEnabled) {
+        return false;
+    }
     return (!disabledTracers.has(tracer) && (allEnabled || enabledTracers.has(tracer)));
 }
 //# sourceMappingURL=logging.js.map
@@ -41322,7 +41823,6 @@ function validate(key, value) {
 class Metadata {
     constructor(options = {}) {
         this.internalRepr = new Map();
-        this.opaqueData = new Map();
         this.options = options;
     }
     /**
@@ -41432,15 +41932,17 @@ class Metadata {
      * Creates an OutgoingHttpHeaders object that can be used with the http2 API.
      */
     toHttp2Headers() {
-        // NOTE: Node <8.9 formats http2 headers incorrectly.
         const result = {};
         for (const [key, values] of this.internalRepr) {
             if (key.startsWith(':')) {
                 continue;
             }
-            // We assume that the user's interaction with this object is limited to
-            // through its public API (i.e. keys and values are already validated).
-            result[key] = values.map(bufToString);
+            if (values.length === 1) {
+                result[key] = bufToString(values[0]);
+            }
+            else {
+                result[key] = values.map(bufToString);
+            }
         }
         return result;
     }
@@ -41464,6 +41966,9 @@ class Metadata {
      * @param value
      */
     setOpaque(key, value) {
+        if (!this.opaqueData) {
+            this.opaqueData = new Map();
+        }
         this.opaqueData.set(key, value);
     }
     /**
@@ -41472,7 +41977,8 @@ class Metadata {
      * @returns
      */
     getOpaque(key) {
-        return this.opaqueData.get(key);
+        var _a;
+        return (_a = this.opaqueData) === null || _a === void 0 ? void 0 : _a.get(key);
     }
     /**
      * Returns a new Metadata object based fields in a given IncomingHttpHeaders
@@ -42765,7 +43271,7 @@ class ResolvingCall {
         this.metadata = null;
         this.listener = null;
         this.statusWatchers = [];
-        this.deadlineTimer = setTimeout(() => { }, 0);
+        this.deadlineTimer = null;
         this.filterStack = null;
         this.deadlineStartTime = null;
         this.configReceivedTime = null;
@@ -42785,37 +43291,52 @@ class ResolvingCall {
                 });
             }
             if (options.flags & constants_1.Propagate.DEADLINE) {
-                this.trace('Propagating deadline from parent: ' +
-                    options.parentCall.getDeadline());
+                if (this.traceEnabled) {
+                    this.trace('Propagating deadline from parent: ' +
+                        options.parentCall.getDeadline());
+                }
                 this.deadline = (0, deadline_1.minDeadline)(this.deadline, options.parentCall.getDeadline());
             }
         }
         this.trace('Created');
         this.runDeadlineTimer();
     }
+    get traceEnabled() {
+        return logging.isTracerEnabled(TRACER_NAME);
+    }
     trace(text) {
-        logging.trace(constants_1.LogVerbosity.DEBUG, TRACER_NAME, '[' + this.callNumber + '] ' + text);
+        if (this.traceEnabled) {
+            logging.trace(constants_1.LogVerbosity.DEBUG, TRACER_NAME, '[' + this.callNumber + '] ' + text);
+        }
     }
     runDeadlineTimer() {
-        clearTimeout(this.deadlineTimer);
-        this.deadlineStartTime = new Date();
-        this.trace('Deadline: ' + (0, deadline_1.deadlineToString)(this.deadline));
+        if (this.deadlineTimer) {
+            clearTimeout(this.deadlineTimer);
+            this.deadlineTimer = null;
+        }
+        this.deadlineStartTime = Date.now();
+        if (this.traceEnabled) {
+            this.trace('Deadline: ' + (0, deadline_1.deadlineToString)(this.deadline));
+        }
         const timeout = (0, deadline_1.getRelativeTimeout)(this.deadline);
         if (timeout !== Infinity) {
-            this.trace('Deadline will be reached in ' + timeout + 'ms');
+            if (this.traceEnabled) {
+                this.trace('Deadline will be reached in ' + timeout + 'ms');
+            }
             const handleDeadline = () => {
-                if (!this.deadlineStartTime) {
+                this.deadlineTimer = null;
+                if (this.deadlineStartTime === null) {
                     this.cancelWithStatus(constants_1.Status.DEADLINE_EXCEEDED, 'Deadline exceeded');
                     return;
                 }
                 const deadlineInfo = [];
-                const deadlineEndTime = new Date();
+                const deadlineEndTime = Date.now();
                 deadlineInfo.push(`Deadline exceeded after ${(0, deadline_1.formatDateDifference)(this.deadlineStartTime, deadlineEndTime)}`);
-                if (this.configReceivedTime) {
+                if (this.configReceivedTime !== null) {
                     if (this.configReceivedTime > this.deadlineStartTime) {
                         deadlineInfo.push(`name resolution: ${(0, deadline_1.formatDateDifference)(this.deadlineStartTime, this.configReceivedTime)}`);
                     }
-                    if (this.childStartTime) {
+                    if (this.childStartTime !== null) {
                         if (this.childStartTime > this.configReceivedTime) {
                             deadlineInfo.push(`metadata filters: ${(0, deadline_1.formatDateDifference)(this.configReceivedTime, this.childStartTime)}`);
                         }
@@ -42846,13 +43367,18 @@ class ResolvingCall {
             if (!this.filterStack) {
                 this.filterStack = this.filterStackFactory.createFilter();
             }
-            clearTimeout(this.deadlineTimer);
+            if (this.deadlineTimer) {
+                clearTimeout(this.deadlineTimer);
+                this.deadlineTimer = null;
+            }
             const filteredStatus = this.filterStack.receiveTrailers(status);
-            this.trace('ended with status: code=' +
-                filteredStatus.code +
-                ' details="' +
-                filteredStatus.details +
-                '"');
+            if (this.traceEnabled) {
+                this.trace('ended with status: code=' +
+                    filteredStatus.code +
+                    ' details="' +
+                    filteredStatus.details +
+                    '"');
+            }
             this.statusWatchers.forEach(watcher => watcher(filteredStatus));
             process.nextTick(() => {
                 var _a;
@@ -42873,7 +43399,8 @@ class ResolvingCall {
                 child.halfClose();
             }
         }, (status) => {
-            this.cancelWithStatus(status.code, status.details);
+            var _a, _b;
+            this.cancelWithStatus((_a = status.code) !== null && _a !== void 0 ? _a : constants_1.Status.INTERNAL, (_b = status.details) !== null && _b !== void 0 ? _b : 'Failed to write message');
         });
     }
     getConfig() {
@@ -42898,7 +43425,7 @@ class ResolvingCall {
             return;
         }
         // configResult.type === 'SUCCESS'
-        this.configReceivedTime = new Date();
+        this.configReceivedTime = Date.now();
         const config = configResult.config;
         if (config.status !== constants_1.Status.OK) {
             const { code, details } = (0, control_plane_status_1.restrictControlPlaneStatusCode)(config.status, 'Failed to route call to method ' + this.method);
@@ -42910,19 +43437,20 @@ class ResolvingCall {
             return;
         }
         if (config.methodConfig.timeout) {
-            const configDeadline = new Date();
-            configDeadline.setSeconds(configDeadline.getSeconds() + config.methodConfig.timeout.seconds);
-            configDeadline.setMilliseconds(configDeadline.getMilliseconds() +
+            const timeoutMs = Math.floor(config.methodConfig.timeout.seconds * 1000 +
                 config.methodConfig.timeout.nanos / 1000000);
+            const configDeadline = Date.now() + timeoutMs;
             this.deadline = (0, deadline_1.minDeadline)(this.deadline, configDeadline);
             this.runDeadlineTimer();
         }
         this.filterStackFactory.push(config.dynamicFilterFactories);
         this.filterStack = this.filterStackFactory.createFilter();
         this.filterStack.sendMetadata(Promise.resolve(this.metadata)).then(filteredMetadata => {
-            this.child = this.channel.createRetryingCall(config, this.method, this.host, this.credentials, this.deadline);
-            this.trace('Created child [' + this.child.getCallNumber() + ']');
-            this.childStartTime = new Date();
+            this.child = this.channel.createRetryingCall(config, this.method, this.host, this.credentials, this.deadline, this.callNumber);
+            if (this.traceEnabled) {
+                this.trace('Created child [' + this.child.getCallNumber() + ']');
+            }
+            this.childStartTime = Date.now();
             this.child.start(filteredMetadata, {
                 onReceiveMetadata: metadata => {
                     this.trace('Received metadata');
@@ -42976,7 +43504,9 @@ class ResolvingCall {
     }
     cancelWithStatus(status, details) {
         var _a;
-        this.trace('cancelWithStatus code: ' + status + ' details: "' + details + '"');
+        if (this.traceEnabled) {
+            this.trace('cancelWithStatus code: ' + status + ' details: "' + details + '"');
+        }
         (_a = this.child) === null || _a === void 0 ? void 0 : _a.cancelWithStatus(status, details);
         this.outputStatus({
             code: status,
@@ -42995,7 +43525,9 @@ class ResolvingCall {
         this.getConfig();
     }
     sendMessageWithContext(context, message) {
-        this.trace('write() called with message of length ' + message.length);
+        if (this.traceEnabled) {
+            this.trace('write() called with message of length ' + message.length);
+        }
         if (this.child) {
             this.sendMessageOnChild(context, message);
         }
@@ -43067,6 +43599,7 @@ exports.ResolvingCall = ResolvingCall;
  */
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.ResolvingLoadBalancer = void 0;
+exports.getDefaultConfigSelector = getDefaultConfigSelector;
 const load_balancer_1 = __nccwpck_require__(7000);
 const service_config_1 = __nccwpck_require__(70005);
 const connectivity_state_1 = __nccwpck_require__(60778);
@@ -43121,40 +43654,47 @@ function findMatchingConfig(service, method, methodConfigs, matchLevel) {
     }
     return null;
 }
+const MAX_CACHED_METHOD_CONFIGS = 100;
 function getDefaultConfigSelector(serviceConfig) {
+    const methodConfigCache = new Map();
     return {
-        invoke(methodName, metadata) {
+        invoke(methodName, metadata, channelId) {
             var _a, _b;
-            const splitName = methodName.split('/').filter(x => x.length > 0);
-            const service = (_a = splitName[0]) !== null && _a !== void 0 ? _a : '';
-            const method = (_b = splitName[1]) !== null && _b !== void 0 ? _b : '';
-            if (serviceConfig && serviceConfig.methodConfig) {
-                /* Check for the following in order, and return the first method
-                * config that matches:
-                * 1. A name that exactly matches the service and method
-                * 2. A name with no method set that matches the service
-                * 3. An empty name
-                */
-                for (const matchLevel of NAME_MATCH_LEVEL_ORDER) {
-                    const matchingConfig = findMatchingConfig(service, method, serviceConfig.methodConfig, matchLevel);
-                    if (matchingConfig) {
-                        return {
-                            methodConfig: matchingConfig,
-                            pickInformation: {},
-                            status: constants_1.Status.OK,
-                            dynamicFilterFactories: [],
-                        };
+            let matchingConfig = methodConfigCache.get(methodName);
+            if (matchingConfig === undefined) {
+                const splitName = methodName.split('/').filter(x => x.length > 0);
+                const service = (_a = splitName[0]) !== null && _a !== void 0 ? _a : '';
+                const method = (_b = splitName[1]) !== null && _b !== void 0 ? _b : '';
+                matchingConfig = { name: [] };
+                if (serviceConfig && serviceConfig.methodConfig) {
+                    /* Check for the following in order, and return the first method
+                     * config that matches:
+                     * 1. A name that exactly matches the service and method
+                     * 2. A name with no method set that matches the service
+                     * 3. An empty name
+                     */
+                    for (const matchLevel of NAME_MATCH_LEVEL_ORDER) {
+                        const foundConfig = findMatchingConfig(service, method, serviceConfig.methodConfig, matchLevel);
+                        if (foundConfig) {
+                            matchingConfig = foundConfig;
+                            break;
+                        }
                     }
+                }
+                if (methodConfigCache.size < MAX_CACHED_METHOD_CONFIGS) {
+                    methodConfigCache.set(methodName, matchingConfig);
                 }
             }
             return {
-                methodConfig: { name: [] },
+                methodConfig: matchingConfig,
                 pickInformation: {},
                 status: constants_1.Status.OK,
                 dynamicFilterFactories: [],
             };
         },
-        unref() { }
+        unref() {
+            methodConfigCache.clear();
+        }
     };
 }
 class ResolvingLoadBalancer {
@@ -43382,6 +43922,7 @@ const constants_1 = __nccwpck_require__(68288);
 const deadline_1 = __nccwpck_require__(52173);
 const metadata_1 = __nccwpck_require__(36100);
 const logging = __nccwpck_require__(8536);
+const call_number_1 = __nccwpck_require__(35675);
 const TRACER_NAME = 'retrying_call';
 class RetryThrottler {
     constructor(maxTokens, tokenRatio, previousRetryThrottler) {
@@ -43487,6 +44028,7 @@ class RetryingCall {
          */
         this.attempts = 0;
         this.hedgingTimer = null;
+        this.retryTimer = null;
         this.committedCallIndex = null;
         this.initialRetryBackoffSec = 0;
         this.nextRetryBackoffSec = 0;
@@ -43509,7 +44051,7 @@ class RetryingCall {
             this.state = 'TRANSPARENT_ONLY';
             this.maxAttempts = 1;
         }
-        this.startTime = new Date();
+        this.startTime = Date.now();
     }
     getDeadlineInfo() {
         if (this.underlyingCalls.length === 0) {
@@ -43529,16 +44071,23 @@ class RetryingCall {
     getCallNumber() {
         return this.callNumber;
     }
+    get traceEnabled() {
+        return logging.isTracerEnabled(TRACER_NAME);
+    }
     trace(text) {
-        logging.trace(constants_1.LogVerbosity.DEBUG, TRACER_NAME, '[' + this.callNumber + '] ' + text);
+        if (this.traceEnabled) {
+            logging.trace(constants_1.LogVerbosity.DEBUG, TRACER_NAME, '[' + this.callNumber + '] ' + text);
+        }
     }
     reportStatus(statusObject) {
-        this.trace('ended with status: code=' +
-            statusObject.code +
-            ' details="' +
-            statusObject.details +
-            '" start time=' +
-            this.startTime.toISOString());
+        if (this.traceEnabled) {
+            this.trace('ended with status: code=' +
+                statusObject.code +
+                ' details="' +
+                statusObject.details +
+                '" start time=' +
+                new Date(this.startTime).toISOString());
+        }
         this.bufferTracker.freeAll(this.callNumber);
         this.writeBufferOffset = this.writeBufferOffset + this.writeBuffer.length;
         this.writeBuffer = [];
@@ -43553,7 +44102,21 @@ class RetryingCall {
         });
     }
     cancelWithStatus(status, details) {
-        this.trace('cancelWithStatus code: ' + status + ' details: "' + details + '"');
+        if (this.traceEnabled) {
+            this.trace('cancelWithStatus code: ' + status + ' details: "' + details + '"');
+        }
+        /* No new attempt may start after cancellation. Otherwise a pending retry
+         * or hedging timer would start one, opening a stream that nothing will
+         * ever end. */
+        this.state = 'NO_RETRY';
+        if (this.retryTimer) {
+            clearTimeout(this.retryTimer);
+            this.retryTimer = null;
+        }
+        if (this.hedgingTimer) {
+            clearTimeout(this.hedgingTimer);
+            this.hedgingTimer = null;
+        }
         this.reportStatus({ code: status, details, metadata: new metadata_1.Metadata() });
         for (const { call } of this.underlyingCalls) {
             call.cancelWithStatus(status, details);
@@ -43605,10 +44168,12 @@ class RetryingCall {
         if (this.state === 'COMMITTED') {
             return;
         }
-        this.trace('Committing call [' +
-            this.underlyingCalls[index].call.getCallNumber() +
-            '] at index ' +
-            index);
+        if (this.traceEnabled) {
+            this.trace('Committing call [' +
+                this.underlyingCalls[index].call.getCallNumber() +
+                '] at index ' +
+                index);
+        }
         this.state = 'COMMITTED';
         (_b = (_a = this.callConfig).onCommitted) === null || _b === void 0 ? void 0 : _b.call(_a);
         this.committedCallIndex = index;
@@ -43691,8 +44256,9 @@ class RetryingCall {
             retryDelayMs = pushback;
             this.nextRetryBackoffSec = this.initialRetryBackoffSec;
         }
-        setTimeout(() => {
+        this.retryTimer = setTimeout(() => {
             var _a, _b;
+            this.retryTimer = null;
             if (this.state !== 'RETRY') {
                 callback(false);
                 return;
@@ -43790,14 +44356,16 @@ class RetryingCall {
         if (this.underlyingCalls[callIndex].state === 'COMPLETED') {
             return;
         }
-        this.trace('state=' +
-            this.state +
-            ' handling status with progress ' +
-            status.progress +
-            ' from child [' +
-            this.underlyingCalls[callIndex].call.getCallNumber() +
-            '] in state ' +
-            this.underlyingCalls[callIndex].state);
+        if (this.traceEnabled) {
+            this.trace('state=' +
+                this.state +
+                ' handling status with progress ' +
+                status.progress +
+                ' from child [' +
+                this.underlyingCalls[callIndex].call.getCallNumber() +
+                '] in state ' +
+                this.underlyingCalls[callIndex].state);
+        }
         this.underlyingCalls[callIndex].state = 'COMPLETED';
         if (status.code === constants_1.Status.OK) {
             (_a = this.retryThrottler) === null || _a === void 0 ? void 0 : _a.addCallSucceeded();
@@ -43876,27 +44444,33 @@ class RetryingCall {
         (_c = (_b = this.hedgingTimer).unref) === null || _c === void 0 ? void 0 : _c.call(_b);
     }
     startNewAttempt() {
-        const child = this.channel.createLoadBalancingCall(this.callConfig, this.methodName, this.host, this.credentials, this.deadline);
-        this.trace('Created child call [' +
-            child.getCallNumber() +
-            '] for attempt ' +
-            this.attempts);
+        const childCallNumber = this.underlyingCalls.length > 0 ? (0, call_number_1.getNextCallNumber)() : this.callNumber;
+        const child = this.channel.createLoadBalancingCall(this.callConfig, this.methodName, this.host, this.credentials, this.deadline, childCallNumber);
+        if (this.traceEnabled) {
+            this.trace('Created child call [' +
+                child.getCallNumber() +
+                '] for attempt ' +
+                this.attempts);
+        }
         const index = this.underlyingCalls.length;
         this.underlyingCalls.push({
             state: 'ACTIVE',
             call: child,
             nextMessageToSend: 0,
-            startTime: new Date(),
+            startTime: Date.now(),
         });
         const previousAttempts = this.attempts - 1;
-        const initialMetadata = this.initialMetadata.clone();
+        let initialMetadata = this.initialMetadata;
         if (previousAttempts > 0) {
+            initialMetadata = initialMetadata.clone();
             initialMetadata.set(PREVIONS_RPC_ATTEMPTS_METADATA_KEY, `${previousAttempts}`);
         }
         let receivedMetadata = false;
         child.start(initialMetadata, {
             onReceiveMetadata: metadata => {
-                this.trace('Received metadata from child [' + child.getCallNumber() + ']');
+                if (this.traceEnabled) {
+                    this.trace('Received metadata from child [' + child.getCallNumber() + ']');
+                }
                 this.commitCall(index);
                 receivedMetadata = true;
                 if (previousAttempts > 0) {
@@ -43907,14 +44481,18 @@ class RetryingCall {
                 }
             },
             onReceiveMessage: message => {
-                this.trace('Received message from child [' + child.getCallNumber() + ']');
+                if (this.traceEnabled) {
+                    this.trace('Received message from child [' + child.getCallNumber() + ']');
+                }
                 this.commitCall(index);
                 if (this.underlyingCalls[index].state === 'ACTIVE') {
                     this.listener.onReceiveMessage(message);
                 }
             },
             onReceiveStatus: status => {
-                this.trace('Received status from child [' + child.getCallNumber() + ']');
+                if (this.traceEnabled) {
+                    this.trace('Received status from child [' + child.getCallNumber() + ']');
+                }
                 if (!receivedMetadata && previousAttempts > 0) {
                     status.metadata.set(PREVIONS_RPC_ATTEMPTS_METADATA_KEY, `${previousAttempts}`);
                 }
@@ -43963,9 +44541,11 @@ class RetryingCall {
                     // has already been passed to the underlying transport.
                     const nextEntry = this.getBufferEntry(messageIndex + 1);
                     if (nextEntry.entryType === 'HALF_CLOSE') {
-                        this.trace('Sending halfClose immediately after message to child [' +
-                            childCall.call.getCallNumber() +
-                            '] - optimizing for unary/final message');
+                        if (this.traceEnabled) {
+                            this.trace('Sending halfClose immediately after message to child [' +
+                                childCall.call.getCallNumber() +
+                                '] - optimizing for unary/final message');
+                        }
                         childCall.nextMessageToSend += 1;
                         childCall.call.halfClose();
                     }
@@ -43981,7 +44561,9 @@ class RetryingCall {
         }
     }
     sendMessageWithContext(context, message) {
-        this.trace('write() called with message of length ' + message.length);
+        if (this.traceEnabled) {
+            this.trace('write() called with message of length ' + message.length);
+        }
         const writeObj = {
             message,
             flags: context.flags,
@@ -44053,9 +44635,11 @@ class RetryingCall {
                 // - nextMessageToSend === halfCloseIndex: all messages sent and acknowledged
                 if (call.nextMessageToSend === halfCloseIndex
                     || call.nextMessageToSend === halfCloseIndex - 1) {
-                    this.trace('Sending halfClose immediately to child [' +
-                        call.call.getCallNumber() +
-                        '] - all messages already sent');
+                    if (this.traceEnabled) {
+                        this.trace('Sending halfClose immediately to child [' +
+                            call.call.getCallNumber() +
+                            '] - all messages already sent');
+                    }
                     call.nextMessageToSend += 1;
                     call.call.halfClose();
                 }
@@ -44674,6 +45258,7 @@ const stream_decoder_1 = __nccwpck_require__(47956);
 const logging = __nccwpck_require__(8536);
 const tls_1 = __nccwpck_require__(64756);
 const orca_1 = __nccwpck_require__(82124);
+const environment_1 = __nccwpck_require__(16964);
 const TRACER_NAME = 'server_call';
 function trace(text) {
     logging.trace(constants_1.LogVerbosity.DEBUG, TRACER_NAME, text);
@@ -45087,8 +45672,7 @@ class BaseServerInterceptingCall {
             return;
         }
         const timeout = (+match[1] * deadlineUnitsToMs[match[2]]) | 0;
-        const now = new Date();
-        this.deadline = now.setMilliseconds(now.getMilliseconds() + timeout);
+        this.deadline = Date.now() + timeout;
         this.deadlineTimer = setTimeout(() => {
             const status = {
                 code: constants_1.Status.DEADLINE_EXCEEDED,
@@ -45216,9 +45800,16 @@ class BaseServerInterceptingCall {
             queueEntry.parsedMessage = this.handler.deserialize(decompressedMessage);
         }
         catch (err) {
+            let details;
+            if (environment_1.GRPC_NODE_DEBUG_SEND_ERROR_DETAILS) {
+                details = `Error deserializing request: ${err.message}`;
+            }
+            else {
+                details = 'Error deserializing request';
+            }
             this.sendStatus({
                 code: constants_1.Status.INTERNAL,
-                details: `Error deserializing request: ${err.message}`,
+                details: details,
             });
             return;
         }
@@ -45308,9 +45899,16 @@ class BaseServerInterceptingCall {
             response = this.serializeMessage(message);
         }
         catch (e) {
+            let details;
+            if (environment_1.GRPC_NODE_DEBUG_SEND_ERROR_DETAILS) {
+                details = `Error serializing response: ${(0, error_1.getErrorMessage)(e)}`;
+            }
+            else {
+                details = 'Error serializing response';
+            }
             this.sendStatus({
                 code: constants_1.Status.INTERNAL,
-                details: `Error serializing response: ${(0, error_1.getErrorMessage)(e)}`,
+                details: details,
                 metadata: null,
             });
             return;
@@ -45332,9 +45930,16 @@ class BaseServerInterceptingCall {
         this.stream.write(response, error => {
             var _a;
             if (error) {
+                let details;
+                if (environment_1.GRPC_NODE_DEBUG_SEND_ERROR_DETAILS) {
+                    details = `Error writing message: ${(0, error_1.getErrorMessage)(error)}`;
+                }
+                else {
+                    details = 'Internal server error';
+                }
                 this.sendStatus({
                     code: constants_1.Status.INTERNAL,
-                    details: `Error writing message: ${(0, error_1.getErrorMessage)(error)}`,
+                    details: details,
                     metadata: null,
                 });
                 return;
@@ -45427,16 +46032,17 @@ class BaseServerInterceptingCall {
     }
     getAuthContext() {
         var _a;
-        if (((_a = this.stream.session) === null || _a === void 0 ? void 0 : _a.socket) instanceof tls_1.TLSSocket) {
-            const peerCertificate = this.stream.session.socket.getPeerCertificate();
-            return {
-                transportSecurityType: 'ssl',
-                sslPeerCertificate: peerCertificate.raw ? peerCertificate : undefined
-            };
-        }
-        else {
+        if (!(((_a = this.stream.session) === null || _a === void 0 ? void 0 : _a.socket) instanceof tls_1.TLSSocket)) {
             return {};
         }
+        if (!this.stream.session.socket.authorized) {
+            return {};
+        }
+        const peerCertificate = this.stream.session.socket.getPeerCertificate();
+        return {
+            transportSecurityType: 'ssl',
+            sslPeerCertificate: peerCertificate.raw ? peerCertificate : undefined
+        };
     }
     getConnectionInfo() {
         return this.connectionInfo;
@@ -45531,6 +46137,7 @@ const subchannel_address_1 = __nccwpck_require__(97021);
 const uri_parser_1 = __nccwpck_require__(56027);
 const channelz_1 = __nccwpck_require__(68198);
 const server_interceptors_1 = __nccwpck_require__(42151);
+const environment_1 = __nccwpck_require__(16964);
 const UNLIMITED_CONNECTION_AGE_MS = ~(1 << 31);
 const KEEPALIVE_MAX_TIME_MS = ~(1 << 31);
 const KEEPALIVE_TIMEOUT_MS = 20000;
@@ -46433,13 +47040,13 @@ let Server = (() => {
                     addMessageSent: () => {
                         if (channelzSessionInfo) {
                             channelzSessionInfo.messagesSent += 1;
-                            channelzSessionInfo.lastMessageSentTimestamp = new Date();
+                            channelzSessionInfo.lastMessageSentTimestamp = Date.now();
                         }
                     },
                     addMessageReceived: () => {
                         if (channelzSessionInfo) {
                             channelzSessionInfo.messagesReceived += 1;
-                            channelzSessionInfo.lastMessageReceivedTimestamp = new Date();
+                            channelzSessionInfo.lastMessageReceivedTimestamp = Date.now();
                         }
                     },
                     onCallEnd: status => {
@@ -46947,9 +47554,16 @@ async function handleUnary(call, handler) {
                 handler.func(stream, respond);
             }
             catch (err) {
+                let details;
+                if (environment_1.GRPC_NODE_DEBUG_SEND_ERROR_DETAILS) {
+                    details = `Server method handler threw error ${err.message}`;
+                }
+                else {
+                    details = 'Unknown error';
+                }
                 call.sendStatus({
                     code: constants_1.Status.UNKNOWN,
-                    details: `Server method handler threw error ${err.message}`,
+                    details: details,
                     metadata: null,
                 });
             }
@@ -46984,9 +47598,16 @@ function handleClientStreaming(call, handler) {
                 handler.func(stream, respond);
             }
             catch (err) {
+                let details;
+                if (environment_1.GRPC_NODE_DEBUG_SEND_ERROR_DETAILS) {
+                    details = `Server method handler threw error ${err.message}`;
+                }
+                else {
+                    details = 'Unknown error';
+                }
                 call.sendStatus({
                     code: constants_1.Status.UNKNOWN,
-                    details: `Server method handler threw error ${err.message}`,
+                    details: details,
                     metadata: null,
                 });
             }
@@ -47041,9 +47662,16 @@ function handleServerStreaming(call, handler) {
                 handler.func(stream);
             }
             catch (err) {
+                let details;
+                if (environment_1.GRPC_NODE_DEBUG_SEND_ERROR_DETAILS) {
+                    details = `Server method handler threw error ${err.message}`;
+                }
+                else {
+                    details = 'Unknown error';
+                }
                 call.sendStatus({
                     code: constants_1.Status.UNKNOWN,
-                    details: `Server method handler threw error ${err.message}`,
+                    details: details,
                     metadata: null,
                 });
             }
@@ -47066,9 +47694,16 @@ function handleBidiStreaming(call, handler) {
                 handler.func(stream);
             }
             catch (err) {
+                let details;
+                if (environment_1.GRPC_NODE_DEBUG_SEND_ERROR_DETAILS) {
+                    details = `Server method handler threw error ${err.message}`;
+                }
+                else {
+                    details = 'Unknown error';
+                }
                 call.sendStatus({
                     code: constants_1.Status.UNKNOWN,
-                    details: `Server method handler threw error ${err.message}`,
+                    details: details,
                     metadata: null,
                 });
             }
@@ -47565,7 +48200,6 @@ const resolver_1 = __nccwpck_require__(76255);
 const uri_parser_1 = __nccwpck_require__(56027);
 class SubchannelCallWrapper {
     constructor(subchannel, method, filterStackFactory, options, callNumber) {
-        var _a, _b;
         this.subchannel = subchannel;
         this.method = method;
         this.options = options;
@@ -47577,18 +48211,7 @@ class SubchannelCallWrapper {
         this.pendingStatus = null;
         this.readFilterPending = false;
         this.writeFilterPending = false;
-        const splitPath = this.method.split('/');
-        let serviceName = '';
-        /* The standard path format is "/{serviceName}/{methodName}", so if we split
-          * by '/', the first item should be empty and the second should be the
-          * service name */
-        if (splitPath.length >= 2) {
-            serviceName = splitPath[1];
-        }
-        const hostname = (_b = (_a = (0, uri_parser_1.splitHostPort)(this.options.host)) === null || _a === void 0 ? void 0 : _a.host) !== null && _b !== void 0 ? _b : 'localhost';
-        /* Currently, call credentials are only allowed on HTTPS connections, so we
-          * can assume that the scheme is "https" */
-        this.serviceUrl = `https://${hostname}/${serviceName}`;
+        this.serviceUrl = (0, uri_parser_1.computeServiceUrl)(this.options.host, this.method);
         const timeout = (0, deadline_1.getRelativeTimeout)(options.deadline);
         if (timeout !== Infinity) {
             if (timeout <= 0) {
@@ -47671,7 +48294,7 @@ class SubchannelCallWrapper {
                 }
             }
         };
-        this.childCall = this.subchannel.createCall(credsMetadata, this.options.host, this.method, childListener);
+        this.childCall = this.subchannel.createCall(credsMetadata, this.options.host, this.method, childListener, this.callNumber);
         if (this.readPending) {
             this.childCall.startRead();
         }
@@ -48275,11 +48898,13 @@ class Http2SubchannelCall {
         const maxReceiveMessageLength = (_a = transport.getOptions()['grpc.max_receive_message_length']) !== null && _a !== void 0 ? _a : constants_1.DEFAULT_MAX_RECEIVE_MESSAGE_LENGTH;
         this.decoder = new stream_decoder_1.StreamDecoder(maxReceiveMessageLength);
         http2Stream.on('response', (headers, flags) => {
-            let headersString = '';
-            for (const header of Object.keys(headers)) {
-                headersString += '\t\t' + header + ': ' + headers[header] + '\n';
+            if (this.traceEnabled) {
+                let headersString = '';
+                for (const header of Object.keys(headers)) {
+                    headersString += '\t\t' + header + ': ' + headers[header] + '\n';
+                }
+                this.trace('Received server headers:\n' + headersString);
             }
-            this.trace('Received server headers:\n' + headersString);
             this.httpStatusCode = headers[':status'];
             if (flags & http2.constants.NGHTTP2_FLAG_END_STREAM) {
                 this.handleTrailers(headers);
@@ -48309,7 +48934,9 @@ class Http2SubchannelCall {
             if (this.statusOutput) {
                 return;
             }
-            this.trace('receive HTTP/2 data frame of length ' + data.length);
+            if (this.traceEnabled) {
+                this.trace('receive HTTP/2 data frame of length ' + data.length);
+            }
             let messages;
             try {
                 messages = this.decoder.write(data);
@@ -48335,7 +48962,9 @@ class Http2SubchannelCall {
                 return;
             }
             for (const message of messages) {
-                this.trace('parsed message of length ' + message.length);
+                if (this.traceEnabled) {
+                    this.trace('parsed message of length ' + message.length);
+                }
                 this.callEventTracker.addMessageReceived();
                 this.tryPush(message);
             }
@@ -48351,7 +48980,9 @@ class Http2SubchannelCall {
              * we can bubble up the error message from that event. */
             process.nextTick(() => {
                 var _a;
-                this.trace('HTTP/2 stream closed with code ' + http2Stream.rstCode);
+                if (this.traceEnabled) {
+                    this.trace('HTTP/2 stream closed with code ' + http2Stream.rstCode);
+                }
                 /* If we have a final status with an OK status code, that means that
                  * we have received all of the messages and we have processed the
                  * trailers and the call completed successfully, so it doesn't matter
@@ -48454,14 +49085,16 @@ class Http2SubchannelCall {
              * https://github.com/nodejs/node/blob/8b8620d580314050175983402dfddf2674e8e22a/lib/internal/http2/core.js#L2267
              */
             if (err.code !== 'ERR_HTTP2_STREAM_ERROR') {
-                this.trace('Node error event: message=' +
-                    err.message +
-                    ' code=' +
-                    err.code +
-                    ' errno=' +
-                    getSystemErrorName(err.errno) +
-                    ' syscall=' +
-                    err.syscall);
+                if (this.traceEnabled) {
+                    this.trace('Node error event: message=' +
+                        err.message +
+                        ' code=' +
+                        err.code +
+                        ' errno=' +
+                        getSystemErrorName(err.errno) +
+                        ' syscall=' +
+                        err.syscall);
+                }
                 this.internalError = err;
             }
             this.callEventTracker.onStreamEnd(false);
@@ -48486,11 +49119,13 @@ class Http2SubchannelCall {
         /* Precondition: this.finalStatus !== null */
         if (!this.statusOutput) {
             this.statusOutput = true;
-            this.trace('ended with status: code=' +
-                this.finalStatus.code +
-                ' details="' +
-                this.finalStatus.details +
-                '"');
+            if (this.traceEnabled) {
+                this.trace('ended with status: code=' +
+                    this.finalStatus.code +
+                    ' details="' +
+                    this.finalStatus.details +
+                    '"');
+            }
             this.callEventTracker.onCallEnd(this.finalStatus);
             /* We delay the actual action of bubbling up the status to insulate the
              * cleanup code in this class from any errors that may be thrown in the
@@ -48508,8 +49143,13 @@ class Http2SubchannelCall {
             this.http2Stream.resume();
         }
     }
+    get traceEnabled() {
+        return logging.isTracerEnabled(TRACER_NAME);
+    }
     trace(text) {
-        logging.trace(constants_2.LogVerbosity.DEBUG, TRACER_NAME, '[' + this.callId + '] ' + text);
+        if (this.traceEnabled) {
+            logging.trace(constants_2.LogVerbosity.DEBUG, TRACER_NAME, '[' + this.callId + '] ' + text);
+        }
     }
     /**
      * On first call, emits a 'status' event with the given StatusObject.
@@ -48540,8 +49180,10 @@ class Http2SubchannelCall {
         }
     }
     push(message) {
-        this.trace('pushing to reader message of length ' +
-            (message instanceof Buffer ? message.length : null));
+        if (this.traceEnabled) {
+            this.trace('pushing to reader message of length ' +
+                (message instanceof Buffer ? message.length : null));
+        }
         this.canPush = false;
         this.isPushPending = true;
         process.nextTick(() => {
@@ -48563,18 +49205,22 @@ class Http2SubchannelCall {
             this.push(messageBytes);
         }
         else {
-            this.trace('unpushedReadMessages.push message of length ' + messageBytes.length);
+            if (this.traceEnabled) {
+                this.trace('unpushedReadMessages.push message of length ' + messageBytes.length);
+            }
             this.unpushedReadMessages.push(messageBytes);
         }
     }
     handleTrailers(headers) {
         this.serverEndedCall = true;
         this.callEventTracker.onStreamEnd(true);
-        let headersString = '';
-        for (const header of Object.keys(headers)) {
-            headersString += '\t\t' + header + ': ' + headers[header] + '\n';
+        if (this.traceEnabled) {
+            let headersString = '';
+            for (const header of Object.keys(headers)) {
+                headersString += '\t\t' + header + ': ' + headers[header] + '\n';
+            }
+            this.trace('Received server trailers:\n' + headersString);
         }
-        this.trace('Received server trailers:\n' + headersString);
         let metadata;
         try {
             metadata = metadata_1.Metadata.fromHttp2Headers(headers);
@@ -48582,27 +49228,33 @@ class Http2SubchannelCall {
         catch (e) {
             metadata = new metadata_1.Metadata();
         }
-        const metadataMap = metadata.getMap();
+        const statusValues = metadata.get('grpc-status');
         let status;
-        if (typeof metadataMap['grpc-status'] === 'string') {
-            const receivedStatus = Number(metadataMap['grpc-status']);
-            this.trace('received status code ' + receivedStatus + ' from server');
+        if (statusValues.length > 0 && typeof statusValues[0] === 'string') {
+            const receivedStatus = Number(statusValues[0]);
+            if (this.traceEnabled) {
+                this.trace('received status code ' + receivedStatus + ' from server');
+            }
             metadata.remove('grpc-status');
             let details = '';
-            if (typeof metadataMap['grpc-message'] === 'string') {
+            const messageValues = metadata.get('grpc-message');
+            if (messageValues.length > 0 && typeof messageValues[0] === 'string') {
+                const messageString = messageValues[0];
                 try {
-                    details = decodeURI(metadataMap['grpc-message']);
+                    details = decodeURI(messageString);
                 }
-                catch (e) {
-                    details = metadataMap['grpc-message'];
+                catch (error) {
+                    details = messageString;
                 }
                 metadata.remove('grpc-message');
-                this.trace('received status details string "' + details + '" from server');
+                if (this.traceEnabled) {
+                    this.trace('received status details string "' + details + '" from server');
+                }
             }
             status = {
                 code: receivedStatus,
                 details: details,
-                metadata: metadata
+                metadata: metadata,
             };
         }
         else if (this.httpStatusCode) {
@@ -48613,7 +49265,7 @@ class Http2SubchannelCall {
             status = {
                 code: constants_1.Status.UNKNOWN,
                 details: 'No status information received',
-                metadata: metadata
+                metadata: metadata,
             };
         }
         // This is a no-op if the call was already ended when handling headers.
@@ -48628,9 +49280,20 @@ class Http2SubchannelCall {
         }
         /* If the server ended the call, sending an RST_STREAM is redundant, so we
          * just half close on the client side instead to finish closing the stream.
+         *
+         * Only call end() if writableEnded is false. For unary and server-streaming
+         * calls (and client streams where the client already finished sending),
+         * halfClose() has already called http2Stream.end(). Calling end() again on
+         * an already finished Node stream causes Node core stream internals to
+         * construct an ERR_STREAM_ALREADY_FINISHED Error (which synchronously captures
+         * a full native V8 stack trace) and immediately discard it because no callback
+         * is passed. On high-throughput workloads, this causes unnecessary CPU
+         * overhead and garbage collection pressure.
          */
         if (this.serverEndedCall) {
-            this.http2Stream.end();
+            if (!this.http2Stream.writableEnded) {
+                this.http2Stream.end();
+            }
         }
         else {
             /* If the call has ended with an OK status, communicate that when closing
@@ -48643,12 +49306,16 @@ class Http2SubchannelCall {
             else {
                 code = http2.constants.NGHTTP2_CANCEL;
             }
-            this.trace('close http2 stream with code ' + code);
+            if (this.traceEnabled) {
+                this.trace('close http2 stream with code ' + code);
+            }
             this.http2Stream.close(code);
         }
     }
     cancelWithStatus(status, details) {
-        this.trace('cancelWithStatus code: ' + status + ' details: "' + details + '"');
+        if (this.traceEnabled) {
+            this.trace('cancelWithStatus code: ' + status + ' details: "' + details + '"');
+        }
         this.endCall({ code: status, details, metadata: new metadata_1.Metadata() });
     }
     getStatus() {
@@ -48682,7 +49349,9 @@ class Http2SubchannelCall {
         this.http2Stream.resume();
     }
     sendMessageWithContext(context, message) {
-        this.trace('write() called with message of length ' + message.length);
+        if (this.traceEnabled) {
+            this.trace('write() called with message of length ' + message.length);
+        }
         const cb = (error) => {
             /* nextTick here ensures that no stream action can be taken in the call
              * stack of the write callback, in order to hopefully work around
@@ -48695,12 +49364,19 @@ class Http2SubchannelCall {
                     code = constants_1.Status.INTERNAL;
                 }
                 if (error) {
-                    this.cancelWithStatus(code, `Write error: ${error.message}`);
+                    this.endCall({
+                        code,
+                        details: `Write error: ${error.message}`,
+                        metadata: new metadata_1.Metadata(),
+                        rstCode: this.http2Stream.rstCode,
+                    });
                 }
                 (_a = context.callback) === null || _a === void 0 ? void 0 : _a.call(context);
             });
         };
-        this.trace('sending data chunk of length ' + message.length);
+        if (this.traceEnabled) {
+            this.trace('sending data chunk of length ' + message.length);
+        }
         this.callEventTracker.addMessageSent();
         try {
             this.http2Stream.write(message, cb);
@@ -48715,6 +49391,14 @@ class Http2SubchannelCall {
     }
     halfClose() {
         this.trace('end() called');
+        /* Calling end() on a stream that is already ended or destroyed causes Node
+         * core stream internals to construct ERR_STREAM_ALREADY_FINISHED or
+         * ERR_STREAM_DESTROYED Error instances with synchronous native V8 stack traces,
+         * which are immediately discarded when no callback is passed.
+         */
+        if (this.http2Stream.destroyed || this.http2Stream.writableEnded) {
+            return;
+        }
         this.trace('calling end() on HTTP/2 stream');
         this.http2Stream.end();
     }
@@ -49095,8 +49779,10 @@ class Subchannel {
         }
         this.channelzRef = (0, channelz_1.registerChannelzSubchannel)(this.subchannelAddressString, () => this.getChannelzInfo(), this.channelzEnabled);
         this.channelzTrace.addTrace('CT_INFO', 'Subchannel created');
-        this.trace('Subchannel constructed with options ' +
-            JSON.stringify(options, undefined, 2));
+        if (this.traceEnabled) {
+            this.trace('Subchannel constructed with options ' +
+                JSON.stringify(options, undefined, 2));
+        }
         this.secureConnector = credentials._createSecureConnector(channelTarget, options);
     }
     getChannelzInfo() {
@@ -49108,21 +49794,31 @@ class Subchannel {
             target: this.subchannelAddressString,
         };
     }
+    get traceEnabled() {
+        return logging.isTracerEnabled(TRACER_NAME);
+    }
+    get refTraceEnabled() {
+        return logging.isTracerEnabled('subchannel_refcount');
+    }
     trace(text) {
-        logging.trace(constants_1.LogVerbosity.DEBUG, TRACER_NAME, '(' +
-            this.channelzRef.id +
-            ') ' +
-            this.subchannelAddressString +
-            ' ' +
-            text);
+        if (this.traceEnabled) {
+            logging.trace(constants_1.LogVerbosity.DEBUG, TRACER_NAME, '(' +
+                this.channelzRef.id +
+                ') ' +
+                this.subchannelAddressString +
+                ' ' +
+                text);
+        }
     }
     refTrace(text) {
-        logging.trace(constants_1.LogVerbosity.DEBUG, 'subchannel_refcount', '(' +
-            this.channelzRef.id +
-            ') ' +
-            this.subchannelAddressString +
-            ' ' +
-            text);
+        if (this.refTraceEnabled) {
+            logging.trace(constants_1.LogVerbosity.DEBUG, 'subchannel_refcount', '(' +
+                this.channelzRef.id +
+                ') ' +
+                this.subchannelAddressString +
+                ' ' +
+                text);
+        }
     }
     handleBackoffTimer() {
         if (this.continueConnecting) {
@@ -49185,16 +49881,20 @@ class Subchannel {
         if (oldStates.indexOf(this.connectivityState) === -1) {
             return false;
         }
-        if (errorMessage) {
-            this.trace(connectivity_state_1.ConnectivityState[this.connectivityState] +
-                ' -> ' +
-                connectivity_state_1.ConnectivityState[newState] +
-                ' with error "' + errorMessage + '"');
-        }
-        else {
-            this.trace(connectivity_state_1.ConnectivityState[this.connectivityState] +
-                ' -> ' +
-                connectivity_state_1.ConnectivityState[newState]);
+        if (this.traceEnabled) {
+            if (errorMessage) {
+                this.trace(connectivity_state_1.ConnectivityState[this.connectivityState] +
+                    ' -> ' +
+                    connectivity_state_1.ConnectivityState[newState] +
+                    ' with error "' +
+                    errorMessage +
+                    '"');
+            }
+            else {
+                this.trace(connectivity_state_1.ConnectivityState[this.connectivityState] +
+                    ' -> ' +
+                    connectivity_state_1.ConnectivityState[newState]);
+            }
         }
         if (this.channelzEnabled) {
             this.channelzTrace.addTrace('CT_INFO', 'Connectivity state change to ' + connectivity_state_1.ConnectivityState[newState]);
@@ -49241,11 +49941,15 @@ class Subchannel {
         return true;
     }
     ref() {
-        this.refTrace('refcount ' + this.refcount + ' -> ' + (this.refcount + 1));
+        if (this.refTraceEnabled) {
+            this.refTrace('refcount ' + this.refcount + ' -> ' + (this.refcount + 1));
+        }
         this.refcount += 1;
     }
     unref() {
-        this.refTrace('refcount ' + this.refcount + ' -> ' + (this.refcount - 1));
+        if (this.refTraceEnabled) {
+            this.refTrace('refcount ' + this.refcount + ' -> ' + (this.refcount - 1));
+        }
         this.refcount -= 1;
         if (this.refcount === 0) {
             this.channelzTrace.addTrace('CT_INFO', 'Shutting down');
@@ -49263,7 +49967,7 @@ class Subchannel {
         }
         return false;
     }
-    createCall(metadata, host, method, listener) {
+    createCall(metadata, host, method, listener, callId) {
         if (!this.transport) {
             throw new Error('Cannot create call, subchannel not READY');
         }
@@ -49285,7 +49989,7 @@ class Subchannel {
         else {
             statsTracker = {};
         }
-        return this.transport.createCall(metadata, host, method, listener, statsTracker);
+        return this.transport.createCall(metadata, host, method, listener, statsTracker, callId);
     }
     /**
      * If the subchannel is currently IDLE, start connecting and switch to the
@@ -49554,21 +50258,27 @@ class Http2Transport {
                 opaqueData.equals(tooManyPingsData)) {
                 tooManyPings = true;
             }
-            this.trace('connection closed by GOAWAY with code ' +
-                errorCode +
-                ' and data ' +
-                (opaqueData === null || opaqueData === void 0 ? void 0 : opaqueData.toString()));
+            if (this.traceEnabled) {
+                this.trace('connection closed by GOAWAY with code ' +
+                    errorCode +
+                    ' and data ' +
+                    (opaqueData === null || opaqueData === void 0 ? void 0 : opaqueData.toString()));
+            }
             this.reportDisconnectToOwner(tooManyPings);
         });
         session.once('error', error => {
-            this.trace('connection closed with error ' + error.message);
+            if (this.traceEnabled) {
+                this.trace('connection closed with error ' + error.message);
+            }
             this.handleDisconnect();
         });
         session.socket.once('close', (hadError) => {
-            this.trace('connection closed. hadError=' + hadError);
+            if (this.traceEnabled) {
+                this.trace('connection closed. hadError=' + hadError);
+            }
             this.handleDisconnect();
         });
-        if (logging.isTracerEnabled(TRACER_NAME)) {
+        if (this.traceEnabled) {
             session.on('remoteSettings', (settings) => {
                 this.trace('new settings received' +
                     (this.session !== session ? ' on the old connection' : '') +
@@ -49587,7 +50297,7 @@ class Http2Transport {
         if (this.keepaliveWithoutCalls) {
             this.maybeStartKeepalivePingTimer();
         }
-        if (session.socket instanceof tls_1.TLSSocket) {
+        if (session.socket instanceof tls_1.TLSSocket && session.socket.authorized) {
             this.authContext = {
                 transportSecurityType: 'ssl',
                 sslPeerCertificate: session.socket.getPeerCertificate()
@@ -49644,37 +50354,57 @@ class Http2Transport {
         };
         return socketInfo;
     }
+    get traceEnabled() {
+        return logging.isTracerEnabled(TRACER_NAME);
+    }
+    get keepaliveTraceEnabled() {
+        return logging.isTracerEnabled('keepalive');
+    }
+    get flowControlTraceEnabled() {
+        return logging.isTracerEnabled(FLOW_CONTROL_TRACER_NAME);
+    }
+    get internalsTraceEnabled() {
+        return logging.isTracerEnabled('transport_internals');
+    }
     trace(text) {
-        logging.trace(constants_1.LogVerbosity.DEBUG, TRACER_NAME, '(' +
-            this.channelzRef.id +
-            ') ' +
-            this.subchannelAddressString +
-            ' ' +
-            text);
+        if (this.traceEnabled) {
+            logging.trace(constants_1.LogVerbosity.DEBUG, TRACER_NAME, '(' +
+                this.channelzRef.id +
+                ') ' +
+                this.subchannelAddressString +
+                ' ' +
+                text);
+        }
     }
     keepaliveTrace(text) {
-        logging.trace(constants_1.LogVerbosity.DEBUG, 'keepalive', '(' +
-            this.channelzRef.id +
-            ') ' +
-            this.subchannelAddressString +
-            ' ' +
-            text);
+        if (this.keepaliveTraceEnabled) {
+            logging.trace(constants_1.LogVerbosity.DEBUG, 'keepalive', '(' +
+                this.channelzRef.id +
+                ') ' +
+                this.subchannelAddressString +
+                ' ' +
+                text);
+        }
     }
     flowControlTrace(text) {
-        logging.trace(constants_1.LogVerbosity.DEBUG, FLOW_CONTROL_TRACER_NAME, '(' +
-            this.channelzRef.id +
-            ') ' +
-            this.subchannelAddressString +
-            ' ' +
-            text);
+        if (this.flowControlTraceEnabled) {
+            logging.trace(constants_1.LogVerbosity.DEBUG, FLOW_CONTROL_TRACER_NAME, '(' +
+                this.channelzRef.id +
+                ') ' +
+                this.subchannelAddressString +
+                ' ' +
+                text);
+        }
     }
     internalsTrace(text) {
-        logging.trace(constants_1.LogVerbosity.DEBUG, 'transport_internals', '(' +
-            this.channelzRef.id +
-            ') ' +
-            this.subchannelAddressString +
-            ' ' +
-            text);
+        if (this.internalsTraceEnabled) {
+            logging.trace(constants_1.LogVerbosity.DEBUG, 'transport_internals', '(' +
+                this.channelzRef.id +
+                ') ' +
+                this.subchannelAddressString +
+                ' ' +
+                text);
+        }
     }
     /**
      * Indicate to the owner of this object that this transport should no longer
@@ -49727,7 +50457,9 @@ class Http2Transport {
         if (this.channelzEnabled) {
             this.keepalivesSent += 1;
         }
-        this.keepaliveTrace('Sending ping with timeout ' + this.keepaliveTimeoutMs + 'ms');
+        if (this.keepaliveTraceEnabled) {
+            this.keepaliveTrace('Sending ping with timeout ' + this.keepaliveTimeoutMs + 'ms');
+        }
         this.keepaliveTimer = setTimeout(() => {
             this.keepaliveTimer = null;
             this.keepaliveTrace('Ping timeout passed without response');
@@ -49739,7 +50471,9 @@ class Http2Transport {
             const pingSentSuccessfully = this.session.ping((err, duration, payload) => {
                 this.clearKeepaliveTimeout();
                 if (err) {
-                    this.keepaliveTrace('Ping failed with error ' + err.message);
+                    if (this.keepaliveTraceEnabled) {
+                        this.keepaliveTrace('Ping failed with error ' + err.message);
+                    }
                     this.handleDisconnect();
                 }
                 else {
@@ -49756,7 +50490,9 @@ class Http2Transport {
             pingSendError = (e instanceof Error ? e.message : '') || 'Unknown error';
         }
         if (pingSendError) {
-            this.keepaliveTrace('Ping send failed: ' + pingSendError);
+            if (this.keepaliveTraceEnabled) {
+                this.keepaliveTrace('Ping send failed: ' + pingSendError);
+            }
             this.handleDisconnect();
         }
     }
@@ -49810,7 +50546,7 @@ class Http2Transport {
             }
         }
     }
-    createCall(metadata, host, method, listener, subchannelCallStatsTracker) {
+    createCall(metadata, host, method, listener, subchannelCallStatsTracker, callId) {
         const headers = metadata.toHttp2Headers();
         headers[HTTP2_HEADER_AUTHORITY] = host;
         headers[HTTP2_HEADER_USER_AGENT] = this.userAgent;
@@ -49834,16 +50570,20 @@ class Http2Transport {
             this.handleDisconnect();
             throw e;
         }
-        this.flowControlTrace('local window size: ' +
-            this.session.state.localWindowSize +
-            ' remote window size: ' +
-            this.session.state.remoteWindowSize);
-        this.internalsTrace('session.closed=' +
-            this.session.closed +
-            ' session.destroyed=' +
-            this.session.destroyed +
-            ' session.socket.destroyed=' +
-            this.session.socket.destroyed);
+        if (this.flowControlTraceEnabled) {
+            this.flowControlTrace('local window size: ' +
+                this.session.state.localWindowSize +
+                ' remote window size: ' +
+                this.session.state.remoteWindowSize);
+        }
+        if (this.internalsTraceEnabled) {
+            this.internalsTrace('session.closed=' +
+                this.session.closed +
+                ' session.destroyed=' +
+                this.session.destroyed +
+                ' session.socket.destroyed=' +
+                this.session.socket.destroyed);
+        }
         let eventTracker;
         // eslint-disable-next-line prefer-const
         let call;
@@ -49853,13 +50593,13 @@ class Http2Transport {
                 addMessageSent: () => {
                     var _a;
                     this.messagesSent += 1;
-                    this.lastMessageSentTimestamp = new Date();
+                    this.lastMessageSentTimestamp = Date.now();
                     (_a = subchannelCallStatsTracker.addMessageSent) === null || _a === void 0 ? void 0 : _a.call(subchannelCallStatsTracker);
                 },
                 addMessageReceived: () => {
                     var _a;
                     this.messagesReceived += 1;
-                    this.lastMessageReceivedTimestamp = new Date();
+                    this.lastMessageReceivedTimestamp = Date.now();
                     (_a = subchannelCallStatsTracker.addMessageReceived) === null || _a === void 0 ? void 0 : _a.call(subchannelCallStatsTracker);
                 },
                 onCallEnd: status => {
@@ -49900,7 +50640,7 @@ class Http2Transport {
                 },
             };
         }
-        call = new subchannel_call_1.Http2SubchannelCall(http2Stream, eventTracker, listener, this, (0, call_number_1.getNextCallNumber)());
+        call = new subchannel_call_1.Http2SubchannelCall(http2Stream, eventTracker, listener, this, callId !== null && callId !== void 0 ? callId : (0, call_number_1.getNextCallNumber)());
         this.addActiveCall(call);
         return call;
     }
@@ -49927,8 +50667,13 @@ class Http2SubchannelConnector {
         this.session = null;
         this.isShutdown = false;
     }
+    get traceEnabled() {
+        return logging.isTracerEnabled(TRACER_NAME);
+    }
     trace(text) {
-        logging.trace(constants_1.LogVerbosity.DEBUG, TRACER_NAME, (0, uri_parser_1.uriToString)(this.channelTarget) + ' ' + text);
+        if (this.traceEnabled) {
+            logging.trace(constants_1.LogVerbosity.DEBUG, TRACER_NAME, (0, uri_parser_1.uriToString)(this.channelTarget) + ' ' + text);
+        }
     }
     createSession(secureConnectResult, address, options) {
         if (this.isShutdown) {
@@ -49966,7 +50711,9 @@ class Http2SubchannelConnector {
                 var _a;
                 (_a = this.session) === null || _a === void 0 ? void 0 : _a.destroy();
                 errorMessage = error.message;
-                this.trace('connection failed with error ' + errorMessage);
+                if (this.traceEnabled) {
+                    this.trace('connection failed with error ' + errorMessage);
+                }
                 if (!reportedError) {
                     reportedError = true;
                     reject(`${errorMessage} (${new Date().toISOString()})`);
@@ -50053,14 +50800,22 @@ class Http2SubchannelConnector {
         let secureConnectResult = null;
         const addressString = (0, subchannel_address_1.subchannelAddressToString)(address);
         try {
-            this.trace(addressString + ' Waiting for secureConnector to be ready');
+            if (this.traceEnabled) {
+                this.trace(addressString + ' Waiting for secureConnector to be ready');
+            }
             await secureConnector.waitForReady();
-            this.trace(addressString + ' secureConnector is ready');
+            if (this.traceEnabled) {
+                this.trace(addressString + ' secureConnector is ready');
+            }
             tcpConnection = await this.tcpConnect(address, options);
             tcpConnection.setNoDelay();
-            this.trace(addressString + ' Established TCP connection');
+            if (this.traceEnabled) {
+                this.trace(addressString + ' Established TCP connection');
+            }
             secureConnectResult = await secureConnector.connect(tcpConnection);
-            this.trace(addressString + ' Established secure connection');
+            if (this.traceEnabled) {
+                this.trace(addressString + ' Established secure connection');
+            }
             return this.createSession(secureConnectResult, address, options);
         }
         catch (e) {
@@ -50107,6 +50862,8 @@ exports.parseUri = parseUri;
 exports.splitHostPort = splitHostPort;
 exports.combineHostPort = combineHostPort;
 exports.uriToString = uriToString;
+exports.extractServiceName = extractServiceName;
+exports.computeServiceUrl = computeServiceUrl;
 /*
  * The groups correspond to URI parts as follows:
  * 1. scheme
@@ -50208,6 +50965,31 @@ function uriToString(uri) {
     }
     result += uri.path;
     return result;
+}
+/**
+ * Extracts the service name from a gRPC method path (e.g.
+ * "/package.Service/Method" -> "package.Service").
+ */
+function extractServiceName(methodName) {
+    const firstSlashIndex = methodName.indexOf('/');
+    if (firstSlashIndex === -1) {
+        return '';
+    }
+    const secondSlashIndex = methodName.indexOf('/', firstSlashIndex + 1);
+    if (secondSlashIndex === -1) {
+        return methodName.substring(firstSlashIndex + 1);
+    }
+    return methodName.substring(firstSlashIndex + 1, secondSlashIndex);
+}
+/**
+ * Computes the service URL used by call credentials (e.g.
+ * "https://hostname/serviceName").
+ */
+function computeServiceUrl(host, methodName) {
+    var _a, _b;
+    const serviceName = extractServiceName(methodName);
+    const hostname = (_b = (_a = splitHostPort(host)) === null || _a === void 0 ? void 0 : _a.host) !== null && _b !== void 0 ? _b : 'localhost';
+    return `https://${hostname}/${serviceName}`;
 }
 //# sourceMappingURL=uri-parser.js.map
 
@@ -162349,7 +163131,16 @@ RedirectableRequest.prototype._sanitizeOptions = function (options) {
   if (!options.headers) {
     options.headers = {};
   }
-  if (!isArray(options.sensitiveHeaders)) {
+  // Convert [header1, value1, header2, value2, …] to object
+  else if (Array.isArray(options.headers)) {
+    var headerList = options.headers;
+    options.headers = {};
+    for (var i = 0; i < headerList.length; i += 2) {
+      options.headers[headerList[i]] = headerList[i + 1];
+    }
+  }
+  // Ensure sensitive headers are always present
+  if (!Array.isArray(options.sensitiveHeaders)) {
     options.sensitiveHeaders = [];
   }
 
@@ -162727,10 +163518,6 @@ function isSubdomain(subdomain, domain) {
   return dot > 0 && subdomain[dot] === "." && subdomain.endsWith(domain);
 }
 
-function isArray(value) {
-  return value instanceof Array;
-}
-
 function isString(value) {
   return typeof value === "string" || value instanceof String;
 }
@@ -162748,7 +163535,8 @@ function isURL(value) {
 }
 
 function escapeRegex(regex) {
-  return regex.replace(/[\]\\/()*+?.$]/g, "\\$&");
+  // As per https://tc39.es/proposal-regexp-modifiers/#prod-SyntaxCharacter
+  return regex.replace(/[\^$\\.*+?()[\]{}|]/g, "\\$&");
 }
 
 // Exports
@@ -164149,7 +164937,7 @@ class Gaxios {
                     for await (const chunk of translatedResponse.data) {
                         response.push(chunk);
                     }
-                    translatedResponse.data = response.toString();
+                    translatedResponse.data = Buffer.concat(response.map(c => (typeof c === 'string' ? Buffer.from(c) : c))).toString('utf8');
                 }
                 const errorInfo = common_js_1.GaxiosError.extractAPIErrorFromResponse(translatedResponse, `Request failed with status code ${translatedResponse.status}`);
                 throw new common_js_1.GaxiosError(errorInfo?.message, opts, translatedResponse, errorInfo);
@@ -204023,55 +204811,49 @@ async function isAvailable() {
         // runtime environment. We use the same promise for each of these calls
         // to reduce the network load.
         if (cachedIsAvailableResponse === undefined) {
-            cachedIsAvailableResponse = (async () => {
-                try {
-                    await metadataAccessor('instance', undefined, detectGCPAvailableRetries(), 
-                    // If the default HOST_ADDRESS has been overridden, we should not
-                    // make an effort to try SECONDARY_HOST_ADDRESS (as we are likely in
-                    // a non-GCP environment):
-                    !(process.env.GCE_METADATA_IP || process.env.GCE_METADATA_HOST));
-                    return true;
-                }
-                catch (e) {
-                    const err = e;
-                    if (process.env.DEBUG_AUTH) {
-                        console.info(err);
-                    }
-                    if (err.type === 'request-timeout') {
-                        // If running in a GCP environment, metadata endpoint should return
-                        // within ms.
-                        return false;
-                    }
-                    if (err.response && err.response.status === 404) {
-                        return false;
-                    }
-                    else {
-                        const codes = e instanceof Error && e.name === 'AggregateError'
-                            ? e.errors.map((error) => error.code ? error.code.toString() : 'UNKNOWN')
-                            : [err.code ? err.code.toString() : 'UNKNOWN'];
-                        const isExpected = codes.every((code) => [
-                            'EHOSTDOWN',
-                            'EHOSTUNREACH',
-                            'ENETUNREACH',
-                            'ENOENT',
-                            'ENOTFOUND',
-                            'ECONNREFUSED',
-                        ].includes(code));
-                        if (!isExpected) {
-                            const code = err.code ? err.code.toString() : 'UNKNOWN';
-                            process.emitWarning(`received unexpected error = ${err.message} code = ${code}`, 'MetadataLookupWarning');
-                        }
-                        // Failure to resolve the metadata service means that it is not available.
-                        return false;
-                    }
-                }
-            })();
+            cachedIsAvailableResponse = metadataAccessor('instance', undefined, detectGCPAvailableRetries(), 
+            // If the default HOST_ADDRESS has been overridden, we should not
+            // make an effort to try SECONDARY_HOST_ADDRESS (as we are likely in
+            // a non-GCP environment):
+            !(process.env.GCE_METADATA_IP || process.env.GCE_METADATA_HOST));
         }
-        return await cachedIsAvailableResponse;
+        await cachedIsAvailableResponse;
+        return true;
     }
     catch (e) {
-        // This block should technically not be reached because the async IIFE catches its own errors
-        return false;
+        const err = e;
+        if (process.env.DEBUG_AUTH) {
+            console.info(err);
+        }
+        if (err.type === 'request-timeout') {
+            // If running in a GCP environment, metadata endpoint should return
+            // within ms.
+            return false;
+        }
+        if (err.response && err.response.status === 404) {
+            return false;
+        }
+        else {
+            if (!(err.response && err.response.status === 404) &&
+                // A warning is emitted if we see an unexpected err.code, or err.code
+                // is not populated:
+                (!err.code ||
+                    ![
+                        'EHOSTDOWN',
+                        'EHOSTUNREACH',
+                        'ENETUNREACH',
+                        'ENOENT',
+                        'ENOTFOUND',
+                        'ECONNREFUSED',
+                    ].includes(err.code.toString()))) {
+                let code = 'UNKNOWN';
+                if (err.code)
+                    code = err.code.toString();
+                process.emitWarning(`received unexpected error = ${err.message} code = ${code}`, 'MetadataLookupWarning');
+            }
+            // Failure to resolve the metadata service means that it is not available.
+            return false;
+        }
     }
 }
 /**
@@ -214385,7 +215167,7 @@ exports.visitAsync = visitAsync;
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 "use strict";
-/*! Axios v1.19.0 Copyright (c) 2026 Matt Zabriskie and contributors */
+/*! Axios v1.21.1 Copyright (c) 2026 Matt Zabriskie and contributors */
 
 
 var FormData$1 = __nccwpck_require__(96454);
@@ -214432,13 +215214,57 @@ const {
 const hasOwnProperty = (({
   hasOwnProperty
 }) => (obj, prop) => hasOwnProperty.call(obj, prop))(Object.prototype);
+const isUnsafeObjectKey = prop => typeof prop === 'string' && (prop === '__proto__' || prop === 'constructor' || prop === 'prototype');
 
 /**
- * Walk the prototype chain (excluding the shared Object.prototype) looking for
- * an own `prop`. This distinguishes genuine own/inherited members — including
- * class accessors and template prototypes — from members injected via
- * Object.prototype pollution (e.g. `Object.prototype.username = '...'`), which
- * live on Object.prototype itself and are therefore never matched.
+ * Determine whether an inherited object must be treated as a shared-prototype
+ * boundary. Cross-realm Object.prototype objects cannot be distinguished
+ * reliably from application-created null-prototype objects because their
+ * properties are mutable, so all inherited terminal prototypes are excluded
+ * as a fail-closed boundary. A null-prototype source still keeps its own
+ * properties, as produced by mergeConfig and other safe materialization paths.
+ *
+ * @param {*} obj The object to inspect
+ * @param {*} prototype The object's prototype
+ * @param {boolean} source Whether obj is the original traversal source
+ *
+ * @returns {boolean} True when obj is a safe prototype traversal boundary
+ */
+const isPrototypeBoundary = (obj, prototype, source) => obj === Object.prototype || !source && prototype === null;
+
+/**
+ * Determine whether an object can retain its identity through code paths that
+ * add, replace, and remove config properties without bypassing unsafe-key
+ * filtering. Immutable objects, unsafe-key-bearing objects, and objects with
+ * accessor or restricted data properties must be materialized instead.
+ *
+ * @param {*} obj The object to inspect
+ *
+ * @returns {boolean} True when every own property is safe and fully mutable
+ */
+const isSafeAndFullyMutable = obj => {
+  if (!Object.isExtensible(obj)) {
+    return false;
+  }
+  const props = Object.getOwnPropertyNames(obj);
+  if (Object.getOwnPropertySymbols) {
+    props.push(...Object.getOwnPropertySymbols(obj));
+  }
+  return props.every(prop => {
+    if (isUnsafeObjectKey(prop)) {
+      return false;
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(obj, prop);
+    return !!descriptor && descriptor.configurable && descriptor.writable === true;
+  });
+};
+
+/**
+ * Walk the prototype chain (excluding the source realm's Object.prototype)
+ * looking for an own `prop`. This distinguishes genuine own/inherited members
+ * — including class accessors and template prototypes — from members injected
+ * via Object.prototype pollution (e.g. `Object.prototype.username = '...'`),
+ * which live on Object.prototype itself and are therefore never matched.
  *
  * @param {*} thing The value whose chain to inspect
  * @param {string|symbol} prop The property key to look for
@@ -214448,15 +215274,19 @@ const hasOwnProperty = (({
 const hasOwnInPrototypeChain = (thing, prop) => {
   let obj = thing;
   const seen = [];
-  while (obj != null && obj !== Object.prototype) {
+  while (obj != null) {
     if (seen.indexOf(obj) !== -1) {
       return false;
     }
     seen.push(obj);
+    const prototype = getPrototypeOf(obj);
+    if (isPrototypeBoundary(obj, prototype, obj === thing)) {
+      return false;
+    }
     if (hasOwnProperty(obj, prop)) {
       return true;
     }
-    obj = getPrototypeOf(obj);
+    obj = prototype;
   }
   return false;
 };
@@ -214473,6 +215303,56 @@ const hasOwnInPrototypeChain = (thing, prop) => {
  * @returns {*} The resolved value, or undefined when unsafe/absent
  */
 const getSafeProp = (obj, prop) => obj != null && hasOwnInPrototypeChain(obj, prop) ? obj[prop] : undefined;
+
+/**
+ * Flatten an object and its application-defined prototype chain into a
+ * null-prototype object. Members inherited only from the source realm's
+ * Object.prototype are deliberately excluded, while class/template members
+ * below that boundary are preserved.
+ *
+ * @param {*} thing The value to flatten
+ *
+ * @returns {*} A null-prototype copy, or the original value when it is already
+ * structurally safe or is not an object
+ */
+const toSafeFlatObject = thing => {
+  if (thing == null || typeof thing !== 'object' && typeof thing !== 'function') {
+    return thing;
+  }
+  const sourcePrototype = getPrototypeOf(thing);
+  if (sourcePrototype === null && isSafeAndFullyMutable(thing)) {
+    return thing;
+  }
+  const result = Object.create(null);
+  const merged = Object.create(null);
+  const seen = [];
+  let current = thing;
+  while (current != null) {
+    if (seen.indexOf(current) !== -1) {
+      break;
+    }
+    seen.push(current);
+    const prototype = current === thing ? sourcePrototype : getPrototypeOf(current);
+    if (isPrototypeBoundary(current, prototype, current === thing)) {
+      break;
+    }
+    const props = Object.getOwnPropertyNames(current);
+    if (Object.getOwnPropertySymbols) {
+      props.push(...Object.getOwnPropertySymbols(current));
+    }
+    for (const prop of props) {
+      if (isUnsafeObjectKey(prop)) {
+        continue;
+      }
+      if (!hasOwnProperty(merged, prop)) {
+        result[prop] = thing[prop];
+        merged[prop] = true;
+      }
+    }
+    current = prototype;
+  }
+  return result;
+};
 const kindOf = (cache => thing => {
   const str = toString.call(thing);
   return cache[str] || (cache[str] = str.slice(8, -1).toLowerCase());
@@ -214595,11 +215475,17 @@ const isPlainObject = val => {
     return false;
   }
   const prototype = getPrototypeOf(val);
-  return (prototype === null || prototype === Object.prototype || getPrototypeOf(prototype) === null) &&
-  // Treat any genuine (non-Object.prototype-polluted) Symbol.toStringTag or
-  // Symbol.iterator as evidence the value is a tagged/iterable type rather
-  // than a plain object, while ignoring keys injected onto Object.prototype.
-  !hasOwnInPrototypeChain(val, toStringTag) && !hasOwnInPrototypeChain(val, iterator);
+  return (prototype === null || prototype === Object.prototype || getPrototypeOf(prototype) === null) && (
+  // Treat own Symbol.toStringTag or Symbol.iterator members as evidence the
+  // value is tagged/iterable, ignoring members reachable only through shared
+  // or terminal prototype boundaries. This is exactly what
+  // hasOwnInPrototypeChain(val, prop) computes here: every prototype admitted
+  // above (null, Object.prototype, or a terminal null-prototype template) is
+  // a boundary, so the walk never inspects anything but `val`'s own members,
+  // and stops before even those when `val` is itself the boundary
+  // Object.prototype. Checking that inline avoids allocating the walker's
+  // `seen` list twice per call on the mergeConfig / merge hot path.
+  isPrototypeBoundary(val, prototype, true) || !hasOwnProperty(val, toStringTag) && !hasOwnProperty(val, iterator));
 };
 
 /**
@@ -214850,15 +215736,29 @@ function merge(...objs) {
     skipUndefined
   } = isContextDefined(this) && this || {};
   const result = {};
+  // Caseless lookup only applies to string keys — symbol keys are
+  // identity-matched. Every string key that reaches `result` passes through
+  // this index first, so it can never hold two case variants of one key and a
+  // lowercase -> key map is exactly what findKey(result, key) would rescan
+  // Object.keys(result) for on each assignment.
+  const lowerCaseKeys = caseless ? Object.create(null) : null;
   const assignValue = (val, key) => {
     // Skip dangerous property names to prevent prototype pollution
     if (key === '__proto__' || key === 'constructor' || key === 'prototype') {
       return;
     }
-
-    // findKey lowercases the key, so caseless lookup only applies to strings —
-    // symbol keys are identity-matched.
-    const targetKey = caseless && typeof key === 'string' && findKey(result, key) || key;
+    let targetKey = key;
+    if (lowerCaseKeys && typeof key === 'string') {
+      const lowerKey = key.toLowerCase();
+      const knownKey = lowerCaseKeys[lowerKey];
+      // A key recorded but absent from `result` was skipped by skipUndefined;
+      // the later spelling wins then, as it does for findKey.
+      if (knownKey !== undefined && hasOwnProperty(result, knownKey)) {
+        targetKey = knownKey;
+      } else {
+        lowerCaseKeys[lowerKey] = key;
+      }
+    }
     // Read via own-prop only — a bare `result[targetKey]` walks the prototype
     // chain, so a polluted Object.prototype value could surface here and get
     // copied into the merged result.
@@ -214879,7 +215779,7 @@ function merge(...objs) {
       continue;
     }
     forEach(source, assignValue);
-    if (typeof source !== 'object' || isArray(source)) {
+    if (typeof source !== 'object' || isArray(source) || !Object.getOwnPropertySymbols) {
       continue;
     }
     const symbols = Object.getOwnPropertySymbols(source);
@@ -215034,7 +215934,27 @@ const toArray = thing => {
   if (!thing) return null;
   if (isArray(thing)) return thing;
   let i = thing.length;
-  if (!isNumber(i)) return null;
+  if (!Number.isSafeInteger(i) || i < 0 || i > 0xffffffff) return null;
+
+  // Bound the copy by actual indexed properties, including hidden and inherited
+  // members of array-like collections, rather than by the declared length alone.
+  const indexes = new Set();
+  const seen = new Set();
+  let source = thing;
+  while (source != null && indexes.size < i) {
+    if (seen.has(source)) return null;
+    seen.add(source);
+    const prototype = getPrototypeOf(source);
+    if (isPrototypeBoundary(source, prototype, source === thing)) break;
+    Object.getOwnPropertyNames(source).forEach(key => {
+      const index = +key;
+      if (Number.isInteger(index) && index >= 0 && index < i && String(index) === key && hasOwnProperty(source, key)) {
+        indexes.add(index);
+      }
+    });
+    source = prototype;
+  }
+  if (indexes.size !== i) return null;
   const arr = new Array(i);
   while (i-- > 0) {
     arr[i] = thing[i];
@@ -215346,6 +216266,7 @@ var utils$1 = {
   // an alias to avoid ESLint no-prototype-builtins detection
   hasOwnInPrototypeChain,
   getSafeProp,
+  toSafeFlatObject,
   reduceDescriptors,
   freezeMethods,
   toObjectSet,
@@ -215384,7 +216305,8 @@ const ignoreDuplicateOf = utils$1.toObjectSet(['age', 'authorization', 'content-
  * @returns {Object} Headers parsed into an object
  */
 var parseHeaders = rawHeaders => {
-  const parsed = {};
+  // Header names are data, including __proto__; avoid inherited setters.
+  const parsed = Object.create(null);
   let key;
   let val;
   let i;
@@ -215450,7 +216372,7 @@ function toByteStringHeaderObject(headers) {
   return byteStringHeaders;
 }
 
-const $internals = Symbol('internals');
+const $internals$1 = Symbol('internals');
 function normalizeHeader(header) {
   return header && String(header).trim().toLowerCase();
 }
@@ -215554,9 +216476,21 @@ function parseParameters(value) {
   return parameters;
 }
 const isValidHeaderName = str => /^[-_a-zA-Z0-9^`|~,!#$%&'*+.]+$/.test(str.trim());
+
+// `__proto__` is a valid field name, and the one name the uppercase mapping at
+// the bottom of this file cannot reach: it is inherited from Object.prototype
+// instead of being declared on AxiosHeaders.prototype, so `self.__proto__ = v`
+// runs the inherited setter. That silently discards the header, and an array
+// value replaces the instance prototype, taking every method with it.
+// Store it under the same kind of case variant that mapping uses for `set` and
+// `constructor`. Header lookup is caseless, so it reads back under either
+// spelling, and no own `__proto__` slot is ever created for a later
+// `Object.assign` to copy onto a plain object through the same setter.
+const PROTO_HEADER_SLOT = '__Proto__';
+const headerSlot = name => name === '__proto__' ? PROTO_HEADER_SLOT : name;
 function matchHeaderValue(context, value, header, filter, isHeaderNameFilter) {
   if (utils$1.isFunction(filter)) {
-    return filter.call(this, value, header);
+    return filter.call(context, value, header);
   }
   if (isHeaderNameFilter) {
     value = header;
@@ -215601,7 +216535,7 @@ class AxiosHeaders {
       }
       const key = utils$1.findKey(self, lHeader);
       if (!key || self[key] === undefined || _rewrite === true || _rewrite === undefined && self[key] !== false) {
-        self[key || _header] = normalizeValue(_value);
+        self[headerSlot(key || _header)] = normalizeValue(_value);
       }
     }
     const setHeaders = (headers, _rewrite) => utils$1.forEach(headers, (_value, _header) => setHeader(_value, _header, _rewrite));
@@ -215696,7 +216630,7 @@ class AxiosHeaders {
   }
   normalize(format) {
     const self = this;
-    const headers = {};
+    const headers = Object.create(null);
     utils$1.forEach(this, (value, header) => {
       const key = utils$1.findKey(headers, header);
       if (key) {
@@ -215704,7 +216638,7 @@ class AxiosHeaders {
         delete self[header];
         return;
       }
-      const normalized = format ? formatHeader(header) : String(header).trim();
+      const normalized = headerSlot(format ? formatHeader(header) : String(header).trim());
       if (normalized !== header) {
         delete self[header];
       }
@@ -215748,7 +216682,7 @@ class AxiosHeaders {
     return computed;
   }
   static accessor(header) {
-    const internals = this[$internals] = this[$internals] = {
+    const internals = this[$internals$1] = this[$internals$1] = {
       accessors: {}
     };
     const accessors = internals.accessors;
@@ -215853,6 +216787,60 @@ function aggregateErrorMessage(error) {
   }).filter(Boolean).join('; ');
   return message || error.name || 'AggregateError';
 }
+
+// Shared with `Axios.prototype.request`, which splices the reconstructed
+// caller frames in ahead of this marker.
+const CAUSED_BY_SEPARATOR = '\nCaused by: ';
+const $causeStack = Symbol('causeStack');
+
+// Match the section we appended, not marker-like text in an error message or
+// a replacement stack supplied by the caller. Do not re-read the cause's stack.
+function getCauseStackIndex(error, stack) {
+  const causeStack = utils$1.hasOwnProp(error, $causeStack) && error[$causeStack];
+  return causeStack && stack.endsWith(causeStack) ? stack.length - causeStack.length : -1;
+}
+
+/**
+ * Append the stack of a wrapped error to `target.stack`.
+ *
+ * `cause` already exposes the original error for tooling that walks the standard
+ * cause chain, but many error reporters read `stack` and nothing else. Inlining
+ * the wrapped stack there means those reporters surface the underlying failure
+ * instead of the axios frames that normalized it (see #6670).
+ *
+ * Every read is defensive: a custom `Error.prepareStackTrace` hook, a runtime
+ * without stack support, or a replaced `stack` property can leave the value
+ * missing, non-string, or read-only, and normalizing an error must not throw
+ * because of that.
+ *
+ * @param {Error} target The AxiosError being built.
+ * @param {Error} source The error being wrapped.
+ *
+ * @returns {void}
+ */
+function appendCauseStack(target, source) {
+  try {
+    const sourceStack = source && source.stack;
+    if (typeof sourceStack !== 'string' || !sourceStack) {
+      return;
+    }
+    const targetStack = target.stack;
+    if (typeof targetStack !== 'string' || !targetStack) {
+      return;
+    }
+
+    // Each call to `from()` creates a fresh target. Re-wrapping includes the
+    // previous stack verbatim, adding one cause section per wrap.
+    const causeStack = CAUSED_BY_SEPARATOR + sourceStack;
+    target.stack = targetStack + causeStack;
+    Object.defineProperty(target, $causeStack, {
+      __proto__: null,
+      value: causeStack
+    });
+  } catch (e) {
+    // Ignore failures from custom stack hooks or un-writable stack properties.
+  }
+}
 class AxiosError extends Error {
   static from(error, code, config, request, response, customProps) {
     // `AggregateError` (thrown by Node on dual-stack/Happy-Eyeballs connection
@@ -215877,6 +216865,10 @@ class AxiosError extends Error {
       configurable: true
     });
     axiosError.name = error.name;
+
+    // Inline the wrapped stack for reporters that read only `stack`; the `cause`
+    // property above already covers cause-aware tooling.
+    appendCauseStack(axiosError, error);
 
     // Preserve status from the original error if not already set from response
     if (error.status != null && axiosError.status == null) {
@@ -216063,23 +217055,17 @@ function toFormData(obj, formData, options) {
 
   // eslint-disable-next-line no-param-reassign
   formData = formData || new (FormData$1 || FormData)();
-
-  // eslint-disable-next-line no-param-reassign
-  options = utils$1.toFlatObject(options, {
-    metaTokens: true,
-    dots: false,
-    indexes: false
-  }, false, function defined(option, source) {
-    // eslint-disable-next-line no-eq-null,eqeqeq
-    return !utils$1.isUndefined(source[option]);
-  });
-  const metaTokens = options.metaTokens;
+  const option = (name, fallback) => {
+    const value = utils$1.getSafeProp(options, name);
+    return utils$1.isUndefined(value) ? fallback : value;
+  };
+  const metaTokens = option('metaTokens', true);
   // eslint-disable-next-line no-use-before-define
-  const visitor = options.visitor || defaultVisitor;
-  const dots = options.dots;
-  const indexes = options.indexes;
-  const _Blob = options.Blob || typeof Blob !== 'undefined' && Blob;
-  const maxDepth = options.maxDepth === undefined ? DEFAULT_FORM_DATA_MAX_DEPTH : options.maxDepth;
+  const visitor = option('visitor') || defaultVisitor;
+  const dots = option('dots', false);
+  const indexes = option('indexes', false);
+  const _Blob = option('Blob') || typeof Blob !== 'undefined' && Blob;
+  const maxDepth = option('maxDepth', DEFAULT_FORM_DATA_MAX_DEPTH);
   const useBlob = _Blob && utils$1.isSpecCompliantForm(formData);
   const stack = [];
   if (!utils$1.isFunction(visitor)) {
@@ -216292,9 +217278,60 @@ function buildURL(url, params, options) {
   return url;
 }
 
+const $internals = Symbol('internals');
+
+// `handlers` is public and may be replaced with a nullish value by user code;
+// `clear()` has always tolerated that. Treat it as an empty stack rather than
+// dereferencing it.
+function countHandlers(handlers) {
+  return handlers ? handlers.length : 0;
+}
+function trimHandlers(handlers) {
+  if (!handlers) {
+    return;
+  }
+  while (handlers.length && handlers[handlers.length - 1] === null) {
+    handlers.pop();
+  }
+}
+
+// Preserve the array-key coercion used before IDs were stored in a Map, without
+// treating null, empty strings, or noncanonical numeric strings as ID zero.
+function normalizeHandlerId(id) {
+  if (typeof id === 'string' && id !== '' && String(Number(id)) === id) {
+    return Number(id);
+  }
+  return id;
+}
+function syncHandlerEntries(manager, internals) {
+  const handlers = manager.handlers;
+  const length = countHandlers(handlers);
+  if (handlers !== internals.handlersRef) {
+    internals.handlersRef = handlers;
+    internals.handlerEntries.clear();
+  } else if (length !== internals.handlersLength) {
+    if (!length) {
+      internals.handlerEntries.clear();
+    } else {
+      internals.handlerEntries.forEach(function removeStaleEntry(entry, id) {
+        if (handlers[entry.index] !== entry.handler) {
+          internals.handlerEntries.delete(id);
+        }
+      });
+    }
+  }
+  internals.handlersLength = length;
+}
 class InterceptorManager {
   constructor() {
     this.handlers = [];
+    this[$internals] = {
+      handlersRef: this.handlers,
+      handlersLength: this.handlers.length,
+      handlerEntries: new Map(),
+      iterationDepth: 0,
+      nextId: 0
+    };
   }
 
   /**
@@ -216307,13 +217344,25 @@ class InterceptorManager {
    * @return {Number} An ID used to remove interceptor later
    */
   use(fulfilled, rejected, options) {
-    this.handlers.push({
+    const handler = {
       fulfilled,
       rejected,
       synchronous: options ? options.synchronous : false,
       runWhen: options ? options.runWhen : null
+    };
+    const internals = this[$internals];
+    if (this.handlers == null) {
+      this.handlers = [];
+    }
+    syncHandlerEntries(this, internals);
+    const id = internals.nextId++;
+    this.handlers.push(handler);
+    internals.handlerEntries.set(id, {
+      handler,
+      index: this.handlers.length - 1
     });
-    return this.handlers.length - 1;
+    internals.handlersLength = this.handlers.length;
+    return id;
   }
 
   /**
@@ -216324,8 +217373,24 @@ class InterceptorManager {
    * @returns {void}
    */
   eject(id) {
-    if (this.handlers[id]) {
-      this.handlers[id] = null;
+    const internals = this[$internals];
+    syncHandlerEntries(this, internals);
+    const handlerId = normalizeHandlerId(id);
+    const entry = internals.handlerEntries.get(handlerId);
+    if (entry) {
+      internals.handlerEntries.delete(handlerId);
+
+      // Ignore IDs invalidated by clear or direct replacement of handlers.
+      if (this.handlers[entry.index] !== entry.handler) {
+        return;
+      }
+      this.handlers[entry.index] = null;
+
+      // Do not reuse an index while forEach is walking its length snapshot.
+      if (!internals.iterationDepth) {
+        trimHandlers(this.handlers);
+        internals.handlersLength = this.handlers.length;
+      }
     }
   }
 
@@ -216337,6 +217402,7 @@ class InterceptorManager {
   clear() {
     if (this.handlers) {
       this.handlers = [];
+      syncHandlerEntries(this, this[$internals]);
     }
   }
 
@@ -216351,11 +217417,22 @@ class InterceptorManager {
    * @returns {void}
    */
   forEach(fn) {
-    utils$1.forEach(this.handlers, function forEachHandler(h) {
-      if (h !== null) {
-        fn(h);
+    const internals = this[$internals];
+    syncHandlerEntries(this, internals);
+    internals.iterationDepth++;
+    try {
+      utils$1.forEach(this.handlers, function forEachHandler(h) {
+        if (h !== null) {
+          fn(h);
+        }
+      });
+    } finally {
+      if (! --internals.iterationDepth) {
+        syncHandlerEntries(this, internals);
+        trimHandlers(this.handlers);
+        internals.handlersLength = countHandlers(this.handlers);
       }
-    });
+    }
   }
 }
 
@@ -216365,7 +217442,8 @@ var transitionalDefaults = {
   clarifyTimeoutError: false,
   legacyInterceptorReqResOrdering: true,
   advertiseZstdAcceptEncoding: false,
-  validateStatusUndefinedResolves: true
+  validateStatusUndefinedResolves: true,
+  encodeBasicAuthUsername: false
 };
 
 var URLSearchParams = url.URLSearchParams;
@@ -216520,6 +217598,24 @@ function arrayToObject(arr) {
   }
   return obj;
 }
+function normalizeArray(value) {
+  if (!utils$1.isArray(value)) return value;
+  const keys = Object.keys(value);
+  return keys.length !== value.length || keys.some((key, index) => key !== String(index)) ? arrayToObject(value) : value;
+}
+function normalizeArrays(obj) {
+  const pending = [obj];
+  while (pending.length) {
+    const target = pending.pop();
+    Object.keys(target).forEach(key => {
+      const value = target[key] = normalizeArray(target[key]);
+      if (utils$1.isArray(value) || utils$1.isPlainObject(value)) {
+        pending.push(value);
+      }
+    });
+  }
+  return obj;
+}
 
 /**
  * It takes a FormData object and returns a JavaScript object
@@ -216538,6 +217634,7 @@ function formDataToJSON(formData) {
     name = !name && utils$1.isArray(target) ? target.length : name;
     if (isLast) {
       if (utils$1.hasOwnProp(target, name)) {
+        target[name] = normalizeArray(target[name]);
         target[name] = utils$1.isArray(target[name]) ? target[name].concat(value) : [target[name], value];
       } else {
         target[name] = value;
@@ -216558,10 +217655,12 @@ function formDataToJSON(formData) {
     utils$1.forEachEntry(formData, (name, value) => {
       buildPath(parsePropPath(name), value, obj, 0);
     });
-    return obj;
+    return normalizeArrays(obj);
   }
   return null;
 }
+
+const methodList = Object.freeze(['get', 'delete', 'head', 'options', 'post', 'put', 'patch', 'purge', 'link', 'unlink', 'query']);
 
 const own = (obj, key) => obj != null && utils$1.hasOwnProp(obj, key) ? obj[key] : undefined;
 
@@ -216679,7 +217778,7 @@ const defaults = {
     }
   }
 };
-utils$1.forEach(['delete', 'get', 'head', 'post', 'put', 'patch', 'query'], method => {
+utils$1.forEach(methodList, method => {
   defaults.headers[method] = {};
 });
 
@@ -216778,18 +217877,27 @@ function combineURLs(baseURL, relativeURL) {
   return baseURL.slice(0, end) + '/' + relativeURL.replace(/^\/+/, '');
 }
 
-const malformedHttpProtocol = /^https?:(?!\/\/)/i;
-const httpProtocolControlCharacters = /[\t\n\r]/g;
-function stripLeadingC0ControlOrSpace(url) {
-  let i = 0;
-  while (i < url.length && url.charCodeAt(i) <= 0x20) {
-    i++;
-  }
-  return url.slice(i);
-}
+const urlParserControlCharacters = /[\t\n\r]/g;
+
+/**
+ * Match WHATWG URL preprocessing before checking a URL's protocol.
+ *
+ * @param {string} url
+ *
+ * @returns {string}
+ */
 function normalizeURLForProtocolCheck(url) {
-  return stripLeadingC0ControlOrSpace(url).replace(httpProtocolControlCharacters, '');
+  if (typeof url !== 'string') {
+    return url;
+  }
+  let start = 0;
+  while (start < url.length && url.charCodeAt(start) <= 0x20) {
+    start++;
+  }
+  return url.slice(start).replace(urlParserControlCharacters, '');
 }
+
+const malformedHttpProtocol = /^https?:(?!\/\/)/i;
 
 // Redact the parts of a URL that can carry secrets before it is embedded in an
 // error message. AxiosError.toJSON() serializes `message` verbatim and errors
@@ -216942,16 +218050,19 @@ function getEnv(key) {
   return process.env[key.toLowerCase()] || process.env[key.toUpperCase()] || '';
 }
 
-const VERSION = "1.19.0";
+const VERSION = "1.21.1";
 
 function parseProtocol(url) {
   const match = /^([-+\w]{1,25}):(?:\/\/)?/.exec(url);
-  return match && match[1] || '';
+  return match && match[1].toLowerCase() || '';
 }
 
 // RFC 2397: data:[<mediatype>][;base64],<data>
 // mediatype = type/subtype followed by optional ;name=value parameters
-const DATA_URL_PATTERN = /^([^,;]+\/[^,;]+)?((?:;[^,;=]+=[^,;]+)*)(;base64)?,([\s\S]*)$/;
+// The `i` flag makes the `;base64` token case-insensitive, matching the WHATWG
+// URL/Fetch data URL processor (and therefore the fetch adapter and browsers).
+// The remaining character classes do not depend on letter case.
+const DATA_URL_PATTERN = /^([^,;/]+\/[^,;/]+)?((?:;[^,;=]+=[^,;]+)*)(;base64)?,([\s\S]*)$/i;
 
 /**
  * Parse data uri to a Buffer or Blob
@@ -216988,7 +218099,7 @@ function fromDataURI(uri, asBlob, options) {
     } else if (params) {
       mime = 'text/plain' + params;
     }
-    const buffer = encoding === 'base64' ? Buffer.from(body, 'base64') : Buffer.from(decodeURIComponent(body), encoding);
+    const buffer = encoding === 'base64' ? Buffer.from(body.replace(/%([\da-f]{2})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16))), 'base64') : Buffer.from(decodeURIComponent(body), encoding);
     if (asBlob) {
       if (!_Blob) {
         throw new AxiosError('Blob is not supported', AxiosError.ERR_NOT_SUPPORT);
@@ -217077,7 +218188,10 @@ class AxiosTransformStream extends stream.Transform {
     const timeWindow = internals.timeWindow;
     const divider = 1000 / timeWindow;
     const bytesThreshold = maxRate / divider;
-    const minChunkSize = internals.minChunkSize !== false ? Math.max(internals.minChunkSize, bytesThreshold * 0.01) : 0;
+    let minChunkSize = internals.minChunkSize !== false ? Math.max(internals.minChunkSize, bytesThreshold * 0.01) : 0;
+    if (maxRate) {
+      minChunkSize = Math.min(bytesThreshold, minChunkSize);
+    }
     const pushChunk = (_chunk, _callback) => {
       const bytes = Buffer.byteLength(_chunk);
       internals.bytesSeen += bytes;
@@ -217093,6 +218207,9 @@ class AxiosTransformStream extends stream.Transform {
       }
     };
     const transformChunk = (_chunk, _callback) => {
+      if (this.destroyed) {
+        return _callback();
+      }
       const chunkSize = Buffer.byteLength(_chunk);
       let chunkRemainder = null;
       let maxChunkSize = readableHighWaterMark;
@@ -217116,7 +218233,9 @@ class AxiosTransformStream extends stream.Transform {
           }, timeWindow - passed);
         }
         if (bytesLeft < maxChunkSize) {
-          maxChunkSize = bytesLeft;
+          // A buffer boundary must consume at least one byte. Carry any
+          // fractional allowance forward in the next accounting window.
+          maxChunkSize = Math.max(1, Math.floor(bytesLeft));
         }
       }
       if (maxChunkSize && chunkSize > maxChunkSize && chunkSize - maxChunkSize > minChunkSize) {
@@ -217157,8 +218276,8 @@ const readBlob = async function* (blob) {
 
 const BOUNDARY_ALPHABET = platform.ALPHABET.ALPHA_DIGIT + '-_';
 const textEncoder = typeof TextEncoder === 'function' ? new TextEncoder() : new util.TextEncoder();
-const CRLF = '\r\n';
-const CRLF_BYTES = textEncoder.encode(CRLF);
+const CRLF$1 = '\r\n';
+const CRLF_BYTES = textEncoder.encode(CRLF$1);
 const CRLF_BYTES_COUNT = 2;
 class FormDataPart {
   constructor(name, value) {
@@ -217166,14 +218285,14 @@ class FormDataPart {
       escapeName
     } = this.constructor;
     const isStringValue = utils$1.isString(value);
-    let headers = `Content-Disposition: form-data; name="${escapeName(name)}"${!isStringValue && value.name ? `; filename="${escapeName(value.name)}"` : ''}${CRLF}`;
+    let headers = `Content-Disposition: form-data; name="${escapeName(name)}"${!isStringValue && value.name ? `; filename="${escapeName(value.name)}"` : ''}${CRLF$1}`;
     if (isStringValue) {
-      value = textEncoder.encode(String(value).replace(/\r?\n|\r\n?/g, CRLF));
+      value = textEncoder.encode(String(value).replace(/\r?\n|\r\n?/g, CRLF$1));
     } else {
       const safeType = String(value.type || 'application/octet-stream').replace(/[\r\n]/g, '');
-      headers += `Content-Type: ${safeType}${CRLF}`;
+      headers += `Content-Type: ${safeType}${CRLF$1}`;
     }
-    this.headers = textEncoder.encode(headers + CRLF);
+    this.headers = textEncoder.encode(headers + CRLF$1);
     this.contentLength = isStringValue ? value.byteLength : value.size;
     this.size = this.headers.byteLength + this.contentLength + CRLF_BYTES_COUNT;
     this.name = name;
@@ -217211,8 +218330,8 @@ const formDataToStream = (form, headersHandler, options) => {
   if (boundary.length < 1 || boundary.length > 70) {
     throw new Error('boundary must be 1-70 characters long');
   }
-  const boundaryBytes = textEncoder.encode('--' + boundary + CRLF);
-  const footerBytes = textEncoder.encode('--' + boundary + '--' + CRLF);
+  const boundaryBytes = textEncoder.encode('--' + boundary + CRLF$1);
+  const footerBytes = textEncoder.encode('--' + boundary + '--' + CRLF$1);
   let contentLength = footerBytes.byteLength;
   const parts = Array.from(form.entries()).map(([name, value]) => {
     const part = new FormDataPart(name, value);
@@ -217264,7 +218383,7 @@ class Http2Sessions {
     this.sessions = Object.create(null);
   }
   getSession(authority, options) {
-    options = Object.assign({
+    options = Object.assign(Object.create(null), {
       sessionTimeout: 1000
     }, options);
     let authoritySessions = this.sessions[authority];
@@ -217320,7 +218439,7 @@ class Http2Sessions {
           timer = null;
         }
         stream.once('close', () => {
-          if (! --streamsCount) {
+          if (! --streamsCount && !removed) {
             timer = setTimeout(() => {
               timer = null;
               removeSession();
@@ -217331,6 +218450,8 @@ class Http2Sessions {
       };
     }
     session.once('close', removeSession);
+    session.once('error', removeSession);
+    session.once('goaway', removeSession);
     let entry = [session, options];
     authoritySessions ? authoritySessions.push(entry) : authoritySessions = this.sessions[authority] = [entry];
     return session;
@@ -217351,6 +218472,13 @@ const callbackify = (fn, reducer) => {
 };
 
 const LOOPBACK_HOSTNAMES = new Set(['localhost', '0.0.0.0']);
+const trimTrailingDots = value => {
+  let end = value.length;
+  while (end && value.charCodeAt(end - 1) === 46) {
+    end--;
+  }
+  return end === value.length ? value : value.slice(0, end);
+};
 const isIPv4Loopback = host => {
   const parts = host.split('.');
   if (parts.length !== 4) return false;
@@ -217406,7 +218534,7 @@ const normalizeIPAddress = host => {
   if (h.charAt(0) === '[' && h.charAt(h.length - 1) === ']') {
     h = h.slice(1, -1);
   }
-  h = h.replace(/\.+$/, '');
+  h = trimTrailingDots(h);
 
   // Allowed characters for any IPv4 shape: digits, dot, 'x', 'X', hex digits.
   if (!/^[0-9.xXa-fA-F]+$/.test(h)) return host;
@@ -217561,6 +218689,40 @@ const unmapIPv4MappedIPv6 = host => {
   }
   return host;
 };
+const IPV4_OCTET_RE = /^(?:0|[1-9]\d{0,2})$/;
+const ipv4ToBytes = host => {
+  const parts = host.split('.');
+  return parts.length === 4 && parts.every(part => IPV4_OCTET_RE.test(part) && Number(part) <= 255) ? parts.map(Number) : null;
+};
+const IPV6_GROUP_RE = /^[0-9a-f]{1,4}$/i;
+const ipv6ToBytes = host => {
+  const halves = host.split('::');
+  if (halves.length > 2) {
+    return null;
+  }
+  const groups = halves[0] ? halves[0].split(':') : [];
+  if (halves.length === 2) {
+    const rear = halves[1] ? halves[1].split(':') : [];
+    const missing = 8 - groups.length - rear.length;
+    if (missing < 1) {
+      return null;
+    }
+    groups.push(...new Array(missing).fill('0'), ...rear);
+  }
+  if (groups.length !== 8 || groups.some(group => !IPV6_GROUP_RE.test(group))) {
+    return null;
+  }
+  return groups.flatMap(group => {
+    const value = Number.parseInt(group, 16);
+    return [value >> 8 & 0xff, value & 0xff];
+  });
+};
+const ipToBytes = host => {
+  if (typeof host !== 'string' || !host) {
+    return null;
+  }
+  return host.indexOf(':') !== -1 ? ipv6ToBytes(host) : ipv4ToBytes(host);
+};
 const normalizeNoProxyHost = hostname => {
   if (!hostname) {
     return hostname;
@@ -217568,7 +218730,20 @@ const normalizeNoProxyHost = hostname => {
   if (hostname.charAt(0) === '[' && hostname.charAt(hostname.length - 1) === ']') {
     hostname = hostname.slice(1, -1);
   }
-  const trimmed = hostname.replace(/\.+$/, '');
+  let trimmed = trimTrailingDots(hostname);
+  if (trimmed.indexOf(':') !== -1) {
+    try {
+      trimmed = new URL('http://[' + trimmed + ']/').hostname.slice(1, -1);
+    } catch (_err) {
+      return trimmed;
+    }
+  } else if (/[\u0080-\uffff]/.test(trimmed)) {
+    const prefix = /^[*.]+/.exec(trimmed);
+    const start = prefix ? prefix[0] : '';
+    const ascii = url.domainToASCII(trimmed.slice(start.length));
+    if (!ascii) return '';
+    trimmed = start + trimTrailingDots(ascii);
+  }
 
   // IPv4 shorthand/octal/hex → dotted-decimal; helper is a no-op for inputs
   // containing ':' (IPv6 and IPv4-mapped IPv6) so we fall through to unmap.
@@ -217577,6 +218752,92 @@ const normalizeNoProxyHost = hostname => {
     return ipv4;
   }
   return unmapIPv4MappedIPv6(trimmed);
+};
+const normalizeCidrBase = input => {
+  let base = input;
+  const startsBracket = base.charAt(0) === '[';
+  const endsBracket = base.charAt(base.length - 1) === ']';
+  const hasBracket = base.includes('[') || base.includes(']');
+  if (startsBracket || endsBracket) {
+    if (!startsBracket || !endsBracket) {
+      return null;
+    }
+    base = base.slice(1, -1);
+    if (base.indexOf(':') === -1 || base.includes('[') || base.includes(']')) {
+      return null;
+    }
+  } else if (hasBracket) {
+    return null;
+  }
+  if (!base || base.charAt(base.length - 1) === '.') {
+    return null;
+  }
+  const wasIPv6 = base.indexOf(':') !== -1;
+  if (wasIPv6) {
+    try {
+      base = new URL(`http://[${base}]/`).hostname.slice(1, -1);
+    } catch (_err) {
+      return null;
+    }
+  } else {
+    base = normalizeIPAddress(base);
+    if (!ipv4ToBytes(base)) {
+      return null;
+    }
+  }
+  return {
+    normalized: unmapIPv4MappedIPv6(base),
+    wasIPv6
+  };
+};
+const CIDR_ENTRY_RE = /^(.+)\/(0|[1-9]\d{0,2})$/;
+const parseCidrEntry = entry => {
+  if (entry.indexOf('/') === -1) {
+    return undefined;
+  }
+  const match = CIDR_ENTRY_RE.exec(entry);
+  if (!match) {
+    return null;
+  }
+  let prefix = Number(match[2]);
+  const parsedBase = normalizeCidrBase(match[1]);
+  if (!parsedBase) {
+    return null;
+  }
+  const {
+    normalized,
+    wasIPv6
+  } = parsedBase;
+  if (wasIPv6 && normalized.indexOf(':') === -1) {
+    if (prefix < 96) {
+      return null;
+    }
+    prefix -= 96;
+  }
+  const bytes = ipToBytes(normalized);
+  if (!bytes || prefix > bytes.length * 8) {
+    return null;
+  }
+  return {
+    bytes,
+    prefix
+  };
+};
+const isInSubnet = (addressBytes, networkBytes, prefix) => {
+  const fullBytes = prefix >> 3;
+  for (let i = 0; i < fullBytes; i++) {
+    if (addressBytes[i] !== networkBytes[i]) {
+      return false;
+    }
+  }
+  const remainingBits = prefix & 7;
+  if (remainingBits) {
+    const mask = 0xff << 8 - remainingBits & 0xff;
+    if ((addressBytes[fullBytes] & mask) !== (networkBytes[fullBytes] & mask)) {
+      return false;
+    }
+  }
+  return true;
 };
 function shouldBypassProxy(location) {
   let parsed;
@@ -217594,12 +218855,17 @@ function shouldBypassProxy(location) {
   }
   const port = Number.parseInt(parsed.port, 10) || DEFAULT_PORTS[parsed.protocol.split(':', 1)[0]] || 0;
   const hostname = normalizeNoProxyHost(parsed.hostname.toLowerCase());
+  const hostnameBytes = ipToBytes(hostname);
   return noProxy.split(/[\s,]+/).some(entry => {
     if (!entry) {
       return false;
     }
     if (entry === '*') {
       return true;
+    }
+    const cidr = parseCidrEntry(entry);
+    if (cidr !== undefined) {
+      return cidr !== null && !!hostnameBytes && hostnameBytes.length === cidr.bytes.length && isInSubnet(hostnameBytes, cidr.bytes, cidr.prefix);
     }
     let [entryHost, entryPort] = parseNoProxyEntry(entry);
     entryHost = normalizeNoProxyHost(entryHost);
@@ -217663,7 +218929,7 @@ function speedometer(samplesCount, min) {
  * Throttle decorator
  * @param {Function} fn
  * @param {Number} freq
- * @return {Function}
+ * @return {Array<Function>}
  */
 function throttle(fn, freq) {
   let timestamp = 0;
@@ -217695,14 +218961,15 @@ function throttle(fn, freq) {
     }
   };
   const flush = () => lastArgs && invoke(lastArgs);
-  return [throttled, flush];
+  const flushWith = (...args) => invoke(args);
+  return [throttled, flush, flushWith];
 }
 
 const progressEventReducer = (listener, isDownloadStream, freq = 3) => {
   let bytesNotified = 0;
   const _speedometer = speedometer(50, 250);
   return throttle(e => {
-    if (!e || typeof e.loaded !== 'number') {
+    if (!e || !utils$1.isNumber(e.loaded)) {
       return;
     }
     const rawLoaded = e.loaded;
@@ -217739,7 +219006,7 @@ const asyncDecorator = (fn, scheduler = utils$1.asap) => (...args) => scheduler(
  * Estimate data: URL byte lengths *without* allocating large buffers.
  * - Fetch percent-decodes a base64 body before decoding it.
  * - Node's Buffer.from(body, 'base64') sizes its backing allocation from the
- *   raw body, including ignored characters and content after padding.
+ *   percent-decoded body, including ignored characters and content after padding.
  * - Non-base64 data is percent-decoded and then encoded as UTF-8.
  */
 const isHexDigit = charCode => charCode >= 48 && charCode <= 57 || charCode >= 65 && charCode <= 70 || charCode >= 97 && charCode <= 102;
@@ -217779,6 +219046,27 @@ const estimateBase64BufferAllocation = body => {
   }
   return Math.floor((len - padding) * 3 / 4);
 };
+const estimatePercentDecodedBase64BufferAllocation = body => {
+  // Ordinary Base64 needs only its length and trailing padding.
+  if (body.indexOf('%') === -1) {
+    return estimateBase64BufferAllocation(body);
+  }
+  let length = 0;
+  let previous = 0;
+  let last = 0;
+  for (let i = 0, len = body.length; i < len; i++) {
+    let code = body.charCodeAt(i);
+    if (code === 37 /* '%' */ && isPercentEncodedByte(body, i, len)) {
+      code = hexValue(body.charCodeAt(i + 1)) * 16 + hexValue(body.charCodeAt(i + 2));
+      i += 2;
+    }
+    length++;
+    previous = last;
+    last = code;
+  }
+  const padding = last === 61 ? previous === 61 ? 2 : 1 : 0;
+  return Math.floor((length - padding) * 3 / 4);
+};
 const estimatePercentDecodedBase64Bytes = body => {
   const len = body.length;
   let significant = 0;
@@ -217811,14 +219099,14 @@ const estimatePercentDecodedBase64Bytes = body => {
   }
   return base64Bytes(significant);
 };
-const estimateDataURLBytes = (url, estimateBase64) => {
+const estimateDataURLBytes = (url, estimateBase64, base64Pattern) => {
   if (!url || typeof url !== 'string') return 0;
-  if (!url.startsWith('data:')) return 0;
+  if (!/^data:/i.test(url)) return 0;
   const comma = url.indexOf(',');
   if (comma < 0) return 0;
   const meta = url.slice(5, comma);
   const body = url.slice(comma + 1);
-  const isBase64 = /;base64/i.test(meta);
+  const isBase64 = base64Pattern.test(meta);
   if (isBase64) {
     return estimateBase64(body);
   }
@@ -217861,17 +219149,18 @@ const estimateDataURLBytes = (url, estimateBase64) => {
 function estimateDataURLDecodedBytes(url) {
   // Fetch removes URL fragments before processing a data: URL.
   const fragmentIndex = typeof url === 'string' ? url.indexOf('#') : -1;
-  return estimateDataURLBytes(fragmentIndex === -1 ? url : url.slice(0, fragmentIndex), estimatePercentDecodedBase64Bytes);
+  return estimateDataURLBytes(fragmentIndex === -1 ? url : url.slice(0, fragmentIndex), estimatePercentDecodedBase64Bytes, /; *base64[\t\n\f\r ]*$/i);
 }
 
 /**
- * Estimate the Buffer backing allocation used by Node's raw base64 decoder.
+ * Estimate the Buffer backing allocation used after Node's percent-decoding step.
  *
  * @param {string} url
  * @returns {number}
  */
 function estimateDataURLBufferAllocation(url) {
-  return estimateDataURLBytes(url, estimateBase64BufferAllocation);
+  // Match fromDataURI's case-insensitive protocol and encoding suffix.
+  return estimateDataURLBytes(url, estimatePercentDecodedBase64BufferAllocation, /;base64$/i);
 }
 
 const zlibOptions = {
@@ -217902,6 +219191,15 @@ const isHttps = /https:?/;
 const kAxiosSocketListener = Symbol('axios.http.socketListener');
 const kAxiosCurrentReq = Symbol('axios.http.currentReq');
 
+// A shared listener avoids retaining an adapter context for the lifetime of a
+// pooled socket. EventEmitter invokes listeners with `this` set to the emitter.
+function handleSocketError(err) {
+  const current = this[kAxiosCurrentReq];
+  if (current && !current.destroyed) {
+    current.destroy(err);
+  }
+}
+
 // Tags HttpsProxyAgent instances installed by setProxy() so the redirect path
 // can strip them without clobbering a user-supplied agent that happens to be
 // an HttpsProxyAgent.
@@ -217913,6 +219211,9 @@ const kAxiosInstalledTunnel = Symbol('axios.http.installedTunnel');
 // so unbounded growth is not a concern in practice.
 const tunnelingAgentCache = new Map();
 const tunnelingAgentCacheUser = new WeakMap();
+const directAgents = new WeakMap();
+const directAgentHooks = ['createConnection', 'getName'];
+const nativeAgentPoolHooks = ['addRequest', 'createSocket', 'removeSocket', 'keepSocketAlive', 'reuseSocket', '_getSession', '_cacheSession', '_evictSession'];
 // Minimum minor versions where Node's HTTP Agent supports native proxyEnv
 // handling. Checking the selected agent below also covers startup modes such
 // as NODE_OPTIONS=--use-env-proxy and --no-use-env-proxy precedence.
@@ -217943,32 +219244,88 @@ function isNodeEnvProxyEnabled(agent, nodeVersion = process.versions && process.
 function getProxyEnvAgent(options, configHttpAgent, configHttpsAgent) {
   return isHttps.test(options.protocol) ? configHttpsAgent || https.globalAgent : configHttpAgent || http.globalAgent;
 }
+function getDirectAgent(configuredAgent, transport) {
+  if (!process.allowedNodeEnvironmentFlags || !process.allowedNodeEnvironmentFlags.has('--use-env-proxy')) {
+    return configuredAgent;
+  }
+  const agent = configuredAgent || transport.globalAgent;
+  const options = agent && agent.options;
+  if (!(agent instanceof transport.Agent) || agent.protocol !== transport.globalAgent.protocol || !options || !utils$1.hasOwnProp(options, 'proxyEnv') || typeof options.proxyEnv !== 'object' || options.proxyEnv === null) {
+    return configuredAgent;
+  }
+
+  // These hooks own pool queues or TLS session state. Neither binding them to
+  // the source agent nor copying them without subclass state preserves their
+  // behavior on a separate direct pool.
+  for (const hook of nativeAgentPoolHooks) {
+    if (utils$1.isFunction(transport.Agent.prototype[hook]) && agent[hook] !== transport.Agent.prototype[hook]) {
+      throw new AxiosError('proxy: false cannot adapt an agent overriding ' + hook + '; use an agent constructed without proxyEnv', AxiosError.ERR_BAD_OPTION_VALUE);
+    }
+  }
+
+  // Node snapshots proxyEnv when constructing the agent. Keep this check
+  // conservative even when the caller later removes protocol-specific entries.
+  let direct = directAgents.get(agent);
+  if (!direct) {
+    direct = new transport.Agent({
+      ...options,
+      proxyEnv: undefined
+    });
+
+    // Agent.destroy() does not emit an event. Keep the associated pool under
+    // the configured agent's lifetime, including agents reused after destroy().
+    const destroy = agent.destroy;
+    agent.destroy = function destroyWithDirectAgent() {
+      try {
+        return destroy.apply(this, arguments);
+      } finally {
+        direct.destroy();
+      }
+    };
+    directAgents.set(agent, direct);
+  }
+
+  // Connections and pool keys do not own the direct pool's queues. Preserve
+  // their configured receiver and refresh hooks that change between requests.
+  for (const hook of directAgentHooks) {
+    direct[hook] = agent[hook] === transport.Agent.prototype[hook] ? transport.Agent.prototype[hook] : bind(agent[hook], agent);
+  }
+  return direct;
+}
+function setDirectAgent(options, configHttpAgent, configHttpsAgent) {
+  const secure = isHttps.test(options.protocol);
+  const agent = getDirectAgent(secure ? configHttpsAgent : configHttpAgent, secure ? https : http);
+  options.agent = agent;
+  if (options.agents) {
+    options.agents[secure ? 'https' : 'http'] = agent;
+  }
+}
 function getTunnelingAgent(agentOptions, userHttpsAgent) {
   const key = agentOptions.protocol + '//' + agentOptions.hostname + ':' + (agentOptions.port || '') + '#' + (agentOptions.auth || '');
   const cache = userHttpsAgent ? tunnelingAgentCacheUser.get(userHttpsAgent) || tunnelingAgentCacheUser.set(userHttpsAgent, new Map()).get(userHttpsAgent) : tunnelingAgentCache;
   let agent = cache.get(key);
   if (agent) return agent;
-  // Forward the user's TLS options (custom CA, rejectUnauthorized, client cert,
-  // etc.) into the tunneling agent so they apply to the origin TLS upgrade
-  // performed after CONNECT. Our proxy fields take precedence on conflict.
+  // Preserve per-request TLS options for the proxy connection, with our proxy
+  // fields taking precedence. Global-agent options belong only to the origin
+  // TLS upgrade in the callback below.
   const merged = userHttpsAgent && userHttpsAgent.options ? {
     ...userHttpsAgent.options,
     ...agentOptions
   } : agentOptions;
   agent = new HttpsProxyAgent(merged);
-  if (userHttpsAgent && userHttpsAgent.options) {
-    const originTLSOptions = {
-      ...userHttpsAgent.options
-    };
-    const callback = agent.callback;
-    agent.callback = function axiosTunnelingAgentCallback(req, opts) {
-      // HttpsProxyAgent v5 reads callback opts for the post-CONNECT origin TLS upgrade.
-      return callback.call(this, req, {
-        ...originTLSOptions,
-        ...opts
-      });
-    };
-  }
+  const callback = agent.callback;
+  agent.callback = function axiosTunnelingAgentCallback(req, opts) {
+    // Without a proxy the origin TLS connection would be made by https.globalAgent,
+    // so its options have to reach the tunneled origin too. Resolved per request
+    // because the tunneling agent outlives any one of them.
+    const originTLSAgent = userHttpsAgent || https.globalAgent;
+    const originTLSOptions = originTLSAgent && originTLSAgent.options;
+    // HttpsProxyAgent v5 reads callback opts for the post-CONNECT origin TLS upgrade.
+    return callback.call(this, req, {
+      ...originTLSOptions,
+      ...opts
+    });
+  };
   agent[kAxiosInstalledTunnel] = true;
   cache.set(key, agent);
   return agent;
@@ -218006,6 +219363,10 @@ const http2Sessions = new Http2Sessions();
  * @returns {Object<string, any>}
  */
 function dispatchBeforeRedirect(options, responseDetails, requestDetails) {
+  if (!isSameOriginRedirect(options, requestDetails)) {
+    stripMatchingHeaders(options.headers, new Set(['authorization', 'cookie']));
+    delete options.auth;
+  }
   if (options.beforeRedirects.proxy) {
     options.beforeRedirects.proxy(options);
   }
@@ -218014,6 +219375,9 @@ function dispatchBeforeRedirect(options, responseDetails, requestDetails) {
   }
   if (options.beforeRedirects.sensitiveHeaders) {
     options.beforeRedirects.sensitiveHeaders(options, requestDetails);
+  }
+  if (options.beforeRedirects.direct) {
+    options.beforeRedirects.direct(options);
   }
   if (options.beforeRedirects.config) {
     options.beforeRedirects.config(options, responseDetails, requestDetails);
@@ -218047,13 +219411,14 @@ function isSameOriginRedirect(redirectOptions, requestDetails) {
  * @param {http.ClientRequestArgs} options
  * @param {AxiosProxyConfig} configProxy configuration from Axios options object
  * @param {string} location
+ * @param {boolean} [allowEnvProxy=true] whether environment proxy configuration can be used
  *
- * @returns {http.ClientRequestArgs}
+ * @returns {boolean} whether a proxy applies to the selected transport
  */
-function setProxy(options, configProxy, location, isRedirect, configHttpsAgent, configHttpAgent) {
+function setProxy(options, configProxy, location, isRedirect, configHttpsAgent, configHttpAgent, allowEnvProxy = true) {
   let proxy = configProxy;
   const proxyEnvAgent = getProxyEnvAgent(options, configHttpAgent, configHttpsAgent);
-  if (!proxy && proxy !== false && !isNodeEnvProxyEnabled(proxyEnvAgent)) {
+  if (!proxy && proxy !== false && allowEnvProxy && !isNodeEnvProxyEnabled(proxyEnvAgent)) {
     const proxyUrl = getProxyForUrl(location);
     if (proxyUrl) {
       if (!shouldBypassProxy(location)) {
@@ -218078,6 +219443,9 @@ function setProxy(options, configProxy, location, isRedirect, configHttpsAgent, 
   // (which won't carry the marker) is left alone.
   if (isRedirect && options.agent && options.agent[kAxiosInstalledTunnel]) {
     options.agent = undefined;
+  }
+  if (isRedirect && options.agents && options.agents.https && options.agents.https[kAxiosInstalledTunnel]) {
+    options.agents.https = configHttpsAgent;
   }
   if (proxy) {
     // Read proxy fields without traversing the prototype chain. URL instances expose
@@ -218188,8 +219556,9 @@ function setProxy(options, configProxy, location, isRedirect, configHttpsAgent, 
   options.beforeRedirects.proxy = function beforeRedirect(redirectOptions) {
     // Configure proxy for redirected request, passing the original config proxy to apply
     // the exact same logic as if the redirected request was performed by axios directly.
-    setProxy(redirectOptions, configProxy, redirectOptions.href, true, configHttpsAgent, configHttpAgent);
+    setProxy(redirectOptions, configProxy, redirectOptions.href, true, configHttpsAgent, configHttpAgent, allowEnvProxy);
   };
+  return Boolean(proxy || configProxy !== false && allowEnvProxy && isNodeEnvProxyEnabled(proxyEnvAgent));
 }
 const isHttpAdapterSupported = typeof process !== 'undefined' && utils$1.kindOf(process) === 'process';
 
@@ -218220,7 +219589,7 @@ const resolveFamily = ({
   family
 }) => {
   if (!utils$1.isString(address)) {
-    throw TypeError('address must be a string');
+    throw new AxiosError('address must be a string', AxiosError.ERR_BAD_OPTION_VALUE);
   }
   return {
     address,
@@ -218231,6 +219600,32 @@ const buildAddressEntry = (address, family) => resolveFamily(utils$1.isObject(ad
   address,
   family
 });
+const normalizedLookupCache = new WeakMap();
+const normalizeLookup = lookup => {
+  let normalized = normalizedLookupCache.get(lookup);
+  if (normalized) {
+    return normalized;
+  }
+  const callbackLookup = callbackify(lookup, value => utils$1.isArray(value) ? value : [value]);
+
+  // Support opt.all, which is required by current Node.js releases.
+  normalized = (hostname, opt, cb) => {
+    callbackLookup(hostname, opt, (err, arg0, arg1) => {
+      if (err) {
+        return cb(err);
+      }
+      let addresses;
+      try {
+        addresses = utils$1.isArray(arg0) ? arg0.map(addr => buildAddressEntry(addr)) : [buildAddressEntry(arg0, arg1)];
+      } catch (error) {
+        return cb(error);
+      }
+      opt.all ? cb(err, addresses) : cb(err, addresses[0].address, addresses[0].family);
+    });
+  };
+  normalizedLookupCache.set(lookup, normalized);
+  return normalized;
+};
 const http2Transport = {
   request(options, cb) {
     const authority = options.protocol + '//' + options.hostname + ':' + (options.port || (options.protocol === 'https:' ? 443 : 80));
@@ -218283,10 +219678,11 @@ var httpAdapter = isHttpAdapterSupported && function httpAdapter(config) {
     let family = own('family');
     let httpVersion = own('httpVersion');
     if (httpVersion === undefined) httpVersion = 1;
+    const rawHttpVersion = httpVersion;
     let http2Options = own('http2Options');
+    const configProxy = own('proxy');
     const httpAgent = own('httpAgent');
     const httpsAgent = own('httpsAgent');
-    const configProxy = own('proxy');
     const responseType = own('responseType');
     const responseEncoding = own('responseEncoding');
     const socketPath = own('socketPath');
@@ -218299,26 +219695,20 @@ var httpAdapter = isHttpAdapterSupported && function httpAdapter(config) {
     let rejected = false;
     let req;
     let connectPhaseTimer;
-    httpVersion = +httpVersion;
+    try {
+      httpVersion = +httpVersion;
+    } catch (err) {
+      throw new AxiosError('Invalid protocol version: value is not a number', AxiosError.ERR_BAD_OPTION_VALUE, config);
+    }
     if (Number.isNaN(httpVersion)) {
-      throw TypeError(`Invalid protocol version: '${config.httpVersion}' is not a number`);
+      throw new AxiosError(`Invalid protocol version: '${rawHttpVersion}' is not a number`, AxiosError.ERR_BAD_OPTION_VALUE, config);
     }
     if (httpVersion !== 1 && httpVersion !== 2) {
-      throw TypeError(`Unsupported protocol version '${httpVersion}'`);
+      throw new AxiosError(`Unsupported protocol version '${httpVersion}'`, AxiosError.ERR_BAD_OPTION_VALUE, config);
     }
     const isHttp2 = httpVersion === 2;
     if (lookup) {
-      const _lookup = callbackify(lookup, value => utils$1.isArray(value) ? value : [value]);
-      // hotfix to support opt.all option which is required for node 20.x
-      lookup = (hostname, opt, cb) => {
-        _lookup(hostname, opt, (err, arg0, arg1) => {
-          if (err) {
-            return cb(err);
-          }
-          const addresses = utils$1.isArray(arg0) ? arg0.map(addr => buildAddressEntry(addr)) : [buildAddressEntry(arg0, arg1)];
-          opt.all ? cb(err, addresses) : cb(err, addresses[0].address, addresses[0].family);
-        });
-      };
+      lookup = normalizeLookup(lookup);
     }
     const abortEmitter = new events.EventEmitter();
     function abort(reason) {
@@ -218415,6 +219805,11 @@ var httpAdapter = isHttpAdapterSupported && function httpAdapter(config) {
         });
       } catch (err) {
         throw AxiosError.from(err, AxiosError.ERR_BAD_REQUEST, config);
+      }
+
+      // Check bytes before converting the result to text or a stream.
+      if (maxContentLength > -1 && (responseType === 'blob' ? convertedData.size : convertedData.length) > maxContentLength) {
+        return reject(new AxiosError('maxContentLength size of ' + maxContentLength + ' exceeded', AxiosError.ERR_BAD_RESPONSE, config));
       }
       if (responseType === 'text') {
         convertedData = convertedData.toString(responseEncoding);
@@ -218531,6 +219926,11 @@ var httpAdapter = isHttpAdapterSupported && function httpAdapter(config) {
       }));
     }
     headers.set('Accept-Encoding', utils$1.hasOwnProp(transitional, 'advertiseZstdAcceptEncoding') && transitional.advertiseZstdAcceptEncoding === true ? ACCEPT_ENCODING_WITH_ZSTD : ACCEPT_ENCODING, false);
+    if (isHttp2 && lookup) {
+      http2Options = Object.assign(Object.create(null), http2Options, {
+        lookup
+      });
+    }
 
     // Null-prototype to block prototype pollution gadgets on properties read
     // directly by Node's http.request (e.g. insecureHTTPParser, lookup).
@@ -218547,11 +219947,13 @@ var httpAdapter = isHttpAdapterSupported && function httpAdapter(config) {
       family,
       beforeRedirect: dispatchBeforeRedirect,
       beforeRedirects: Object.create(null),
-      http2Options
+      http2Options,
+      createConnection: undefined
     });
 
     // cacheable-lookup integration hotfix
     !utils$1.isUndefined(lookup) && (options.lookup = lookup);
+    let proxyApplied = false;
     if (socketPath) {
       if (typeof socketPath !== 'string') {
         return reject(new AxiosError('socketPath must be a string', AxiosError.ERR_BAD_OPTION_VALUE, config));
@@ -218569,22 +219971,29 @@ var httpAdapter = isHttpAdapterSupported && function httpAdapter(config) {
     } else {
       options.hostname = parsed.hostname.startsWith('[') ? parsed.hostname.slice(1, -1) : parsed.hostname;
       options.port = parsed.port;
-      setProxy(options, configProxy, protocol + '//' + parsed.hostname + (parsed.port ? ':' + parsed.port : '') + options.path, false, httpsAgent, httpAgent);
+      proxyApplied = setProxy(options, configProxy, protocol + '//' + parsed.hostname + (parsed.port ? ':' + parsed.port : '') + options.path, false, httpsAgent, httpAgent,
+      // The HTTP/2 transport connects independently of HTTP/1 agents, so it
+      // cannot apply either axios-resolved or agent-local environment proxies.
+      // Explicit proxy config is still processed and rejected below.
+      !isHttp2);
     }
     let transport;
     let isNativeTransport = false;
-    // True only for the follow-redirects transport, which applies
-    // options.maxBodyLength itself. Every other transport (http2, native
-    // http/https, a user-supplied custom transport) needs the explicit
-    // byte-counting pipeline below to enforce maxBodyLength on streamed uploads.
-    let transportEnforcesMaxBodyLength = false;
     const isHttpsRequest = isHttps.test(options.protocol);
     // Don't clobber a CONNECT-tunneling agent installed by setProxy() for an
     // HTTPS target.
-    if (options.agent == null) {
+    if (!isHttp2 && configProxy === false) {
+      setDirectAgent(options, httpAgent, httpsAgent);
+      options.beforeRedirects.direct = redirectOptions => {
+        setDirectAgent(redirectOptions, httpAgent, httpsAgent);
+      };
+    } else if (options.agent == null) {
       options.agent = isHttpsRequest ? httpsAgent : httpAgent;
     }
     if (isHttp2) {
+      if (proxyApplied) {
+        return reject(new AxiosError('HTTP/2 requests with a proxy are not supported', AxiosError.ERR_NOT_SUPPORT, config));
+      }
       transport = http2Transport;
     } else {
       const configTransport = own('transport');
@@ -218594,7 +220003,6 @@ var httpAdapter = isHttpAdapterSupported && function httpAdapter(config) {
         transport = isHttpsRequest ? https : http;
         isNativeTransport = true;
       } else {
-        transportEnforcesMaxBodyLength = true;
         options.sensitiveHeaders = [];
         if (maxRedirects) {
           options.maxRedirects = maxRedirects;
@@ -218832,18 +220240,10 @@ var httpAdapter = isHttpAdapterSupported && function httpAdapter(config) {
         socket.setKeepAlive(true, 1000 * 60);
       }
 
-      // Install a single 'error' listener per socket (not per request) to avoid
-      // accumulating listeners on pooled keep-alive sockets that get reassigned
-      // to new requests before the previous request's 'close' fires (issue #10780).
-      // The listener is bound to the socket's currently-active request via a
-      // symbol, which is swapped as the socket is reassigned.
+      // Install one shared 'error' listener per socket. The symbol follows the
+      // currently-active request as pooled sockets are reassigned (issue #10780).
       if (!socket[kAxiosSocketListener]) {
-        socket.on('error', function handleSocketError(err) {
-          const current = socket[kAxiosCurrentReq];
-          if (current && !current.destroyed) {
-            current.destroy(err);
-          }
-        });
+        socket.on('error', handleSocketError);
         socket[kAxiosSocketListener] = true;
       }
       socket[kAxiosCurrentReq] = req;
@@ -218906,12 +220306,10 @@ var httpAdapter = isHttpAdapterSupported && function httpAdapter(config) {
         }
       });
 
-      // Enforce maxBodyLength for streamed uploads on every transport that
-      // does not apply options.maxBodyLength itself (native http/https, http2,
-      // and user-supplied custom transports). The follow-redirects transport
-      // enforces it on the redirected HTTP/1 path.
+      // Transform decodes string chunks to Buffers before counting, so every
+      // transport receives at most maxBodyLength encoded bytes.
       let uploadStream = data;
-      if (maxBodyLength > -1 && !transportEnforcesMaxBodyLength) {
+      if (maxBodyLength > -1) {
         const limit = maxBodyLength;
         let bytesSent = 0;
         uploadStream = stream.pipeline([data, new stream.Transform({
@@ -218935,11 +220333,13 @@ var httpAdapter = isHttpAdapterSupported && function httpAdapter(config) {
   });
 };
 
-var isURLSameOrigin = platform.hasStandardBrowserEnv ? ((origin, isMSIE) => url => {
-  url = new URL(url, platform.origin);
-  return origin.protocol === url.protocol && origin.host === url.host && (isMSIE || origin.port === url.port);
-})(new URL(platform.origin), platform.navigator && /(msie|trident)/i.test(platform.navigator.userAgent)) : () => true;
-
+const decodeCookieValue = value => {
+  try {
+    return decodeURIComponent(value);
+  } catch (e) {
+    return value;
+  }
+};
 var cookies = platform.hasStandardBrowserEnv ?
 // Standard browser envs support document.cookie
 {
@@ -218965,24 +220365,35 @@ var cookies = platform.hasStandardBrowserEnv ?
   },
   read(name) {
     if (typeof document === 'undefined') return null;
+    const cookieString = document.cookie;
+    if (!cookieString) return null;
     // Match name=value by splitting on the semicolon separator instead of building a
     // RegExp from `name` — interpolating an unescaped string into a RegExp would let
     // metacharacters (e.g. `.+?` in an attacker-influenced cookie name) cause ReDoS or
     // match the wrong cookie. Browsers may serialize cookie pairs as either ";" or
     // "; ", so ignore optional whitespace before each cookie name.
-    const cookies = document.cookie.split(';');
+    const cookies = cookieString.split(';');
     for (let i = 0; i < cookies.length; i++) {
       const cookie = cookies[i].replace(/^\s+/, '');
       const eq = cookie.indexOf('=');
       if (eq !== -1 && cookie.slice(0, eq) === name) {
-        try {
-          return decodeURIComponent(cookie.slice(eq + 1));
-        } catch (e) {
-          return cookie.slice(eq + 1);
-        }
+        return decodeCookieValue(cookie.slice(eq + 1));
       }
     }
     return null;
+  },
+  async readAsync(name) {
+    try {
+      const store = typeof window !== 'undefined' && window.cookieStore;
+      if (store && utils$1.isFunction(store.get)) {
+        const cookie = await store.get(name);
+        // Both APIs expose stored bytes; preserve Axios's existing URI decoding.
+        return cookie ? decodeCookieValue(cookie.value) : null;
+      }
+    } catch (e) {
+      // Restricted or unavailable storage retains the synchronous fallback.
+    }
+    return this.read(name);
   },
   remove(name) {
     this.write(name, '', Date.now() - 86400000, '/');
@@ -218994,17 +220405,240 @@ var cookies = platform.hasStandardBrowserEnv ?
   read() {
     return null;
   },
+  async readAsync() {
+    return null;
+  },
   remove() {}
 };
+
+var isURLSameOrigin = platform.hasStandardBrowserEnv ? (origin => url => {
+  url = new URL(url, document.baseURI || platform.origin);
+  return origin.protocol === url.protocol && origin.host === url.host && origin.port === url.port;
+})(new URL(platform.origin)) : () => true;
+
+function assertParamsAcyclic(params) {
+  const pending = [{
+    value: params
+  }];
+  const active = new WeakSet();
+  const visited = new WeakSet();
+  while (pending.length) {
+    const {
+      value,
+      done
+    } = pending.pop();
+    if (!utils$1.isPlainObject(value) && !utils$1.isArray(value)) continue;
+    if (done) {
+      active.delete(value);
+      continue;
+    }
+    if (active.has(value)) {
+      throw new AxiosError('Circular reference detected in params', AxiosError.ERR_BAD_OPTION_VALUE);
+    }
+    if (visited.has(value)) continue;
+    visited.add(value);
+    active.add(value);
+    pending.push({
+      value,
+      done: true
+    });
+    const keys = Object.keys(value);
+    if (Object.getOwnPropertySymbols && Object.getOwnPropertyDescriptor) {
+      Object.getOwnPropertySymbols(value).forEach(key => {
+        const descriptor = Object.getOwnPropertyDescriptor(value, key);
+        if (descriptor && descriptor.enumerable) keys.push(key);
+      });
+    }
+    // Shallow array elements retain fields filtered during plain-object merges.
+    // Inspect reserved data properties without evaluating their accessors.
+    keys.forEach(key => {
+      if (key === '__proto__' || key === 'constructor' || key === 'prototype') {
+        const descriptor = Object.getOwnPropertyDescriptor(value, key);
+        if (descriptor && utils$1.hasOwnProp(descriptor, 'value')) {
+          pending.push({
+            value: descriptor.value
+          });
+        }
+      } else {
+        pending.push({
+          value: value[key]
+        });
+      }
+    });
+  }
+}
 
 const headersToObject = thing => thing instanceof AxiosHeaders ? {
   ...thing
 } : thing;
 const ownEnumerableKeys = thing => {
   if (Object.getOwnPropertySymbols && Object.getOwnPropertyDescriptor) {
-    return Object.keys(thing).concat(Object.getOwnPropertySymbols(thing).filter(symbol => Object.getOwnPropertyDescriptor(thing, symbol).enumerable));
+    return Object.keys(thing).concat(Object.getOwnPropertySymbols(thing).filter(symbol => {
+      const descriptor = Object.getOwnPropertyDescriptor(thing, symbol);
+      return descriptor && descriptor.enumerable;
+    }));
   }
   return Object.keys(thing);
+};
+
+// Copy params without recursive merges so the serializer remains responsible
+// for its depth policy. Only visit defaults that contribute to the result.
+function mergeParams(a, b) {
+  const pending = [];
+  const copies = new WeakMap();
+  const empty = {};
+  function copy(target, source) {
+    if (!utils$1.isPlainObject(source)) {
+      return utils$1.isArray(source) ? source.slice() : source;
+    }
+    const base = utils$1.isPlainObject(target) ? target : empty;
+    let bases = copies.get(source);
+    if (!bases) {
+      bases = new WeakMap();
+      copies.set(source, bases);
+    }
+    if (bases.has(base)) return bases.get(base);
+    const result = {};
+    bases.set(base, result);
+    pending.push({
+      base,
+      source,
+      result
+    });
+    return result;
+  }
+  const result = utils$1.isUndefined(b) ? copy(undefined, a) : copy(a, b);
+  while (pending.length) {
+    const {
+      base,
+      source,
+      result: target
+    } = pending.pop();
+    const baseKeys = new Set(ownEnumerableKeys(base));
+    const sourceKeys = new Set(ownEnumerableKeys(source));
+    const keys = new Set([...baseKeys, ...sourceKeys]);
+    keys.forEach(key => {
+      if (key === '__proto__' || key === 'constructor' || key === 'prototype') return;
+      const hasSource = sourceKeys.has(key);
+      const value = hasSource ? source[key] : undefined;
+      const previous = (!hasSource || utils$1.isPlainObject(value)) && baseKeys.has(key) ? base[key] : undefined;
+      target[key] = hasSource ? copy(previous, value) : copy(undefined, previous);
+    });
+  }
+  assertParamsAcyclic(result);
+  return result;
+}
+function getMergedValue(target, source, prop, caseless) {
+  if (utils$1.isPlainObject(target) && utils$1.isPlainObject(source)) {
+    return utils$1.merge.call({
+      caseless
+    }, target, source);
+  } else if (utils$1.isPlainObject(source)) {
+    return utils$1.merge({}, source);
+  } else if (utils$1.isArray(source)) {
+    return source.slice();
+  }
+  return source;
+}
+function mergeDeepProperties(a, b, prop, caseless) {
+  if (!utils$1.isUndefined(b)) {
+    return getMergedValue(a, b, prop, caseless);
+  } else if (!utils$1.isUndefined(a)) {
+    return getMergedValue(undefined, a, prop, caseless);
+  }
+}
+
+// eslint-disable-next-line consistent-return
+function valueFromConfig2(a, b) {
+  if (!utils$1.isUndefined(b)) {
+    return getMergedValue(undefined, b);
+  }
+}
+
+// eslint-disable-next-line consistent-return
+function defaultToConfig2(a, b) {
+  if (!utils$1.isUndefined(b)) {
+    return getMergedValue(undefined, b);
+  } else if (!utils$1.isUndefined(a)) {
+    return getMergedValue(undefined, a);
+  }
+}
+function getMergedTransitionalOption(config1, config2, prop) {
+  const transitional2 = utils$1.hasOwnProp(config2, 'transitional') ? config2.transitional : undefined;
+  if (!utils$1.isUndefined(transitional2)) {
+    if (utils$1.isPlainObject(transitional2)) {
+      if (utils$1.hasOwnProp(transitional2, prop)) {
+        return transitional2[prop];
+      }
+    } else {
+      return undefined;
+    }
+  }
+  const transitional1 = utils$1.hasOwnProp(config1, 'transitional') ? config1.transitional : undefined;
+  if (utils$1.isPlainObject(transitional1) && utils$1.hasOwnProp(transitional1, prop)) {
+    return transitional1[prop];
+  }
+  return undefined;
+}
+
+// eslint-disable-next-line consistent-return
+function mergeDirectKeys(a, b, prop, config1, config2) {
+  if (utils$1.hasOwnProp(config2, prop)) {
+    return getMergedValue(a, b);
+  } else if (utils$1.hasOwnProp(config1, prop)) {
+    return getMergedValue(undefined, a);
+  }
+}
+function mergeHeaders(a, b, prop) {
+  return mergeDeepProperties(headersToObject(a), headersToObject(b), prop, true);
+}
+
+// Null-proto, frozen descriptor so a polluted Object.prototype.get cannot turn
+// this data descriptor into an accessor descriptor on the way in.
+// defineProperty only reads it, so one shared instance serves every call.
+const hasOwnPropertyDescriptor = Object.freeze({
+  __proto__: null,
+  value: Object.prototype.hasOwnProperty,
+  enumerable: false,
+  writable: true,
+  configurable: true
+});
+
+// The strategy table and the strategies above are stateless, so they are
+// built once at module load instead of on every call: mergeConfig runs at
+// most twice per request (once from a method alias, once from `_request`).
+const mergeMap = {
+  url: valueFromConfig2,
+  method: valueFromConfig2,
+  data: valueFromConfig2,
+  baseURL: defaultToConfig2,
+  transformRequest: defaultToConfig2,
+  transformResponse: defaultToConfig2,
+  params: mergeParams,
+  paramsSerializer: defaultToConfig2,
+  timeout: defaultToConfig2,
+  timeoutErrorMessage: defaultToConfig2,
+  withCredentials: defaultToConfig2,
+  withXSRFToken: defaultToConfig2,
+  adapter: defaultToConfig2,
+  responseType: defaultToConfig2,
+  xsrfCookieName: defaultToConfig2,
+  xsrfHeaderName: defaultToConfig2,
+  onUploadProgress: defaultToConfig2,
+  onDownloadProgress: defaultToConfig2,
+  decompress: defaultToConfig2,
+  maxContentLength: defaultToConfig2,
+  maxBodyLength: defaultToConfig2,
+  beforeRedirect: defaultToConfig2,
+  transport: defaultToConfig2,
+  httpAgent: defaultToConfig2,
+  httpsAgent: defaultToConfig2,
+  cancelToken: defaultToConfig2,
+  socketPath: defaultToConfig2,
+  allowedSocketPaths: defaultToConfig2,
+  responseEncoding: defaultToConfig2,
+  validateStatus: mergeDirectKeys,
+  headers: mergeHeaders
 };
 
 /**
@@ -219026,120 +220660,21 @@ function mergeConfig(config1, config2) {
   // `hasOwnProperty` is restored as a non-enumerable own slot to preserve
   // ergonomics for user code that relies on it.
   const config = Object.create(null);
-  Object.defineProperty(config, 'hasOwnProperty', {
-    // Null-proto descriptor so a polluted Object.prototype.get cannot turn
-    // this data descriptor into an accessor descriptor on the way in.
-    __proto__: null,
-    value: Object.prototype.hasOwnProperty,
-    enumerable: false,
-    writable: true,
-    configurable: true
-  });
-  function getMergedValue(target, source, prop, caseless) {
-    if (utils$1.isPlainObject(target) && utils$1.isPlainObject(source)) {
-      return utils$1.merge.call({
-        caseless
-      }, target, source);
-    } else if (utils$1.isPlainObject(source)) {
-      return utils$1.merge({}, source);
-    } else if (utils$1.isArray(source)) {
-      return source.slice();
-    }
-    return source;
-  }
-  function mergeDeepProperties(a, b, prop, caseless) {
-    if (!utils$1.isUndefined(b)) {
-      return getMergedValue(a, b, prop, caseless);
-    } else if (!utils$1.isUndefined(a)) {
-      return getMergedValue(undefined, a, prop, caseless);
-    }
-  }
-
-  // eslint-disable-next-line consistent-return
-  function valueFromConfig2(a, b) {
-    if (!utils$1.isUndefined(b)) {
-      return getMergedValue(undefined, b);
-    }
-  }
-
-  // eslint-disable-next-line consistent-return
-  function defaultToConfig2(a, b) {
-    if (!utils$1.isUndefined(b)) {
-      return getMergedValue(undefined, b);
-    } else if (!utils$1.isUndefined(a)) {
-      return getMergedValue(undefined, a);
-    }
-  }
-  function getMergedTransitionalOption(prop) {
-    const transitional2 = utils$1.hasOwnProp(config2, 'transitional') ? config2.transitional : undefined;
-    if (!utils$1.isUndefined(transitional2)) {
-      if (utils$1.isPlainObject(transitional2)) {
-        if (utils$1.hasOwnProp(transitional2, prop)) {
-          return transitional2[prop];
-        }
-      } else {
-        return undefined;
-      }
-    }
-    const transitional1 = utils$1.hasOwnProp(config1, 'transitional') ? config1.transitional : undefined;
-    if (utils$1.isPlainObject(transitional1) && utils$1.hasOwnProp(transitional1, prop)) {
-      return transitional1[prop];
-    }
-    return undefined;
-  }
-
-  // eslint-disable-next-line consistent-return
-  function mergeDirectKeys(a, b, prop) {
-    if (utils$1.hasOwnProp(config2, prop)) {
-      return getMergedValue(a, b);
-    } else if (utils$1.hasOwnProp(config1, prop)) {
-      return getMergedValue(undefined, a);
-    }
-  }
-  const mergeMap = {
-    url: valueFromConfig2,
-    method: valueFromConfig2,
-    data: valueFromConfig2,
-    baseURL: defaultToConfig2,
-    transformRequest: defaultToConfig2,
-    transformResponse: defaultToConfig2,
-    paramsSerializer: defaultToConfig2,
-    timeout: defaultToConfig2,
-    timeoutMessage: defaultToConfig2,
-    withCredentials: defaultToConfig2,
-    withXSRFToken: defaultToConfig2,
-    adapter: defaultToConfig2,
-    responseType: defaultToConfig2,
-    xsrfCookieName: defaultToConfig2,
-    xsrfHeaderName: defaultToConfig2,
-    onUploadProgress: defaultToConfig2,
-    onDownloadProgress: defaultToConfig2,
-    decompress: defaultToConfig2,
-    maxContentLength: defaultToConfig2,
-    maxBodyLength: defaultToConfig2,
-    beforeRedirect: defaultToConfig2,
-    transport: defaultToConfig2,
-    httpAgent: defaultToConfig2,
-    httpsAgent: defaultToConfig2,
-    cancelToken: defaultToConfig2,
-    socketPath: defaultToConfig2,
-    allowedSocketPaths: defaultToConfig2,
-    responseEncoding: defaultToConfig2,
-    validateStatus: mergeDirectKeys,
-    headers: (a, b, prop) => mergeDeepProperties(headersToObject(a), headersToObject(b), prop, true)
-  };
-  utils$1.forEach(ownEnumerableKeys({
+  Object.defineProperty(config, 'hasOwnProperty', hasOwnPropertyDescriptor);
+  const keys = ownEnumerableKeys({
     ...config1,
     ...config2
-  }), function computeConfigValue(prop) {
-    if (prop === '__proto__' || prop === 'constructor' || prop === 'prototype') return;
+  });
+  for (let i = 0, len = keys.length; i < len; i++) {
+    const prop = keys[i];
+    if (prop === '__proto__' || prop === 'constructor' || prop === 'prototype') continue;
     const merge = utils$1.hasOwnProp(mergeMap, prop) ? mergeMap[prop] : mergeDeepProperties;
     const a = utils$1.hasOwnProp(config1, prop) ? config1[prop] : undefined;
     const b = utils$1.hasOwnProp(config2, prop) ? config2[prop] : undefined;
-    const configValue = merge(a, b, prop);
+    const configValue = merge === mergeDirectKeys ? merge(a, b, prop, config1, config2) : merge(a, b, prop);
     utils$1.isUndefined(configValue) && merge !== mergeDirectKeys || (config[prop] = configValue);
-  });
-  if (utils$1.hasOwnProp(config2, 'validateStatus') && utils$1.isUndefined(config2.validateStatus) && getMergedTransitionalOption('validateStatusUndefinedResolves') === false) {
+  }
+  if (utils$1.hasOwnProp(config2, 'validateStatus') && utils$1.isUndefined(config2.validateStatus) && getMergedTransitionalOption(config1, config2, 'validateStatusUndefinedResolves') === false) {
     if (utils$1.hasOwnProp(config1, 'validateStatus')) {
       config.validateStatus = getMergedValue(undefined, config1.validateStatus);
     } else {
@@ -219158,7 +220693,8 @@ function mergeConfig(config1, config2) {
  * @returns {string} UTF-8 bytes as a Latin-1 string
  */
 const encodeUTF8$1 = str => encodeURIComponent(str).replace(/%([0-9A-F]{2})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
-function resolveConfig(config) {
+const readCookie = name => cookies.read(name);
+function resolveConfig(config, readXsrfCookie = readCookie) {
   const newConfig = mergeConfig({}, config);
 
   // Read only own properties to prevent prototype pollution gadgets
@@ -219180,18 +220716,23 @@ function resolveConfig(config) {
   if (auth) {
     const username = utils$1.getSafeProp(auth, 'username') || '';
     const password = utils$1.getSafeProp(auth, 'password') || '';
+    const transitional = own('transitional');
+    const encodeUsername = transitional && utils$1.hasOwnProp(transitional, 'encodeBasicAuthUsername') && transitional.encodeBasicAuthUsername === true;
     try {
-      headers.set('Authorization', 'Basic ' + btoa(username + ':' + (password ? encodeUTF8$1(password) : '')));
+      headers.set('Authorization',
+      // Preserve legacy username bytes unless the caller opts in to UTF-8.
+      'Basic ' + btoa((encodeUsername ? encodeUTF8$1(username) : username) + ':' + (password ? encodeUTF8$1(password) : '')));
     } catch (e) {
       throw AxiosError.from(e, AxiosError.ERR_BAD_OPTION_VALUE, config);
     }
   }
   if (utils$1.isFormData(data)) {
+    const getHeaders = utils$1.getSafeProp(data, 'getHeaders');
     if (platform.hasStandardBrowserEnv || platform.hasStandardBrowserWebWorkerEnv || utils$1.isReactNative(data)) {
       headers.setContentType(undefined); // browser/web worker/RN handles it
-    } else if (utils$1.isFunction(data.getHeaders)) {
+    } else if (utils$1.isFunction(getHeaders)) {
       // Node.js FormData (like form-data package)
-      setFormDataHeaders(headers, data.getHeaders(), own('formDataHeaderPolicy'));
+      setFormDataHeaders(headers, getHeaders.call(data), own('formDataHeaderPolicy'));
     }
   }
 
@@ -219209,7 +220750,7 @@ function resolveConfig(config) {
     // the XSRF token cross-origin.
     const shouldSendXSRF = withXSRFToken === true || withXSRFToken == null && isURLSameOrigin(newConfig.url);
     if (shouldSendXSRF) {
-      const xsrfValue = xsrfHeaderName && xsrfCookieName && cookies.read(xsrfCookieName);
+      const xsrfValue = xsrfHeaderName && xsrfCookieName && readXsrfCookie(xsrfCookieName);
       if (xsrfValue) {
         headers.set(xsrfHeaderName, xsrfValue);
       }
@@ -219221,7 +220762,18 @@ function resolveConfig(config) {
 const isXHRAdapterSupported = typeof XMLHttpRequest !== 'undefined';
 var xhrAdapter = isXHRAdapterSupported && function (config) {
   return new Promise(function dispatchXhrRequest(resolve, reject) {
-    const _config = resolveConfig(config);
+    let useAsyncXsrf;
+    try {
+      const store = platform.hasStandardBrowserEnv && typeof window !== 'undefined' && window.cookieStore;
+      useAsyncXsrf = store && utils$1.isFunction(store.get);
+    } catch (e) {
+      // A restricted Cookie Store getter must retain the synchronous fallback.
+    }
+    let xsrfCookieName;
+    const _config = resolveConfig(config, useAsyncXsrf ? name => {
+      xsrfCookieName = name;
+      return null;
+    } : undefined);
     let requestData = _config.data;
     const requestHeaders = AxiosHeaders.from(_config.headers).normalize();
     let {
@@ -219230,12 +220782,37 @@ var xhrAdapter = isXHRAdapterSupported && function (config) {
       onDownloadProgress
     } = _config;
     let onCanceled;
+    let timeoutId;
     let uploadThrottled, downloadThrottled;
-    let flushUpload, flushDownload;
+    let flushUpload, flushDownload, flushDownloadWithEvent;
     function done() {
-      flushUpload && flushUpload(); // flush events
-      flushDownload && flushDownload(); // flush events
+      clearTimeout(timeoutId);
+      // A final progress callback must not prevent the remaining cleanup.
+      // Report errors asynchronously, as onloadend and the throttle timer do.
+      try {
+        flushUpload && flushUpload(); // flush events
+      } catch (err) {
+        setTimeout(() => {
+          throw err;
+        });
+      }
+      try {
+        flushDownload && flushDownload(); // flush events
+      } catch (err) {
+        setTimeout(() => {
+          throw err;
+        });
+      }
 
+      // A flush can synchronously cancel the request and reenter done().
+      // In that case the inner call has already detached these listeners.
+      if (request) {
+        downloadThrottled && request.removeEventListener('progress', downloadThrottled);
+        if (request.upload) {
+          uploadThrottled && request.upload.removeEventListener('progress', uploadThrottled);
+          flushUpload && request.upload.removeEventListener('loadend', flushUpload);
+        }
+      }
       _config.cancelToken && _config.cancelToken.unsubscribe(onCanceled);
       _config.signal && _config.signal.removeEventListener('abort', onCanceled);
     }
@@ -219244,10 +220821,50 @@ var xhrAdapter = isXHRAdapterSupported && function (config) {
 
     // Set the request timeout in MS
     request.timeout = _config.timeout;
-    function onloadend() {
+    function onloadend(event) {
       if (!request) {
         return;
       }
+
+      // Status 0 means no response was received, which onerror and onabort normally
+      // reject before this runs. Firefox 152 fires only readystatechange and loadend for
+      // navigation-canceled requests (https://bugzilla.mozilla.org/show_bug.cgi?id=1505389),
+      // leaving settle() to resolve them as an empty success. ECONNABORTED is the error
+      // onabort raised on Firefox 151. Reads over file:, which some environments report as
+      // status 0 on success, are excluded by the request URL's scheme after browser-style
+      // preprocessing, by the page origin's scheme for relative URLs (which inherit it), or
+      // by responseURL where implemented.
+      if (request.status === 0 && (parseProtocol(normalizeURLForProtocolCheck(_config.url)) || parseProtocol(platform.origin)) !== 'file' && !(request.responseURL && request.responseURL.startsWith('file:'))) {
+        reject(new AxiosError('Request aborted', AxiosError.ECONNABORTED, config, request));
+        done();
+
+        // Clean up request
+        request = null;
+        return;
+      }
+
+      // When loadend is still dispatching, flushing with it gives progress
+      // listeners a final delivery whose event has a live target. The legacy
+      // ready-state fallback has no event, so replay its pending progress.
+      // A throwing listener must not block settlement; rethrow asynchronously,
+      // matching how listener errors surface on the throttle timer path.
+      try {
+        if (event) {
+          flushDownloadWithEvent && flushDownloadWithEvent(event);
+        } else {
+          flushDownload && flushDownload();
+        }
+      } catch (err) {
+        setTimeout(() => {
+          throw err;
+        });
+      }
+
+      // A final progress callback can cancel the request synchronously.
+      if (!request) {
+        return;
+      }
+
       // Prepare the response
       const responseHeaders = AxiosHeaders.from('getAllResponseHeaders' in request && request.getAllResponseHeaders());
       const responseData = !responseType || responseType === 'text' || responseType === 'json' ? request.responseText : request.response;
@@ -219321,6 +220938,7 @@ var xhrAdapter = isXHRAdapterSupported && function (config) {
 
     // Handle timeout
     request.ontimeout = function handleTimeout() {
+      if (!request) return;
       let timeoutErrorMessage = _config.timeout ? 'timeout of ' + _config.timeout + 'ms exceeded' : 'timeout exceeded';
       const transitional = _config.transitional || transitionalDefaults;
       if (_config.timeoutErrorMessage) {
@@ -219336,13 +220954,6 @@ var xhrAdapter = isXHRAdapterSupported && function (config) {
     // Remove Content-Type if data is undefined
     requestData === undefined && requestHeaders.setContentType(null);
 
-    // Add headers to the request
-    if ('setRequestHeader' in request) {
-      utils$1.forEach(toByteStringHeaderObject(requestHeaders), function setRequestHeader(val, key) {
-        request.setRequestHeader(key, val);
-      });
-    }
-
     // Add withCredentials to request if needed
     if (!utils$1.isUndefined(_config.withCredentials)) {
       request.withCredentials = !!_config.withCredentials;
@@ -219355,7 +220966,7 @@ var xhrAdapter = isXHRAdapterSupported && function (config) {
 
     // Handle progress if needed
     if (onDownloadProgress) {
-      [downloadThrottled, flushDownload] = progressEventReducer(onDownloadProgress, true);
+      [downloadThrottled, flushDownload, flushDownloadWithEvent] = progressEventReducer(onDownloadProgress, true);
       request.addEventListener('progress', downloadThrottled);
     }
 
@@ -219373,24 +220984,79 @@ var xhrAdapter = isXHRAdapterSupported && function (config) {
           return;
         }
         reject(!cancel || cancel.type ? new CanceledError(null, config, request) : cancel);
-        request.abort();
+        const xhr = request;
         done();
         request = null;
+        xhr.abort();
       };
       _config.cancelToken && _config.cancelToken.subscribe(onCanceled);
+      if (!request) return;
       if (_config.signal) {
         _config.signal.aborted ? onCanceled() : _config.signal.addEventListener('abort', onCanceled);
       }
     }
+    if (!request) return;
     const protocol = parseProtocol(_config.url);
     if (protocol && !platform.protocols.includes(protocol)) {
       reject(new AxiosError('Unsupported protocol ' + protocol + ':', AxiosError.ERR_BAD_REQUEST, config));
       done();
       return;
     }
-
-    // Send the request
-    request.send(requestData || null);
+    const sendRequest = () => {
+      if (!request) return;
+      // Apply headers after an asynchronous XSRF read so existing headers are
+      // replaced through AxiosHeaders rather than appended by the native XHR.
+      if ('setRequestHeader' in request) {
+        utils$1.forEach(toByteStringHeaderObject(requestHeaders), function setRequestHeader(val, key) {
+          request.setRequestHeader(key, val);
+        });
+      }
+      request.send(requestData || null);
+    };
+    if (xsrfCookieName) {
+      // Native XHR timeout starts at send(). Cover cookie preparation and the
+      // subsequent request with the same budget and existing timeout handler.
+      const now = typeof performance !== 'undefined' && utils$1.isFunction(performance.now) ? () => performance.now() : Date.now;
+      const deadline = request.timeout > 0 ? now() + Number(request.timeout) : undefined;
+      const abortOnTimeout = () => {
+        if (!request) return;
+        const xhr = request;
+        xhr.ontimeout();
+        xhr.abort();
+      };
+      if (deadline !== undefined) {
+        const scheduleTimeout = () => {
+          const remaining = deadline - now();
+          if (remaining > 0) {
+            // Browser timers overflow above the signed 32-bit delay limit.
+            timeoutId = setTimeout(scheduleTimeout, Math.min(remaining, 0x7fffffff));
+          } else {
+            abortOnTimeout();
+          }
+        };
+        scheduleTimeout();
+      }
+      cookies.readAsync(xsrfCookieName).then(value => {
+        if (!request) return;
+        // Promise callbacks may run before an overdue timer after a busy task.
+        if (deadline !== undefined && now() >= deadline) {
+          abortOnTimeout();
+          return;
+        }
+        if (value) {
+          const headerName = utils$1.hasOwnProp(_config, 'xsrfHeaderName') && _config.xsrfHeaderName;
+          requestHeaders.set(headerName, value);
+        }
+        sendRequest();
+      }).catch(error => {
+        if (!request) return;
+        reject(AxiosError.from(error, null, config, request));
+        done();
+        request = null;
+      });
+    } else {
+      sendRequest();
+    }
   });
 };
 
@@ -219420,7 +221086,8 @@ const composeSignals = (signals, timeout) => {
     timer && clearTimeout(timer);
     timer = null;
     signals.forEach(signal => {
-      signal.unsubscribe ? signal.unsubscribe(onabort) : signal.removeEventListener('abort', onabort);
+      const unsubscribeSignal = utils$1.getSafeProp(signal, 'unsubscribe');
+      utils$1.isFunction(unsubscribeSignal) ? unsubscribeSignal.call(signal, onabort) : signal.removeEventListener('abort', onabort);
     });
     signals = null;
   };
@@ -219525,7 +221192,133 @@ const trackStream = (stream, chunkSize, onProgress, onFinish) => {
   });
 };
 
+const CRLF = '\r\n';
+const normalizeLines = value => String(value).replace(/\r\n|\r|\n/g, CRLF);
+const escapeName = value => String(value).replace(/[\r\n"]/g, char => char === '\r' ? '%0D' : char === '\n' ? '%0A' : '%22');
+
+// Count UTF-8 bytes without allocating an encoded copy of a field. FormData
+// string values normalize line endings; Blob/File contents remain unchanged.
+const stringBytes = (value, normalize) => {
+  let length = 0;
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i);
+    if (normalize && (code === 13 || code === 10)) {
+      if (code === 13 && value.charCodeAt(i + 1) === 10) i++;
+      length += 2;
+    } else if (code < 0x80) {
+      length++;
+    } else if (code < 0x800) {
+      length += 2;
+    } else if (code >= 0xd800 && code <= 0xdbff && value.charCodeAt(i + 1) >= 0xdc00 && value.charCodeAt(i + 1) <= 0xdfff) {
+      length += 4;
+      i++;
+    } else {
+      length += 3;
+    }
+  }
+  return length;
+};
+
+// Describe serialization failures independently of any request library.
+class FormDataError extends TypeError {
+  constructor(message, reason) {
+    super(message);
+    this.name = 'FormDataError';
+    this.reason = reason;
+  }
+}
+
+// The caller supplies the boundary, Blob implementation, and limit error.
+function formDataToBlob(form, Blob, limit, limitError, boundary) {
+  if (!utils$1.isFunction(Blob)) {
+    throw new FormDataError('Blob is not supported', 'blob');
+  }
+  if (!utils$1.isString(boundary) || !/^[A-Za-z0-9'()+_,./:=? -]{1,70}$/.test(boundary) || / $/.test(boundary)) {
+    throw new FormDataError('Invalid multipart boundary', 'boundary');
+  }
+  const footer = '--' + boundary + '--' + CRLF;
+  let length = footer.length;
+  const parts = [];
+  const checkLength = extra => {
+    if (length + extra > limit) throw limitError();
+  };
+  checkLength(0);
+  for (const [name, value] of form) {
+    const isString = utils$1.isString(value);
+    const valueLength = isString ? stringBytes(value, true) : value.size;
+    if (!Number.isFinite(valueLength) || valueLength < 0) {
+      throw new FormDataError('Unsupported FormData part size', 'part');
+    }
+    // Reject large values and names before building normalized header strings.
+    checkLength(valueLength + stringBytes(name, true) + (!isString && value.name ? stringBytes(value.name, false) : 0) + (!isString && value.type ? stringBytes(value.type, false) : 0));
+    let header = '--' + boundary + CRLF + 'Content-Disposition: form-data; name="' + escapeName(normalizeLines(name)) + '"';
+    if (!isString) {
+      header += '; filename="' + escapeName(utils$1.isString(value.name) ? value.name : 'blob') + '"' + CRLF + 'Content-Type: ' + String(value.type || 'application/octet-stream').replace(/[\r\n]/g, '');
+    }
+    header += CRLF + CRLF;
+    const partLength = stringBytes(header, false) + valueLength + CRLF.length;
+    checkLength(partLength);
+    length += partLength;
+    parts.push({
+      header,
+      value,
+      isString
+    });
+  }
+
+  // Native Blob composition retains existing Blob/File data. No file is read
+  // and no complete multipart ArrayBuffer is created to determine its length.
+  const blobParts = [];
+  for (const part of parts) {
+    blobParts.push(part.header, part.isString ? normalizeLines(part.value) : part.value, CRLF);
+  }
+  blobParts.push(footer);
+  return new Blob(blobParts, {
+    type: 'multipart/form-data; boundary=' + boundary
+  });
+}
+
+function createMultipartBody(form, Blob, limit, limitError, boundary) {
+  // Report missing Blob support before trying to select a random source.
+  if (!utils$1.isFunction(Blob)) {
+    throw new AxiosError('Blob is not supported', AxiosError.ERR_NOT_SUPPORT);
+  }
+  if (boundary === undefined) {
+    if (utils$1.isFunction(platform.generateString)) {
+      boundary = 'axios-' + platform.generateString(36, '0123456789abcdef');
+    } else {
+      const crypto = utils$1.global.crypto;
+      if (!crypto || !utils$1.isFunction(crypto.getRandomValues)) {
+        throw new AxiosError('Random byte generation is not supported', AxiosError.ERR_NOT_SUPPORT);
+      }
+      const random = new Uint8Array(18);
+      crypto.getRandomValues(random);
+      boundary = 'axios-' + Array.from(random, value => ('0' + value.toString(16)).slice(-2)).join('');
+    }
+  }
+  try {
+    return formDataToBlob(form, Blob, limit, limitError, boundary);
+  } catch (error) {
+    if (error instanceof FormDataError) {
+      const code = error.reason === 'boundary' ? AxiosError.ERR_BAD_OPTION_VALUE : AxiosError.ERR_BAD_REQUEST;
+      throw new AxiosError(error.message, code);
+    }
+    throw error;
+  }
+}
+
 const DEFAULT_CHUNK_SIZE = 64 * 1024;
+const DEFAULT_REQUEST_OPTIONS = {
+  cache: 'default',
+  redirect: 'follow',
+  referrer: 'about:client',
+  referrerPolicy: '',
+  mode: 'cors',
+  integrity: '',
+  keepalive: false,
+  priority: 'auto',
+  window: null
+};
 const {
   isFunction
 } = utils$1;
@@ -219579,12 +221372,14 @@ const factory = env => {
     skipUndefined: true
   }, {
     Request: globalObject.Request,
-    Response: globalObject.Response
+    Response: globalObject.Response,
+    Blob: globalObject.Blob
   }, env);
+  const envFetch = utils$1.hasOwnProp(env, 'fetch') ? env.fetch : undefined;
   const {
-    fetch: envFetch,
     Request,
-    Response
+    Response,
+    Blob
   } = env;
   const isFetchSupported = envFetch ? isFunction(envFetch) : typeof fetch === 'function';
   const isRequestSupported = isFunction(Request);
@@ -219611,6 +221406,19 @@ const factory = env => {
     return duplexAccessed && !hasContentType;
   });
   const supportsResponseStream = isResponseSupported && isReadableStreamSupported && test(() => utils$1.isReadableStream(new Response('').body));
+
+  // Some runtimes reject every explicit cache mode. Use own defaults for both
+  // probes so unrelated polluted options cannot affect cache-mode detection.
+  const requestDefaults = Object.assign(Object.create(null), DEFAULT_REQUEST_OPTIONS);
+  if (isRequestSupported && !test(() => new Request(platform.origin, requestDefaults))) {
+    delete requestDefaults.cache;
+
+    // Only omit cache when that makes Request construction succeed. Otherwise
+    // retain the explicit default that protects supporting runtimes from pollution.
+    if (!test(() => new Request(platform.origin, requestDefaults))) {
+      requestDefaults.cache = DEFAULT_REQUEST_OPTIONS.cache;
+    }
+  }
   const resolvers = {
     stream: supportsResponseStream && (res => res.body)
   };
@@ -219631,13 +221439,6 @@ const factory = env => {
     }
     if (utils$1.isBlob(body)) {
       return body.size;
-    }
-    if (utils$1.isSpecCompliantForm(body)) {
-      const _request = new Request(platform.origin, {
-        method: 'POST',
-        body
-      });
-      return (await _request.arrayBuffer()).byteLength;
     }
     if (utils$1.isArrayBufferView(body) || utils$1.isArrayBuffer(body)) {
       return body.byteLength;
@@ -219668,7 +221469,8 @@ const factory = env => {
       withCredentials = 'same-origin',
       fetchOptions,
       maxContentLength,
-      maxBodyLength
+      maxBodyLength,
+      maxRedirects
     } = resolveConfig(config);
     const hasMaxContentLength = utils$1.isNumber(maxContentLength) && maxContentLength > -1;
     const hasMaxBodyLength = utils$1.isNumber(maxBodyLength) && maxBodyLength > -1;
@@ -219682,11 +221484,12 @@ const factory = env => {
     });
     let requestContentLength;
 
-    // AxiosError we raise while the request body is being streamed. Captured
+    // AxiosErrors we raise while request or response bodies are being streamed. Captured
     // by identity so the catch block can surface it directly, regardless of
     // how the runtime wraps the resulting fetch rejection (undici exposes it
     // as `err.cause`; some browsers drop the original error entirely).
     let pendingBodyError = null;
+    let pendingResponseError = null;
     const maxBodyLengthError = () => new AxiosError('Request body larger than maxBodyLength limit', AxiosError.ERR_BAD_REQUEST, config, request);
     try {
       // HTTP basic authentication
@@ -219700,8 +221503,9 @@ const factory = env => {
           password
         };
       }
+      let parsedURL;
       if (maybeWithAuthCredentials(url)) {
-        const parsedURL = new URL(url, platform.origin);
+        parsedURL = new URL(url, platform.origin);
         if (!auth && (parsedURL.username || parsedURL.password)) {
           const urlUsername = decodeURIComponentSafe(parsedURL.username);
           const urlPassword = decodeURIComponentSafe(parsedURL.password);
@@ -219724,11 +221528,24 @@ const factory = env => {
       // Enforce maxContentLength for data: URLs up-front so we never materialize
       // an oversized payload. The HTTP adapter applies the same check (see http.js
       // "if (protocol === 'data:')" branch).
-      if (hasMaxContentLength && typeof url === 'string' && url.startsWith('data:')) {
-        const estimated = estimateDataURLDecodedBytes(url);
+      if (hasMaxContentLength && parsedURL && parsedURL.protocol === 'data:') {
+        const estimated = estimateDataURLDecodedBytes(parsedURL.href);
         if (estimated > maxContentLength) {
           throw new AxiosError('maxContentLength size of ' + maxContentLength + ' exceeded', AxiosError.ERR_BAD_RESPONSE, config, request);
         }
+      }
+      const formContentType = utils$1.isSpecCompliantForm(data) && AxiosHeaders.from(own('headers')).getContentType();
+      let formBoundary;
+      if (utils$1.isString(formContentType) && /^multipart\/form-data(?:\s*;|$)/i.test(formContentType.trim())) {
+        const parameters = AxiosHeaders.parseParameters(formContentType);
+        if (utils$1.hasOwnProp(parameters, 'boundary')) formBoundary = parameters.boundary;
+      }
+      if (utils$1.isSpecCompliantForm(data) && method !== 'get' && method !== 'head' && (hasMaxBodyLength || onUploadProgress && supportsRequestStream || formBoundary !== undefined)) {
+        data = createMultipartBody(data, Blob, hasMaxBodyLength ? maxBodyLength : Infinity, maxBodyLengthError, formBoundary);
+        // Blob.type lowercases its value, including a case-sensitive boundary.
+        // Retain the caller's header when an explicit boundary was serialized.
+        headers.setContentType(formBoundary === undefined ? data.type : formContentType);
+        requestContentLength = data.size;
       }
 
       // Enforce maxBodyLength against known-size bodies before dispatch using
@@ -219799,17 +221616,46 @@ const factory = env => {
 
       // Set User-Agent header if not already set (fetch defaults to 'node' in Node.js)
       headers.set('User-Agent', 'axios/' + VERSION, false);
-      const resolvedOptions = {
-        ...fetchOptions,
+      const safeFetchOptions = fetchOptions == null ? fetchOptions : Object.assign(Object.create(null), fetchOptions);
+      if (safeFetchOptions) {
+        // These options are owned by Axios and are already reflected in the
+        // resolved Request passed to fetch.
+        delete safeFetchOptions.body;
+        delete safeFetchOptions.headers;
+        delete safeFetchOptions.method;
+        delete safeFetchOptions.signal;
+        delete safeFetchOptions.duplex;
+        delete safeFetchOptions.credentials;
+      }
+      const resolvedOptions = Object.assign(Object.create(null), safeFetchOptions, {
         signal: composedSignal,
         method: method.toUpperCase(),
         headers: toByteStringHeaderObject(headers.normalize()),
         body: data,
         duplex: 'half',
         credentials: isCredentialsSupported ? withCredentials : undefined
-      };
+      });
+      if (isRequestSupported) {
+        utils$1.forEach(requestDefaults, (value, key) => {
+          if (resolvedOptions[key] === undefined) {
+            resolvedOptions[key] = value;
+          }
+        });
+        if (resolvedOptions.signal === undefined) {
+          resolvedOptions.signal = null;
+        }
+        if (resolvedOptions.body === undefined) {
+          resolvedOptions.body = null;
+        }
+      }
+      if (maxRedirects === 0) {
+        resolvedOptions.redirect = 'manual';
+        if (safeFetchOptions) {
+          safeFetchOptions.redirect = 'manual';
+        }
+      }
       request = isRequestSupported && new Request(url, resolvedOptions);
-      let response = await (isRequestSupported ? _fetch(request, fetchOptions) : _fetch(url, resolvedOptions));
+      let response = await (isRequestSupported ? _fetch(request, safeFetchOptions) : _fetch(url, resolvedOptions));
       const responseHeaders = AxiosHeaders.from(response.headers);
 
       // Cheap pre-check: if the server honestly declares a content-length that
@@ -219833,7 +221679,7 @@ const factory = env => {
           if (hasMaxContentLength) {
             bytesRead = loadedBytes;
             if (bytesRead > maxContentLength) {
-              throw new AxiosError('maxContentLength size of ' + maxContentLength + ' exceeded', AxiosError.ERR_BAD_RESPONSE, config, request);
+              throw pendingResponseError = new AxiosError('maxContentLength size of ' + maxContentLength + ' exceeded', AxiosError.ERR_BAD_RESPONSE, config, request);
             }
           }
           onProgress && onProgress(loadedBytes);
@@ -219900,13 +221746,16 @@ const factory = env => {
       }
 
       // Surface a maxBodyLength violation we raised while the request body was
-      // being streamed. Matching by identity (rather than reading
+      // being streamed. Keeping the original error (rather than reading
       // `err.cause.isAxiosError`) keeps the error deterministic across runtimes
       // and avoids both prototype-pollution reads and mis-attributing a foreign
       // AxiosError that merely happened to land in `err.cause`.
       if (pendingBodyError) {
         request && !pendingBodyError.request && (pendingBodyError.request = request);
         throw pendingBodyError;
+      }
+      if (pendingResponseError) {
+        throw pendingResponseError;
       }
 
       // Re-throw AxiosErrors we raised synchronously (data: URL / content-length
@@ -219934,13 +221783,20 @@ const factory = env => {
 };
 const seedCache = new Map();
 const getFetch = config => {
-  let env = config && config.env || {};
+  const env = Object.create(null);
+  const configuredEnv = config && utils$1.hasOwnProp(config, 'env') && config.env;
+  ['fetch', 'Request', 'Response', 'Blob'].forEach(key => {
+    if (configuredEnv && utils$1.hasOwnProp(configuredEnv, key)) {
+      env[key] = configuredEnv[key];
+    }
+  });
   const {
     fetch,
     Request,
-    Response
+    Response,
+    Blob
   } = env;
-  const seeds = [Request, Response, fetch];
+  const seeds = [Request, Response, fetch, Blob];
   let len = seeds.length,
     i = len,
     seed,
@@ -220083,15 +221939,48 @@ function throwIfCancellationRequested(config) {
 }
 
 /**
+ * Resolve the clock used to time adapter execution.
+ *
+ * Prefers the monotonic `performance.now()` so wall-clock adjustments do not
+ * skew the measurement, and so frameworks that forbid reading the current
+ * time during prerendering (e.g. Next.js Cache Components) accept it. Falls
+ * back to `Date.now()` in runtimes without the High Resolution Time API.
+ *
+ * @returns {() => number} Millisecond clock
+ */
+function resolveClock() {
+  return typeof performance !== 'undefined' && utils$1.isFunction(performance.now) ? () => performance.now() : Date.now;
+}
+
+/**
+ * Whole milliseconds elapsed since `start`, floored at zero.
+ *
+ * Rounded so the value stays an integer as with `Date.now()`. The fallback
+ * wall clock can move backwards mid-request, so the result is clamped.
+ *
+ * @param {() => number} now Clock returned by `resolveClock()`
+ * @param {number} start Timestamp read from `now`
+ *
+ * @returns {number} Non-negative elapsed milliseconds
+ */
+function elapsedSince(now, start) {
+  return Math.max(0, Math.round(now() - start));
+}
+
+/**
  * Dispatch a request to the server using the configured adapter.
  *
  * @param {object} config The config that is to be used for the request
  *
  * @returns {Promise} The Promise to be fulfilled
  */
-function dispatchRequest(config) {
+function dispatchRequest(_config) {
+  // Interceptors may replace the merged config with an ordinary object. Flatten
+  // it at the dispatch boundary so shared prototype members cannot become
+  // request behavior, while preserving intentional template/class members.
+  const config = utils$1.toSafeFlatObject(_config);
   throwIfCancellationRequested(config);
-  config.headers = AxiosHeaders.from(config.headers);
+  config.headers = AxiosHeaders.from(utils$1.getSafeProp(config, 'headers'));
 
   // Transform request data
   config.data = transformData.call(config, config.transformRequest);
@@ -220099,8 +221988,11 @@ function dispatchRequest(config) {
     config.headers.setContentType('application/x-www-form-urlencoded', false);
   }
   const adapter = adapters.getAdapter(config.adapter || defaults.adapter, config);
+  const now = resolveClock();
+  const start = now();
   return adapter(config).then(function onAdapterResolution(response) {
     throwIfCancellationRequested(config);
+    response.duration = elapsedSince(now, start);
 
     // Expose the current response on config so that transformResponse can
     // attach it to any AxiosError it throws (e.g. on JSON parse failure).
@@ -220119,6 +222011,7 @@ function dispatchRequest(config) {
 
       // Transform response data
       if (reason && reason.response) {
+        reason.response.duration = elapsedSince(now, start);
         config.response = reason.response;
         try {
           reason.response.data = transformData.call(config, config.transformResponse, reason.response);
@@ -220218,6 +222111,21 @@ var validator = {
 
 const validators = validator.validators;
 
+// Recognize header maps without consuming objects intended as literal values.
+// AxiosHeaders from other builds share a brand and header-container interface,
+// but not constructor identity. A tag and toJSON alone can describe a literal.
+const isHeadersBucket = value => {
+  if (value == null || utils$1.isPlainObject(value) || value instanceof AxiosHeaders) {
+    return true;
+  }
+  try {
+    return utils$1.isObject(value) && utils$1.getSafeProp(value, Symbol.toStringTag) === 'AxiosHeaders' && ['toJSON', 'set', 'get', 'has', 'delete', 'clear', 'normalize', 'concat', 'toString', Symbol.iterator].every(method => utils$1.isFunction(utils$1.getSafeProp(value, method)));
+  } catch (e) {
+    // A failed optional brand probe must not prevent literal header serialization.
+    return false;
+  }
+};
+
 /**
  * Create a new instance of Axios
  *
@@ -220247,31 +222155,40 @@ class Axios {
       return await this._request(configOrUrl, config);
     } catch (err) {
       if (err instanceof Error) {
-        let dummy = {};
-        Error.captureStackTrace ? Error.captureStackTrace(dummy) : dummy = new Error();
-
-        // slice off the Error: ... line
-        const stack = (() => {
-          if (!dummy.stack) {
-            return '';
-          }
-          const firstNewlineIndex = dummy.stack.indexOf('\n');
-          return firstNewlineIndex === -1 ? '' : dummy.stack.slice(firstNewlineIndex + 1);
-        })();
         try {
+          let dummy = {};
+          Error.captureStackTrace ? Error.captureStackTrace(dummy) : dummy = new Error();
+          const dummyStack = dummy.stack;
+          let stack = '';
+
+          // slice off the Error: ... line
+          if (typeof dummyStack === 'string') {
+            const firstNewlineIndex = dummyStack.indexOf('\n');
+            stack = firstNewlineIndex === -1 ? '' : dummyStack.slice(firstNewlineIndex + 1);
+          }
           if (!err.stack) {
             err.stack = stack;
-            // match without the 2 top stack lines
           } else if (stack) {
+            // Match a common suffix after the 2 top frames when available,
+            // otherwise compare the full reconstructed stack.
             const firstNewlineIndex = stack.indexOf('\n');
             const secondNewlineIndex = firstNewlineIndex === -1 ? -1 : stack.indexOf('\n', firstNewlineIndex + 1);
-            const stackWithoutTwoTopLines = secondNewlineIndex === -1 ? '' : stack.slice(secondNewlineIndex + 1);
-            if (!String(err.stack).endsWith(stackWithoutTwoTopLines)) {
-              err.stack += '\n' + stack;
+            const duplicateCheckSuffix = secondNewlineIndex === -1 ? stack : stack.slice(secondNewlineIndex + 1);
+
+            // `AxiosError.from()` may have already inlined the wrapped error's
+            // stack under a `Caused by:` marker. Keep the reconstructed caller
+            // frames ahead of that marker so stack-only reporters do not read
+            // them as part of the low-level cause.
+            const currentStack = String(err.stack);
+            const causeIndex = getCauseStackIndex(err, currentStack);
+            const stackHead = causeIndex === -1 ? currentStack : currentStack.slice(0, causeIndex);
+            const causeSection = causeIndex === -1 ? '' : currentStack.slice(causeIndex);
+            if (!stackHead.endsWith(duplicateCheckSuffix)) {
+              err.stack = stackHead + '\n' + stack + causeSection;
             }
           }
         } catch (e) {
-          // ignore the case where "stack" is an un-writable property
+          // Ignore failures from custom stack hooks or un-writable stack properties.
         }
       }
       throw err;
@@ -220299,7 +222216,8 @@ class Axios {
         clarifyTimeoutError: validators.transitional(validators.boolean),
         legacyInterceptorReqResOrdering: validators.transitional(validators.boolean),
         advertiseZstdAcceptEncoding: validators.transitional(validators.boolean),
-        validateStatusUndefinedResolves: validators.transitional(validators.boolean)
+        validateStatusUndefinedResolves: validators.transitional(validators.boolean),
+        encodeBasicAuthUsername: validators.transitional(validators.boolean)
       }, false);
     }
     if (paramsSerializer != null) {
@@ -220316,7 +222234,7 @@ class Axios {
     }
 
     // Set config.allowAbsoluteUrls
-    if (config.allowAbsoluteUrls !== undefined) ; else if (this.defaults.allowAbsoluteUrls !== undefined) {
+    if (config.allowAbsoluteUrls !== undefined) ; else if (utils$1.hasOwnProp(this.defaults, 'allowAbsoluteUrls') && this.defaults.allowAbsoluteUrls !== undefined) {
       config.allowAbsoluteUrls = this.defaults.allowAbsoluteUrls;
     } else {
       config.allowAbsoluteUrls = true;
@@ -220327,12 +222245,16 @@ class Axios {
     }, true);
 
     // Set config.method
-    config.method = (config.method || this.defaults.method || 'get').toLowerCase();
+    config.method = (utils$1.getSafeProp(config, 'method') || utils$1.getSafeProp(this.defaults, 'method') || 'get').toLowerCase();
 
-    // Flatten headers
-    let contextHeaders = headers && utils$1.merge(headers.common, headers[config.method]);
-    headers && utils$1.forEach(['delete', 'get', 'head', 'post', 'put', 'patch', 'query', 'common'], method => {
-      delete headers[method];
+    // Flatten header defaults without consuming literal method-named headers.
+    const commonHeaders = utils$1.getSafeProp(headers, 'common');
+    const methodHeaders = utils$1.getSafeProp(headers, config.method);
+    const contextHeaders = headers && utils$1.merge(isHeadersBucket(commonHeaders) ? commonHeaders : undefined, isHeadersBucket(methodHeaders) ? methodHeaders : undefined);
+    headers && utils$1.forEach(methodList.concat('common'), method => {
+      if (isHeadersBucket(utils$1.getSafeProp(headers, method))) {
+        delete headers[method];
+      }
     });
     config.headers = AxiosHeaders.concat(contextHeaders, headers);
 
@@ -220417,7 +222339,7 @@ class Axios {
 // Provide aliases for supported request methods
 utils$1.forEach(['delete', 'get', 'head', 'options'], function forEachMethodNoData(method) {
   /*eslint func-names:0*/
-  Axios.prototype[method] = function (url, config) {
+  Axios.prototype[method] = async function (url, config) {
     return this.request(mergeConfig(config || {}, {
       method,
       url,
@@ -220427,7 +222349,7 @@ utils$1.forEach(['delete', 'get', 'head', 'options'], function forEachMethodNoDa
 });
 utils$1.forEach(['post', 'put', 'patch', 'query'], function forEachMethodWithData(method) {
   function generateHTTPMethod(isForm) {
-    return function httpMethod(url, data, config) {
+    return async function httpMethod(url, data, config) {
       return this.request(mergeConfig(config || {}, {
         method,
         headers: isForm ? {
@@ -220637,14 +222559,22 @@ const HttpStatusCode = {
   Gone: 410,
   LengthRequired: 411,
   PreconditionFailed: 412,
+  /**
+   * @deprecated Use `ContentTooLarge` instead.
+   */
   PayloadTooLarge: 413,
+  ContentTooLarge: 413,
   UriTooLong: 414,
   UnsupportedMediaType: 415,
   RangeNotSatisfiable: 416,
   ExpectationFailed: 417,
   ImATeapot: 418,
   MisdirectedRequest: 421,
+  /**
+   * @deprecated Use `UnprocessableContent` instead.
+   */
   UnprocessableEntity: 422,
+  UnprocessableContent: 422,
   Locked: 423,
   FailedDependency: 424,
   TooEarly: 425,
@@ -220673,7 +222603,9 @@ const HttpStatusCode = {
   InvalidSslCertificate: 526
 };
 Object.entries(HttpStatusCode).forEach(([key, value]) => {
-  HttpStatusCode[value] = key;
+  if (HttpStatusCode[value] === undefined) {
+    HttpStatusCode[value] = key;
+  }
 });
 
 /**
@@ -220748,7 +222680,7 @@ module.exports = axios;
 /***/ 50591:
 /***/ ((module) => {
 
-(()=>{"use strict";var t={d:(e,n)=>{for(var i in n)t.o(n,i)&&!t.o(e,i)&&Object.defineProperty(e,i,{enumerable:!0,get:n[i]})},o:(t,e)=>Object.prototype.hasOwnProperty.call(t,e),r:t=>{"undefined"!=typeof Symbol&&Symbol.toStringTag&&Object.defineProperty(t,Symbol.toStringTag,{value:"Module"}),Object.defineProperty(t,"__esModule",{value:!0})}},e={};t.r(e),t.d(e,{XMLBuilder:()=>Bt,XMLParser:()=>Tt,XMLValidator:()=>Ut});const n=":A-Za-z_\\u00C0-\\u00D6\\u00D8-\\u00F6\\u00F8-\\u02FF\\u0370-\\u037D\\u037F-\\u1FFF\\u200C-\\u200D\\u2070-\\u218F\\u2C00-\\u2FEF\\u3001-\\uD7FF\\uF900-\\uFDCF\\uFDF0-\\uFFFD",i=new RegExp("^["+n+"]["+n+"\\-.\\d\\u00B7\\u0300-\\u036F\\u203F-\\u2040]*$");function s(t,e){const n=[];let i=e.exec(t);for(;i;){const s=[];s.startIndex=e.lastIndex-i[0].length;const r=i.length;for(let t=0;t<r;t++)s.push(i[t]);n.push(s),i=e.exec(t)}return n}const r=function(t){return!(null==i.exec(t))},o=["hasOwnProperty","toString","valueOf","__defineGetter__","__defineSetter__","__lookupGetter__","__lookupSetter__"],a=["__proto__","constructor","prototype"],h={allowBooleanAttributes:!1,unpairedTags:[]};function l(t,e){e=Object.assign({},h,e);const n=[];let i=!1,s=!1;"\ufeff"===t[0]&&(t=t.substr(1));for(let r=0;r<t.length;r++)if("<"===t[r]&&"?"===t[r+1]){if(r+=2,r=p(t,r),r.err)return r}else{if("<"!==t[r]){if(u(t[r]))continue;return b("InvalidChar","char '"+t[r]+"' is not expected.",w(t,r))}{let o=r;if(r++,"!"===t[r]){r=c(t,r);continue}{let a=!1;"/"===t[r]&&(a=!0,r++);let h="";for(;r<t.length&&">"!==t[r]&&" "!==t[r]&&"\t"!==t[r]&&"\n"!==t[r]&&"\r"!==t[r];r++)h+=t[r];if(h=h.trim(),"/"===h[h.length-1]&&(h=h.substring(0,h.length-1),r--),!E(h)){let e;return e=0===h.trim().length?"Invalid space after '<'.":"Tag '"+h+"' is an invalid name.",b("InvalidTag",e,w(t,r))}const l=g(t,r);if(!1===l)return b("InvalidAttr","Attributes for '"+h+"' have open quote.",w(t,r));let d=l.value;if(r=l.index,"/"===d[d.length-1]){const n=r-d.length;d=d.substring(0,d.length-1);const s=x(d,e);if(!0!==s)return b(s.err.code,s.err.msg,w(t,n+s.err.line));i=!0}else if(a){if(!l.tagClosed)return b("InvalidTag","Closing tag '"+h+"' doesn't have proper closing.",w(t,r));if(d.trim().length>0)return b("InvalidTag","Closing tag '"+h+"' can't have attributes or invalid starting.",w(t,o));if(0===n.length)return b("InvalidTag","Closing tag '"+h+"' has not been opened.",w(t,o));{const e=n.pop();if(h!==e.tagName){let n=w(t,e.tagStartPos);return b("InvalidTag","Expected closing tag '"+e.tagName+"' (opened in line "+n.line+", col "+n.col+") instead of closing tag '"+h+"'.",w(t,o))}0==n.length&&(s=!0)}}else{const a=x(d,e);if(!0!==a)return b(a.err.code,a.err.msg,w(t,r-d.length+a.err.line));if(!0===s)return b("InvalidXml","Multiple possible root nodes found.",w(t,r));-1!==e.unpairedTags.indexOf(h)||n.push({tagName:h,tagStartPos:o}),i=!0}for(r++;r<t.length;r++)if("<"===t[r]){if("!"===t[r+1]){r++,r=c(t,r);continue}if("?"!==t[r+1])break;if(r=p(t,++r),r.err)return r}else if("&"===t[r]){const e=N(t,r);if(-1==e)return b("InvalidChar","char '&' is not expected.",w(t,r));r=e}else if(!0===s&&!u(t[r]))return b("InvalidXml","Extra text at the end",w(t,r));"<"===t[r]&&r--}}}return i?1==n.length?b("InvalidTag","Unclosed tag '"+n[0].tagName+"'.",w(t,n[0].tagStartPos)):!(n.length>0)||b("InvalidXml","Invalid '"+JSON.stringify(n.map(t=>t.tagName),null,4).replace(/\r?\n/g,"")+"' found.",{line:1,col:1}):b("InvalidXml","Start tag expected.",1)}function u(t){return" "===t||"\t"===t||"\n"===t||"\r"===t}function p(t,e){const n=e;for(;e<t.length;e++)if("?"==t[e]||" "==t[e]){const i=t.substr(n,e-n);if(e>5&&"xml"===i)return b("InvalidXml","XML declaration allowed only at the start of the document.",w(t,e));if("?"==t[e]&&">"==t[e+1]){e++;break}continue}return e}function c(t,e){if(t.length>e+5&&"-"===t[e+1]&&"-"===t[e+2]){for(e+=3;e<t.length;e++)if("-"===t[e]&&"-"===t[e+1]&&">"===t[e+2]){e+=2;break}}else if(t.length>e+8&&"D"===t[e+1]&&"O"===t[e+2]&&"C"===t[e+3]&&"T"===t[e+4]&&"Y"===t[e+5]&&"P"===t[e+6]&&"E"===t[e+7]){let n=1;for(e+=8;e<t.length;e++)if("<"===t[e])n++;else if(">"===t[e]&&(n--,0===n))break}else if(t.length>e+9&&"["===t[e+1]&&"C"===t[e+2]&&"D"===t[e+3]&&"A"===t[e+4]&&"T"===t[e+5]&&"A"===t[e+6]&&"["===t[e+7])for(e+=8;e<t.length;e++)if("]"===t[e]&&"]"===t[e+1]&&">"===t[e+2]){e+=2;break}return e}const d='"',f="'";function g(t,e){let n="",i="",s=!1;for(;e<t.length;e++){if(t[e]===d||t[e]===f)""===i?i=t[e]:i!==t[e]||(i="");else if(">"===t[e]&&""===i){s=!0;break}n+=t[e]}return""===i&&{value:n,index:e,tagClosed:s}}const m=new RegExp("(\\s*)([^\\s=]+)(\\s*=)?(\\s*(['\"])(([\\s\\S])*?)\\5)?","g");function x(t,e){const n=s(t,m),i={};for(let t=0;t<n.length;t++){if(0===n[t][1].length)return b("InvalidAttr","Attribute '"+n[t][2]+"' has no space in starting.",v(n[t]));if(void 0!==n[t][3]&&void 0===n[t][4])return b("InvalidAttr","Attribute '"+n[t][2]+"' is without value.",v(n[t]));if(void 0===n[t][3]&&!e.allowBooleanAttributes)return b("InvalidAttr","boolean attribute '"+n[t][2]+"' is not allowed.",v(n[t]));const s=n[t][2];if(!y(s))return b("InvalidAttr","Attribute '"+s+"' is an invalid name.",v(n[t]));if(Object.prototype.hasOwnProperty.call(i,s))return b("InvalidAttr","Attribute '"+s+"' is repeated.",v(n[t]));i[s]=1}return!0}function N(t,e){if(";"===t[++e])return-1;if("#"===t[e])return function(t,e){let n=/\d/;for("x"===t[e]&&(e++,n=/[\da-fA-F]/);e<t.length;e++){if(";"===t[e])return e;if(!t[e].match(n))break}return-1}(t,++e);let n=0;for(;e<t.length;e++,n++)if(!(t[e].match(/\w/)&&n<20)){if(";"===t[e])break;return-1}return e}function b(t,e,n){return{err:{code:t,msg:e,line:n.line||n,col:n.col}}}function y(t){return r(t)}function E(t){return r(t)}function w(t,e){const n=t.substring(0,e).split(/\r?\n/);return{line:n.length,col:n[n.length-1].length+1}}function v(t){return t.startIndex+t[1].length}const S=t=>o.includes(t)?"__"+t:t,_={preserveOrder:!1,attributeNamePrefix:"@_",attributesGroupName:!1,textNodeName:"#text",ignoreAttributes:!0,removeNSPrefix:!1,allowBooleanAttributes:!1,parseTagValue:!0,parseAttributeValue:!1,trimValues:!0,cdataPropName:!1,numberParseOptions:{hex:!0,leadingZeros:!0,eNotation:!0},tagValueProcessor:function(t,e){return e},attributeValueProcessor:function(t,e){return e},stopNodes:[],alwaysCreateTextNode:!1,isArray:()=>!1,commentPropName:!1,unpairedTags:[],processEntities:!0,htmlEntities:!1,entityDecoder:null,ignoreDeclaration:!1,ignorePiTags:!1,transformTagName:!1,transformAttributeName:!1,updateTag:function(t,e,n){return t},captureMetaData:!1,maxNestedTags:100,strictReservedNames:!0,jPath:!0,onDangerousProperty:S};function A(t,e){if("string"!=typeof t)return;const n=t.toLowerCase();if(o.some(t=>n===t.toLowerCase()))throw new Error(`[SECURITY] Invalid ${e}: "${t}" is a reserved JavaScript keyword that could cause prototype pollution`);if(a.some(t=>n===t.toLowerCase()))throw new Error(`[SECURITY] Invalid ${e}: "${t}" is a reserved JavaScript keyword that could cause prototype pollution`)}function T(t,e){return"boolean"==typeof t?{enabled:t,maxEntitySize:1e4,maxExpansionDepth:1e4,maxTotalExpansions:1/0,maxExpandedLength:1e5,maxEntityCount:1e3,allowedTags:null,tagFilter:null,appliesTo:"all"}:"object"==typeof t&&null!==t?{enabled:!1!==t.enabled,maxEntitySize:Math.max(1,t.maxEntitySize??1e4),maxExpansionDepth:Math.max(1,t.maxExpansionDepth??1e4),maxTotalExpansions:Math.max(1,t.maxTotalExpansions??1/0),maxExpandedLength:Math.max(1,t.maxExpandedLength??1e5),maxEntityCount:Math.max(1,t.maxEntityCount??1e3),allowedTags:t.allowedTags??null,tagFilter:t.tagFilter??null,appliesTo:t.appliesTo??"all"}:T(!0)}const C=function(t){const e=Object.assign({},_,t),n=[{value:e.attributeNamePrefix,name:"attributeNamePrefix"},{value:e.attributesGroupName,name:"attributesGroupName"},{value:e.textNodeName,name:"textNodeName"},{value:e.cdataPropName,name:"cdataPropName"},{value:e.commentPropName,name:"commentPropName"}];for(const{value:t,name:e}of n)t&&A(t,e);return null===e.onDangerousProperty&&(e.onDangerousProperty=S),e.processEntities=T(e.processEntities,e.htmlEntities),e.unpairedTagsSet=new Set(e.unpairedTags),e.stopNodes&&Array.isArray(e.stopNodes)&&(e.stopNodes=e.stopNodes.map(t=>"string"==typeof t&&t.startsWith("*.")?".."+t.substring(2):t)),e};let P;P="function"!=typeof Symbol?"@@xmlMetadata":Symbol("XML Node Metadata");class O{constructor(t){this.tagname=t,this.child=[],this[":@"]=Object.create(null)}add(t,e){"__proto__"===t&&(t="#__proto__"),this.child.push({[t]:e})}addChild(t,e){"__proto__"===t.tagname&&(t.tagname="#__proto__"),t[":@"]&&Object.keys(t[":@"]).length>0?this.child.push({[t.tagname]:t.child,":@":t[":@"]}):this.child.push({[t.tagname]:t.child}),void 0!==e&&(this.child[this.child.length-1][P]={startIndex:e})}static getMetaDataSymbol(){return P}}class ${constructor(t){this.suppressValidationErr=!t,this.options=t}readDocType(t,e){const n=Object.create(null);let i=0;if("O"!==t[e+3]||"C"!==t[e+4]||"T"!==t[e+5]||"Y"!==t[e+6]||"P"!==t[e+7]||"E"!==t[e+8])throw new Error("Invalid Tag instead of DOCTYPE");{e+=9;let s=1,r=!1,o=!1,a="";for(;e<t.length;e++)if("<"!==t[e]||o)if(">"===t[e]){if(o?"-"===t[e-1]&&"-"===t[e-2]&&(o=!1,s--):s--,0===s)break}else"["===t[e]?r=!0:a+=t[e];else{if(r&&D(t,"!ENTITY",e)){let s,r;if(e+=7,[s,r,e]=this.readEntityExp(t,e+1,this.suppressValidationErr),-1===r.indexOf("&")){if(!1!==this.options.enabled&&null!=this.options.maxEntityCount&&i>=this.options.maxEntityCount)throw new Error(`Entity count (${i+1}) exceeds maximum allowed (${this.options.maxEntityCount})`);n[s]=r,i++}}else if(r&&D(t,"!ELEMENT",e)){e+=8;const{index:n}=this.readElementExp(t,e+1);e=n}else if(r&&D(t,"!ATTLIST",e))e+=8;else if(r&&D(t,"!NOTATION",e)){e+=9;const{index:n}=this.readNotationExp(t,e+1,this.suppressValidationErr);e=n}else{if(!D(t,"!--",e))throw new Error("Invalid DOCTYPE");o=!0}s++,a=""}if(0!==s)throw new Error("Unclosed DOCTYPE")}return{entities:n,i:e}}readEntityExp(t,e){const n=e=I(t,e);for(;e<t.length&&!/\s/.test(t[e])&&'"'!==t[e]&&"'"!==t[e];)e++;let i=t.substring(n,e);if(M(i),e=I(t,e),!this.suppressValidationErr){if("SYSTEM"===t.substring(e,e+6).toUpperCase())throw new Error("External entities are not supported");if("%"===t[e])throw new Error("Parameter entities are not supported")}let s="";if([e,s]=this.readIdentifierVal(t,e,"entity"),!1!==this.options.enabled&&null!=this.options.maxEntitySize&&s.length>this.options.maxEntitySize)throw new Error(`Entity "${i}" size (${s.length}) exceeds maximum allowed size (${this.options.maxEntitySize})`);return[i,s,--e]}readNotationExp(t,e){const n=e=I(t,e);for(;e<t.length&&!/\s/.test(t[e]);)e++;let i=t.substring(n,e);!this.suppressValidationErr&&M(i),e=I(t,e);const s=t.substring(e,e+6).toUpperCase();if(!this.suppressValidationErr&&"SYSTEM"!==s&&"PUBLIC"!==s)throw new Error(`Expected SYSTEM or PUBLIC, found "${s}"`);e+=s.length,e=I(t,e);let r=null,o=null;if("PUBLIC"===s)[e,r]=this.readIdentifierVal(t,e,"publicIdentifier"),'"'!==t[e=I(t,e)]&&"'"!==t[e]||([e,o]=this.readIdentifierVal(t,e,"systemIdentifier"));else if("SYSTEM"===s&&([e,o]=this.readIdentifierVal(t,e,"systemIdentifier"),!this.suppressValidationErr&&!o))throw new Error("Missing mandatory system identifier for SYSTEM notation");return{notationName:i,publicIdentifier:r,systemIdentifier:o,index:--e}}readIdentifierVal(t,e,n){let i="";const s=t[e];if('"'!==s&&"'"!==s)throw new Error(`Expected quoted string, found "${s}"`);const r=++e;for(;e<t.length&&t[e]!==s;)e++;if(i=t.substring(r,e),t[e]!==s)throw new Error(`Unterminated ${n} value`);return[++e,i]}readElementExp(t,e){const n=e=I(t,e);for(;e<t.length&&!/\s/.test(t[e]);)e++;let i=t.substring(n,e);if(!this.suppressValidationErr&&!r(i))throw new Error(`Invalid element name: "${i}"`);let s="";if("E"===t[e=I(t,e)]&&D(t,"MPTY",e))e+=4;else if("A"===t[e]&&D(t,"NY",e))e+=2;else if("("===t[e]){const n=++e;for(;e<t.length&&")"!==t[e];)e++;if(s=t.substring(n,e),")"!==t[e])throw new Error("Unterminated content model")}else if(!this.suppressValidationErr)throw new Error(`Invalid Element Expression, found "${t[e]}"`);return{elementName:i,contentModel:s.trim(),index:e}}readAttlistExp(t,e){let n=e=I(t,e);for(;e<t.length&&!/\s/.test(t[e]);)e++;let i=t.substring(n,e);for(M(i),n=e=I(t,e);e<t.length&&!/\s/.test(t[e]);)e++;let s=t.substring(n,e);if(!M(s))throw new Error(`Invalid attribute name: "${s}"`);e=I(t,e);let r="";if("NOTATION"===t.substring(e,e+8).toUpperCase()){if(r="NOTATION","("!==t[e=I(t,e+=8)])throw new Error(`Expected '(', found "${t[e]}"`);e++;let n=[];for(;e<t.length&&")"!==t[e];){const i=e;for(;e<t.length&&"|"!==t[e]&&")"!==t[e];)e++;let s=t.substring(i,e);if(s=s.trim(),!M(s))throw new Error(`Invalid notation name: "${s}"`);n.push(s),"|"===t[e]&&(e++,e=I(t,e))}if(")"!==t[e])throw new Error("Unterminated list of notations");e++,r+=" ("+n.join("|")+")"}else{const n=e;for(;e<t.length&&!/\s/.test(t[e]);)e++;r+=t.substring(n,e);const i=["CDATA","ID","IDREF","IDREFS","ENTITY","ENTITIES","NMTOKEN","NMTOKENS"];if(!this.suppressValidationErr&&!i.includes(r.toUpperCase()))throw new Error(`Invalid attribute type: "${r}"`)}e=I(t,e);let o="";return"#REQUIRED"===t.substring(e,e+8).toUpperCase()?(o="#REQUIRED",e+=8):"#IMPLIED"===t.substring(e,e+7).toUpperCase()?(o="#IMPLIED",e+=7):[e,o]=this.readIdentifierVal(t,e,"ATTLIST"),{elementName:i,attributeName:s,attributeType:r,defaultValue:o,index:e}}}const I=(t,e)=>{for(;e<t.length&&/\s/.test(t[e]);)e++;return e};function D(t,e,n){for(let i=0;i<e.length;i++)if(e[i]!==t[n+i+1])return!1;return!0}function M(t){if(r(t))return t;throw new Error(`Invalid entity name ${t}`)}const j=/^[-+]?0x[a-fA-F0-9]+$/,V=/^([\-\+])?(0*)([0-9]*(\.[0-9]*)?)$/,L={hex:!0,leadingZeros:!0,decimalPoint:".",eNotation:!0,infinity:"original"};const k=/^([-+])?(0*)(\d*(\.\d*)?[eE][-\+]?\d+)$/;class F{constructor(t){this._matcher=t}get separator(){return this._matcher.separator}getCurrentTag(){const t=this._matcher.path;return t.length>0?t[t.length-1].tag:void 0}getCurrentNamespace(){const t=this._matcher.path;return t.length>0?t[t.length-1].namespace:void 0}getAttrValue(t){const e=this._matcher.path;if(0!==e.length)return e[e.length-1].values?.[t]}hasAttr(t){const e=this._matcher.path;if(0===e.length)return!1;const n=e[e.length-1];return void 0!==n.values&&t in n.values}getPosition(){const t=this._matcher.path;return 0===t.length?-1:t[t.length-1].position??0}getCounter(){const t=this._matcher.path;return 0===t.length?-1:t[t.length-1].counter??0}getIndex(){return this.getPosition()}getDepth(){return this._matcher.path.length}toString(t,e=!0){return this._matcher.toString(t,e)}toArray(){return this._matcher.path.map(t=>t.tag)}matches(t){return this._matcher.matches(t)}matchesAny(t){return t.matchesAny(this._matcher)}}class R{constructor(t={}){this.separator=t.separator||".",this.path=[],this.siblingStacks=[],this._pathStringCache=null,this._view=new F(this)}push(t,e=null,n=null){this._pathStringCache=null,this.path.length>0&&(this.path[this.path.length-1].values=void 0);const i=this.path.length;this.siblingStacks[i]||(this.siblingStacks[i]=new Map);const s=this.siblingStacks[i],r=n?`${n}:${t}`:t,o=s.get(r)||0;let a=0;for(const t of s.values())a+=t;s.set(r,o+1);const h={tag:t,position:a,counter:o};null!=n&&(h.namespace=n),null!=e&&(h.values=e),this.path.push(h)}pop(){if(0===this.path.length)return;this._pathStringCache=null;const t=this.path.pop();return this.siblingStacks.length>this.path.length+1&&(this.siblingStacks.length=this.path.length+1),t}updateCurrent(t){if(this.path.length>0){const e=this.path[this.path.length-1];null!=t&&(e.values=t)}}getCurrentTag(){return this.path.length>0?this.path[this.path.length-1].tag:void 0}getCurrentNamespace(){return this.path.length>0?this.path[this.path.length-1].namespace:void 0}getAttrValue(t){if(0!==this.path.length)return this.path[this.path.length-1].values?.[t]}hasAttr(t){if(0===this.path.length)return!1;const e=this.path[this.path.length-1];return void 0!==e.values&&t in e.values}getPosition(){return 0===this.path.length?-1:this.path[this.path.length-1].position??0}getCounter(){return 0===this.path.length?-1:this.path[this.path.length-1].counter??0}getIndex(){return this.getPosition()}getDepth(){return this.path.length}toString(t,e=!0){const n=t||this.separator;if(n===this.separator&&!0===e){if(null!==this._pathStringCache)return this._pathStringCache;const t=this.path.map(t=>t.namespace?`${t.namespace}:${t.tag}`:t.tag).join(n);return this._pathStringCache=t,t}return this.path.map(t=>e&&t.namespace?`${t.namespace}:${t.tag}`:t.tag).join(n)}toArray(){return this.path.map(t=>t.tag)}reset(){this._pathStringCache=null,this.path=[],this.siblingStacks=[]}matches(t){const e=t.segments;return 0!==e.length&&(t.hasDeepWildcard()?this._matchWithDeepWildcard(e):this._matchSimple(e))}_matchSimple(t){if(this.path.length!==t.length)return!1;for(let e=0;e<t.length;e++)if(!this._matchSegment(t[e],this.path[e],e===this.path.length-1))return!1;return!0}_matchWithDeepWildcard(t){let e=this.path.length-1,n=t.length-1;for(;n>=0&&e>=0;){const i=t[n];if("deep-wildcard"===i.type){if(n--,n<0)return!0;const i=t[n];let s=!1;for(let t=e;t>=0;t--)if(this._matchSegment(i,this.path[t],t===this.path.length-1)){e=t-1,n--,s=!0;break}if(!s)return!1}else{if(!this._matchSegment(i,this.path[e],e===this.path.length-1))return!1;e--,n--}}return n<0}_matchSegment(t,e,n){if("*"!==t.tag&&t.tag!==e.tag)return!1;if(void 0!==t.namespace&&"*"!==t.namespace&&t.namespace!==e.namespace)return!1;if(void 0!==t.attrName){if(!n)return!1;if(!e.values||!(t.attrName in e.values))return!1;if(void 0!==t.attrValue&&String(e.values[t.attrName])!==String(t.attrValue))return!1}if(void 0!==t.position){if(!n)return!1;const i=e.counter??0;if("first"===t.position&&0!==i)return!1;if("odd"===t.position&&i%2!=1)return!1;if("even"===t.position&&i%2!=0)return!1;if("nth"===t.position&&i!==t.positionValue)return!1}return!0}matchesAny(t){return t.matchesAny(this)}snapshot(){return{path:this.path.map(t=>({...t})),siblingStacks:this.siblingStacks.map(t=>new Map(t))}}restore(t){this._pathStringCache=null,this.path=t.path.map(t=>({...t})),this.siblingStacks=t.siblingStacks.map(t=>new Map(t))}readOnly(){return this._view}}class G{constructor(t,e={},n){this.pattern=t,this.separator=e.separator||".",this.segments=this._parse(t),this.data=n,this._hasDeepWildcard=this.segments.some(t=>"deep-wildcard"===t.type),this._hasAttributeCondition=this.segments.some(t=>void 0!==t.attrName),this._hasPositionSelector=this.segments.some(t=>void 0!==t.position)}_parse(t){const e=[];let n=0,i="";for(;n<t.length;)t[n]===this.separator?n+1<t.length&&t[n+1]===this.separator?(i.trim()&&(e.push(this._parseSegment(i.trim())),i=""),e.push({type:"deep-wildcard"}),n+=2):(i.trim()&&e.push(this._parseSegment(i.trim())),i="",n++):(i+=t[n],n++);return i.trim()&&e.push(this._parseSegment(i.trim())),e}_parseSegment(t){const e={type:"tag"};let n=null,i=t;const s=t.match(/^([^\[]+)(\[[^\]]*\])(.*)$/);if(s&&(i=s[1]+s[3],s[2])){const t=s[2].slice(1,-1);t&&(n=t)}let r,o,a=i;if(i.includes("::")){const e=i.indexOf("::");if(r=i.substring(0,e).trim(),a=i.substring(e+2).trim(),!r)throw new Error(`Invalid namespace in pattern: ${t}`)}let h=null;if(a.includes(":")){const t=a.lastIndexOf(":"),e=a.substring(0,t).trim(),n=a.substring(t+1).trim();["first","last","odd","even"].includes(n)||/^nth\(\d+\)$/.test(n)?(o=e,h=n):o=a}else o=a;if(!o)throw new Error(`Invalid segment pattern: ${t}`);if(e.tag=o,r&&(e.namespace=r),n)if(n.includes("=")){const t=n.indexOf("=");e.attrName=n.substring(0,t).trim(),e.attrValue=n.substring(t+1).trim()}else e.attrName=n.trim();if(h){const t=h.match(/^nth\((\d+)\)$/);t?(e.position="nth",e.positionValue=parseInt(t[1],10)):e.position=h}return e}get length(){return this.segments.length}hasDeepWildcard(){return this._hasDeepWildcard}hasAttributeCondition(){return this._hasAttributeCondition}hasPositionSelector(){return this._hasPositionSelector}toString(){return this.pattern}}class B{constructor(){this._byDepthAndTag=new Map,this._wildcardByDepth=new Map,this._deepWildcards=[],this._patterns=new Set,this._sealed=!1}add(t){if(this._sealed)throw new TypeError("ExpressionSet is sealed. Create a new ExpressionSet to add more expressions.");if(this._patterns.has(t.pattern))return this;if(this._patterns.add(t.pattern),t.hasDeepWildcard())return this._deepWildcards.push(t),this;const e=t.length,n=t.segments[t.segments.length-1],i=n?.tag;if(i&&"*"!==i){const n=`${e}:${i}`;this._byDepthAndTag.has(n)||this._byDepthAndTag.set(n,[]),this._byDepthAndTag.get(n).push(t)}else this._wildcardByDepth.has(e)||this._wildcardByDepth.set(e,[]),this._wildcardByDepth.get(e).push(t);return this}addAll(t){for(const e of t)this.add(e);return this}has(t){return this._patterns.has(t.pattern)}get size(){return this._patterns.size}seal(){return this._sealed=!0,this}get isSealed(){return this._sealed}matchesAny(t){return null!==this.findMatch(t)}findMatch(t){const e=t.getDepth(),n=`${e}:${t.getCurrentTag()}`,i=this._byDepthAndTag.get(n);if(i)for(let e=0;e<i.length;e++)if(t.matches(i[e]))return i[e];const s=this._wildcardByDepth.get(e);if(s)for(let e=0;e<s.length;e++)if(t.matches(s[e]))return s[e];for(let e=0;e<this._deepWildcards.length;e++)if(t.matches(this._deepWildcards[e]))return this._deepWildcards[e];return null}}const U={cent:"¢",pound:"£",curren:"¤",yen:"¥",euro:"€",dollar:"$",euro:"€",fnof:"ƒ",inr:"₹",af:"؋",birr:"ብር",peso:"₱",rub:"₽",won:"₩",yuan:"¥",cedil:"¸"},W={amp:"&",apos:"'",gt:">",lt:"<",quot:'"'},X={nbsp:" ",copy:"©",reg:"®",trade:"™",mdash:"—",ndash:"–",hellip:"…",laquo:"«",raquo:"»",lsquo:"‘",rsquo:"’",ldquo:"“",rdquo:"”",bull:"•",para:"¶",sect:"§",deg:"°",frac12:"½",frac14:"¼",frac34:"¾"},Y=new Set("!?\\\\/[]$%{}^&*()<>|+");function z(t){if("#"===t[0])throw new Error(`[EntityReplacer] Invalid character '#' in entity name: "${t}"`);for(const e of t)if(Y.has(e))throw new Error(`[EntityReplacer] Invalid character '${e}' in entity name: "${t}"`);return t}function q(...t){const e=Object.create(null);for(const n of t)if(n)for(const t of Object.keys(n)){const i=n[t];if("string"==typeof i)e[t]=i;else if(i&&"object"==typeof i&&void 0!==i.val){const n=i.val;"string"==typeof n&&(e[t]=n)}}return e}const Z="external",J="base",K="all",Q=Object.freeze({allow:0,leave:1,remove:2,throw:3}),H=new Set([9,10,13]);class tt{constructor(t={}){var e;this._limit=t.limit||{},this._maxTotalExpansions=this._limit.maxTotalExpansions||0,this._maxExpandedLength=this._limit.maxExpandedLength||0,this._postCheck="function"==typeof t.postCheck?t.postCheck:t=>t,this._limitTiers=(e=this._limit.applyLimitsTo??Z)&&e!==Z?e===K?new Set([K]):e===J?new Set([J]):Array.isArray(e)?new Set(e):new Set([Z]):new Set([Z]),this._numericAllowed=t.numericAllowed??!0,this._baseMap=q(W,t.namedEntities||null),this._externalMap=Object.create(null),this._inputMap=Object.create(null),this._totalExpansions=0,this._expandedLength=0,this._removeSet=new Set(t.remove&&Array.isArray(t.remove)?t.remove:[]),this._leaveSet=new Set(t.leave&&Array.isArray(t.leave)?t.leave:[]);const n=function(t){if(!t)return{xmlVersion:1,onLevel:Q.allow,nullLevel:Q.remove};const e=1.1===t.xmlVersion?1.1:1,n=Q[t.onNCR]??Q.allow,i=Q[t.nullNCR]??Q.remove;return{xmlVersion:e,onLevel:n,nullLevel:Math.max(i,Q.remove)}}(t.ncr);this._ncrXmlVersion=n.xmlVersion,this._ncrOnLevel=n.onLevel,this._ncrNullLevel=n.nullLevel}setExternalEntities(t){if(t)for(const e of Object.keys(t))z(e);this._externalMap=q(t)}addExternalEntity(t,e){z(t),"string"==typeof e&&-1===e.indexOf("&")&&(this._externalMap[t]=e)}addInputEntities(t){this._totalExpansions=0,this._expandedLength=0,this._inputMap=q(t)}reset(){return this._inputMap=Object.create(null),this._totalExpansions=0,this._expandedLength=0,this}setXmlVersion(t){this._ncrXmlVersion=1.1===t?1.1:1}decode(t){if("string"!=typeof t||0===t.length)return t;const e=t,n=[],i=t.length;let s=0,r=0;const o=this._maxTotalExpansions>0,a=this._maxExpandedLength>0,h=o||a;for(;r<i;){if(38!==t.charCodeAt(r)){r++;continue}let e=r+1;for(;e<i&&59!==t.charCodeAt(e)&&e-r<=32;)e++;if(e>=i||59!==t.charCodeAt(e)){r++;continue}const l=t.slice(r+1,e);if(0===l.length){r++;continue}let u,p;if(this._removeSet.has(l))u="",void 0===p&&(p=Z);else{if(this._leaveSet.has(l)){r++;continue}if(35===l.charCodeAt(0)){const t=this._resolveNCR(l);if(void 0===t){r++;continue}u=t,p=J}else{const t=this._resolveName(l);u=t?.value,p=t?.tier}}if(void 0!==u){if(r>s&&n.push(t.slice(s,r)),n.push(u),s=e+1,r=s,h&&this._tierCounts(p)){if(o&&(this._totalExpansions++,this._totalExpansions>this._maxTotalExpansions))throw new Error(`[EntityReplacer] Entity expansion count limit exceeded: ${this._totalExpansions} > ${this._maxTotalExpansions}`);if(a){const t=u.length-(l.length+2);if(t>0&&(this._expandedLength+=t,this._expandedLength>this._maxExpandedLength))throw new Error(`[EntityReplacer] Expanded content length limit exceeded: ${this._expandedLength} > ${this._maxExpandedLength}`)}}}else r++}s<i&&n.push(t.slice(s));const l=0===n.length?t:n.join("");return this._postCheck(l,e)}_tierCounts(t){return!!this._limitTiers.has(K)||this._limitTiers.has(t)}_resolveName(t){return t in this._inputMap?{value:this._inputMap[t],tier:Z}:t in this._externalMap?{value:this._externalMap[t],tier:Z}:t in this._baseMap?{value:this._baseMap[t],tier:J}:void 0}_classifyNCR(t){return 0===t?this._ncrNullLevel:t>=55296&&t<=57343||1===this._ncrXmlVersion&&t>=1&&t<=31&&!H.has(t)?Q.remove:-1}_applyNCRAction(t,e,n){switch(t){case Q.allow:return String.fromCodePoint(n);case Q.remove:return"";case Q.leave:return;case Q.throw:throw new Error(`[EntityDecoder] Prohibited numeric character reference &${e}; (U+${n.toString(16).toUpperCase().padStart(4,"0")})`);default:return String.fromCodePoint(n)}}_resolveNCR(t){const e=t.charCodeAt(1);let n;if(n=120===e||88===e?parseInt(t.slice(2),16):parseInt(t.slice(1),10),Number.isNaN(n)||n<0||n>1114111)return;const i=this._classifyNCR(n);if(!this._numericAllowed&&i<Q.remove)return;const s=-1===i?this._ncrOnLevel:Math.max(this._ncrOnLevel,i);return this._applyNCRAction(s,t,n)}}function et(t,e){if(!t)return{};const n=e.attributesGroupName?t[e.attributesGroupName]:t;if(!n)return{};const i={};for(const t in n)t.startsWith(e.attributeNamePrefix)?i[t.substring(e.attributeNamePrefix.length)]=n[t]:i[t]=n[t];return i}function nt(t){if(!t||"string"!=typeof t)return;const e=t.indexOf(":");if(-1!==e&&e>0){const n=t.substring(0,e);if("xmlns"!==n)return n}}class it{constructor(t,e){var n;this.options=t,this.currentNode=null,this.tagsNodeStack=[],this.parseXml=ht,this.parseTextData=st,this.resolveNameSpace=rt,this.buildAttributesMap=at,this.isItStopNode=ct,this.replaceEntitiesValue=ut,this.readStopNodeData=mt,this.saveTextToParentTag=pt,this.addChild=lt,this.ignoreAttributesFn="function"==typeof(n=this.options.ignoreAttributes)?n:Array.isArray(n)?t=>{for(const e of n){if("string"==typeof e&&t===e)return!0;if(e instanceof RegExp&&e.test(t))return!0}}:()=>!1,this.entityExpansionCount=0,this.currentExpandedLength=0;let i={...W};this.options.entityDecoder?this.entityDecoder=this.options.entityDecoder:("object"==typeof this.options.htmlEntities?i=this.options.htmlEntities:!0===this.options.htmlEntities&&(i={...X,...U}),this.entityDecoder=new tt({namedEntities:{...i,...e},numericAllowed:this.options.htmlEntities,limit:{maxTotalExpansions:this.options.processEntities.maxTotalExpansions,maxExpandedLength:this.options.processEntities.maxExpandedLength,applyLimitsTo:this.options.processEntities.appliesTo}})),this.matcher=new R,this.readonlyMatcher=this.matcher.readOnly(),this.isCurrentNodeStopNode=!1,this.stopNodeExpressionsSet=new B;const s=this.options.stopNodes;if(s&&s.length>0){for(let t=0;t<s.length;t++){const e=s[t];"string"==typeof e?this.stopNodeExpressionsSet.add(new G(e)):e instanceof G&&this.stopNodeExpressionsSet.add(e)}this.stopNodeExpressionsSet.seal()}}}function st(t,e,n,i,s,r,o){const a=this.options;if(void 0!==t&&(a.trimValues&&!i&&(t=t.trim()),t.length>0)){o||(t=this.replaceEntitiesValue(t,e,n));const i=a.jPath?n.toString():n,h=a.tagValueProcessor(e,t,i,s,r);return null==h?t:typeof h!=typeof t||h!==t?h:a.trimValues||t.trim()===t?xt(t,a.parseTagValue,a.numberParseOptions):t}}function rt(t){if(this.options.removeNSPrefix){const e=t.split(":"),n="/"===t.charAt(0)?"/":"";if("xmlns"===e[0])return"";2===e.length&&(t=n+e[1])}return t}const ot=new RegExp("([^\\s=]+)\\s*(=\\s*(['\"])([\\s\\S]*?)\\3)?","gm");function at(t,e,n,i=!1){const r=this.options;if(!0===i||!0!==r.ignoreAttributes&&"string"==typeof t){const i=s(t,ot),o=i.length,a={},h=new Array(o);let l=!1;const u={};for(let t=0;t<o;t++){const e=this.resolveNameSpace(i[t][1]),s=i[t][4];if(e.length&&void 0!==s){let i=s;r.trimValues&&(i=i.trim()),i=this.replaceEntitiesValue(i,n,this.readonlyMatcher),h[t]=i,u[e]=i,l=!0}}l&&"object"==typeof e&&e.updateCurrent&&e.updateCurrent(u);const p=r.jPath?e.toString():this.readonlyMatcher;let c=!1;for(let t=0;t<o;t++){const e=this.resolveNameSpace(i[t][1]);if(this.ignoreAttributesFn(e,p))continue;let n=r.attributeNamePrefix+e;if(e.length)if(r.transformAttributeName&&(n=r.transformAttributeName(n)),n=bt(n,r),void 0!==i[t][4]){const i=h[t],s=r.attributeValueProcessor(e,i,p);a[n]=null==s?i:typeof s!=typeof i||s!==i?s:xt(i,r.parseAttributeValue,r.numberParseOptions),c=!0}else r.allowBooleanAttributes&&(a[n]=!0,c=!0)}if(!c)return;if(r.attributesGroupName&&!r.preserveOrder){const t={};return t[r.attributesGroupName]=a,t}return a}}const ht=function(t){t=t.replace(/\r\n?/g,"\n");const e=new O("!xml");let n=e,i="";this.matcher.reset(),this.entityDecoder.reset(),this.entityExpansionCount=0,this.currentExpandedLength=0;const s=this.options,r=new $(s.processEntities),o=t.length;for(let a=0;a<o;a++)if("<"===t[a]){const h=t.charCodeAt(a+1);if(47===h){const e=dt(t,">",a,"Closing Tag is not closed.");let r=t.substring(a+2,e).trim();if(s.removeNSPrefix){const t=r.indexOf(":");-1!==t&&(r=r.substr(t+1))}r=Nt(s.transformTagName,r,"",s).tagName,n&&(i=this.saveTextToParentTag(i,n,this.readonlyMatcher));const o=this.matcher.getCurrentTag();if(r&&s.unpairedTagsSet.has(r))throw new Error(`Unpaired tag can not be used as closing tag: </${r}>`);o&&s.unpairedTagsSet.has(o)&&(this.matcher.pop(),this.tagsNodeStack.pop()),this.matcher.pop(),this.isCurrentNodeStopNode=!1,n=this.tagsNodeStack.pop(),i="",a=e}else if(63===h){let e=gt(t,a,!1,"?>");if(!e)throw new Error("Pi Tag is not closed.");i=this.saveTextToParentTag(i,n,this.readonlyMatcher);const r=this.buildAttributesMap(e.tagExp,this.matcher,e.tagName,!0);if(r){const t=r[this.options.attributeNamePrefix+"version"];this.entityDecoder.setXmlVersion(Number(t)||1)}if(s.ignoreDeclaration&&"?xml"===e.tagName||s.ignorePiTags);else{const t=new O(e.tagName);t.add(s.textNodeName,""),e.tagName!==e.tagExp&&e.attrExpPresent&&!0!==s.ignoreAttributes&&(t[":@"]=r),this.addChild(n,t,this.readonlyMatcher,a)}a=e.closeIndex+1}else if(33===h&&45===t.charCodeAt(a+2)&&45===t.charCodeAt(a+3)){const e=dt(t,"--\x3e",a+4,"Comment is not closed.");if(s.commentPropName){const r=t.substring(a+4,e-2);i=this.saveTextToParentTag(i,n,this.readonlyMatcher),n.add(s.commentPropName,[{[s.textNodeName]:r}])}a=e}else if(33===h&&68===t.charCodeAt(a+2)){const e=r.readDocType(t,a);this.entityDecoder.addInputEntities(e.entities),a=e.i}else if(33===h&&91===t.charCodeAt(a+2)){const e=dt(t,"]]>",a,"CDATA is not closed.")-2,r=t.substring(a+9,e);i=this.saveTextToParentTag(i,n,this.readonlyMatcher);let o=this.parseTextData(r,n.tagname,this.readonlyMatcher,!0,!1,!0,!0);null==o&&(o=""),s.cdataPropName?n.add(s.cdataPropName,[{[s.textNodeName]:r}]):n.add(s.textNodeName,o),a=e+2}else{let r=gt(t,a,s.removeNSPrefix);if(!r){const e=t.substring(Math.max(0,a-50),Math.min(o,a+50));throw new Error(`readTagExp returned undefined at position ${a}. Context: "${e}"`)}let h=r.tagName;const l=r.rawTagName;let u=r.tagExp,p=r.attrExpPresent,c=r.closeIndex;if(({tagName:h,tagExp:u}=Nt(s.transformTagName,h,u,s)),s.strictReservedNames&&(h===s.commentPropName||h===s.cdataPropName||h===s.textNodeName||h===s.attributesGroupName))throw new Error(`Invalid tag name: ${h}`);n&&i&&"!xml"!==n.tagname&&(i=this.saveTextToParentTag(i,n,this.readonlyMatcher,!1));const d=n;d&&s.unpairedTagsSet.has(d.tagname)&&(n=this.tagsNodeStack.pop(),this.matcher.pop());let f=!1;u.length>0&&u.lastIndexOf("/")===u.length-1&&(f=!0,"/"===h[h.length-1]?(h=h.substr(0,h.length-1),u=h):u=u.substr(0,u.length-1),p=h!==u);let g,m=null,x={};g=nt(l),h!==e.tagname&&this.matcher.push(h,{},g),h!==u&&p&&(m=this.buildAttributesMap(u,this.matcher,h),m&&(x=et(m,s))),h!==e.tagname&&(this.isCurrentNodeStopNode=this.isItStopNode());const N=a;if(this.isCurrentNodeStopNode){let e="";if(f)a=r.closeIndex;else if(s.unpairedTagsSet.has(h))a=r.closeIndex;else{const n=this.readStopNodeData(t,l,c+1);if(!n)throw new Error(`Unexpected end of ${l}`);a=n.i,e=n.tagContent}const i=new O(h);m&&(i[":@"]=m),i.add(s.textNodeName,e),this.matcher.pop(),this.isCurrentNodeStopNode=!1,this.addChild(n,i,this.readonlyMatcher,N)}else{if(f){({tagName:h,tagExp:u}=Nt(s.transformTagName,h,u,s));const t=new O(h);m&&(t[":@"]=m),this.addChild(n,t,this.readonlyMatcher,N),this.matcher.pop(),this.isCurrentNodeStopNode=!1}else{if(s.unpairedTagsSet.has(h)){const t=new O(h);m&&(t[":@"]=m),this.addChild(n,t,this.readonlyMatcher,N),this.matcher.pop(),this.isCurrentNodeStopNode=!1,a=r.closeIndex;continue}{const t=new O(h);if(this.tagsNodeStack.length>s.maxNestedTags)throw new Error("Maximum nested tags exceeded");this.tagsNodeStack.push(n),m&&(t[":@"]=m),this.addChild(n,t,this.readonlyMatcher,N),n=t}}i="",a=c}}}else i+=t[a];return e.child};function lt(t,e,n,i){this.options.captureMetaData||(i=void 0);const s=this.options.jPath?n.toString():n,r=this.options.updateTag(e.tagname,s,e[":@"]);!1===r||("string"==typeof r?(e.tagname=r,t.addChild(e,i)):t.addChild(e,i))}function ut(t,e,n){const i=this.options.processEntities;if(!i||!i.enabled)return t;if(i.allowedTags){const s=this.options.jPath?n.toString():n;if(!(Array.isArray(i.allowedTags)?i.allowedTags.includes(e):i.allowedTags(e,s)))return t}if(i.tagFilter){const s=this.options.jPath?n.toString():n;if(!i.tagFilter(e,s))return t}return this.entityDecoder.decode(t)}function pt(t,e,n,i){return t&&(void 0===i&&(i=0===e.child.length),void 0!==(t=this.parseTextData(t,e.tagname,n,!1,!!e[":@"]&&0!==Object.keys(e[":@"]).length,i))&&""!==t&&e.add(this.options.textNodeName,t),t=""),t}function ct(){return 0!==this.stopNodeExpressionsSet.size&&this.matcher.matchesAny(this.stopNodeExpressionsSet)}function dt(t,e,n,i){const s=t.indexOf(e,n);if(-1===s)throw new Error(i);return s+e.length-1}function ft(t,e,n,i){const s=t.indexOf(e,n);if(-1===s)throw new Error(i);return s}function gt(t,e,n,i=">"){const s=function(t,e,n=">"){let i=0;const s=t.length,r=n.charCodeAt(0),o=n.length>1?n.charCodeAt(1):-1;let a="",h=e;for(let n=e;n<s;n++){const e=t.charCodeAt(n);if(i)e===i&&(i=0);else if(34===e||39===e)i=e;else if(e===r){if(-1===o)return a+=t.substring(h,n),{data:a,index:n};if(t.charCodeAt(n+1)===o)return a+=t.substring(h,n),{data:a,index:n}}else 9!==e||i||(a+=t.substring(h,n)+" ",h=n+1)}}(t,e+1,i);if(!s)return;let r=s.data;const o=s.index,a=r.search(/\s/);let h=r,l=!0;-1!==a&&(h=r.substring(0,a),r=r.substring(a+1).trimStart());const u=h;if(n){const t=h.indexOf(":");-1!==t&&(h=h.substr(t+1),l=h!==s.data.substr(t+1))}return{tagName:h,tagExp:r,closeIndex:o,attrExpPresent:l,rawTagName:u}}function mt(t,e,n){const i=n;let s=1;const r=t.length;for(;n<r;n++)if("<"===t[n]){const r=t.charCodeAt(n+1);if(47===r){const r=ft(t,">",n,`${e} is not closed`);if(t.substring(n+2,r).trim()===e&&(s--,0===s))return{tagContent:t.substring(i,n),i:r};n=r}else if(63===r)n=dt(t,"?>",n+1,"StopNode is not closed.");else if(33===r&&45===t.charCodeAt(n+2)&&45===t.charCodeAt(n+3))n=dt(t,"--\x3e",n+3,"StopNode is not closed.");else if(33===r&&91===t.charCodeAt(n+2))n=dt(t,"]]>",n,"StopNode is not closed.")-2;else{const i=gt(t,n,">");i&&((i&&i.tagName)===e&&"/"!==i.tagExp[i.tagExp.length-1]&&s++,n=i.closeIndex)}}}function xt(t,e,n){if(e&&"string"==typeof t){const e=t.trim();return"true"===e||"false"!==e&&function(t,e={}){if(e=Object.assign({},L,e),!t||"string"!=typeof t)return t;let n=t.trim();if(0===n.length)return t;if(void 0!==e.skipLike&&e.skipLike.test(n))return t;if("0"===n)return 0;if(e.hex&&j.test(n))return function(t){if(parseInt)return parseInt(t,16);if(Number.parseInt)return Number.parseInt(t,16);if(window&&window.parseInt)return window.parseInt(t,16);throw new Error("parseInt, Number.parseInt, window.parseInt are not supported")}(n);if(isFinite(n)){if(n.includes("e")||n.includes("E"))return function(t,e,n){if(!n.eNotation)return t;const i=e.match(k);if(i){let s=i[1]||"";const r=-1===i[3].indexOf("e")?"E":"e",o=i[2],a=s?t[o.length+1]===r:t[o.length]===r;return o.length>1&&a?t:(1!==o.length||!i[3].startsWith(`.${r}`)&&i[3][0]!==r)&&o.length>0?n.leadingZeros&&!a?(e=(i[1]||"")+i[3],Number(e)):t:Number(e)}return t}(t,n,e);{const s=V.exec(n);if(s){const r=s[1]||"",o=s[2];let a=(i=s[3])&&-1!==i.indexOf(".")?("."===(i=i.replace(/0+$/,""))?i="0":"."===i[0]?i="0"+i:"."===i[i.length-1]&&(i=i.substring(0,i.length-1)),i):i;const h=r?"."===t[o.length+1]:"."===t[o.length];if(!e.leadingZeros&&(o.length>1||1===o.length&&!h))return t;{const i=Number(n),s=String(i);if(0===i)return i;if(-1!==s.search(/[eE]/))return e.eNotation?i:t;if(-1!==n.indexOf("."))return"0"===s||s===a||s===`${r}${a}`?i:t;let h=o?a:n;return o?h===s||r+h===s?i:t:h===s||h===r+s?i:t}}return t}}var i;return function(t,e,n){const i=e===1/0;switch(n.infinity.toLowerCase()){case"null":return null;case"infinity":return e;case"string":return i?"Infinity":"-Infinity";default:return t}}(t,Number(n),e)}(t,n)}return void 0!==t?t:""}function Nt(t,e,n,i){if(t){const i=t(e);n===e&&(n=i),e=i}return{tagName:e=bt(e,i),tagExp:n}}function bt(t,e){if(a.includes(t))throw new Error(`[SECURITY] Invalid name: "${t}" is a reserved JavaScript keyword that could cause prototype pollution`);return o.includes(t)?e.onDangerousProperty(t):t}const yt=O.getMetaDataSymbol();function Et(t,e){if(!t||"object"!=typeof t)return{};if(!e)return t;const n={};for(const i in t)i.startsWith(e)?n[i.substring(e.length)]=t[i]:n[i]=t[i];return n}function wt(t,e,n,i){return vt(t,e,n,i)}function vt(t,e,n,i){let s;const r={};for(let o=0;o<t.length;o++){const a=t[o],h=St(a);if(void 0!==h&&h!==e.textNodeName){const t=Et(a[":@"]||{},e.attributeNamePrefix);n.push(h,t)}if(h===e.textNodeName)void 0===s?s=a[h]:s+=""+a[h];else{if(void 0===h)continue;if(a[h]){let t=vt(a[h],e,n,i);const s=At(t,e);if(a[":@"]?_t(t,a[":@"],i,e):1!==Object.keys(t).length||void 0===t[e.textNodeName]||e.alwaysCreateTextNode?0===Object.keys(t).length&&(e.alwaysCreateTextNode?t[e.textNodeName]="":t=""):t=t[e.textNodeName],void 0!==a[yt]&&"object"==typeof t&&null!==t&&(t[yt]=a[yt]),void 0!==r[h]&&Object.prototype.hasOwnProperty.call(r,h))Array.isArray(r[h])||(r[h]=[r[h]]),r[h].push(t);else{const n=e.jPath?i.toString():i;e.isArray(h,n,s)?r[h]=[t]:r[h]=t}void 0!==h&&h!==e.textNodeName&&n.pop()}}}return"string"==typeof s?s.length>0&&(r[e.textNodeName]=s):void 0!==s&&(r[e.textNodeName]=s),r}function St(t){const e=Object.keys(t);for(let t=0;t<e.length;t++){const n=e[t];if(":@"!==n)return n}}function _t(t,e,n,i){if(e){const s=Object.keys(e),r=s.length;for(let o=0;o<r;o++){const r=s[o],a=r.startsWith(i.attributeNamePrefix)?r.substring(i.attributeNamePrefix.length):r,h=i.jPath?n.toString()+"."+a:n;i.isArray(r,h,!0,!0)?t[r]=[e[r]]:t[r]=e[r]}}}function At(t,e){const{textNodeName:n}=e,i=Object.keys(t).length;return 0===i||!(1!==i||!t[n]&&"boolean"!=typeof t[n]&&0!==t[n])}class Tt{constructor(t){this.externalEntities={},this.options=C(t)}parse(t,e){if("string"!=typeof t&&t.toString)t=t.toString();else if("string"!=typeof t)throw new Error("XML data is accepted in String or Bytes[] form.");if(e){!0===e&&(e={});const n=l(t,e);if(!0!==n)throw Error(`${n.err.msg}:${n.err.line}:${n.err.col}`)}const n=new it(this.options,this.externalEntities),i=n.parseXml(t);return this.options.preserveOrder||void 0===i?i:wt(i,this.options,n.matcher,n.readonlyMatcher)}addEntity(t,e){if(-1!==e.indexOf("&"))throw new Error("Entity value can't have '&'");if(-1!==t.indexOf("&")||-1!==t.indexOf(";"))throw new Error("An entity must be set without '&' and ';'. Eg. use '#xD' for '&#xD;'");if("&"===e)throw new Error("An entity with value '&' is not permitted");this.externalEntities[t]=e}static getMetaDataSymbol(){return O.getMetaDataSymbol()}}function Ct(t,e){let n="";e.format&&e.indentBy.length>0&&(n="\n");const i=[];if(e.stopNodes&&Array.isArray(e.stopNodes))for(let t=0;t<e.stopNodes.length;t++){const n=e.stopNodes[t];"string"==typeof n?i.push(new G(n)):n instanceof G&&i.push(n)}return Pt(t,e,n,new R,i)}function Pt(t,e,n,i,s){let r="",o=!1;if(e.maxNestedTags&&i.getDepth()>e.maxNestedTags)throw new Error("Maximum nested tags exceeded");if(!Array.isArray(t)){if(null!=t){let n=t.toString();return n=Vt(n,e),n}return""}for(let a=0;a<t.length;a++){const h=t[a],l=Dt(h);if(void 0===l)continue;const u=Ot(h[":@"],e);i.push(l,u);const p=jt(i,s);if(l===e.textNodeName){let t=h[l];p||(t=e.tagValueProcessor(l,t),t=Vt(t,e)),o&&(r+=n),r+=t,o=!1,i.pop();continue}if(l===e.cdataPropName){o&&(r+=n);const t=h[l][0][e.textNodeName];r+=`<![CDATA[${String(t).replace(/\]\]>/g,"]]]]><![CDATA[>")}]]>`,o=!1,i.pop();continue}if(l===e.commentPropName){const t=h[l][0][e.textNodeName];r+=n+`\x3c!--${String(t).replace(/--/g,"- -").replace(/-$/,"- ")}--\x3e`,o=!0,i.pop();continue}if("?"===l[0]){const t=Mt(h[":@"],e,p),s="?xml"===l?"":n;let a=h[l][0][e.textNodeName];a=0!==a.length?" "+a:"",r+=s+`<${l}${a}${t}?>`,o=!0,i.pop();continue}let c=n;""!==c&&(c+=e.indentBy);const d=n+`<${l}${Mt(h[":@"],e,p)}`;let f;f=p?$t(h[l],e):Pt(h[l],e,c,i,s),-1!==e.unpairedTags.indexOf(l)?e.suppressUnpairedNode?r+=d+">":r+=d+"/>":f&&0!==f.length||!e.suppressEmptyNode?f&&f.endsWith(">")?r+=d+`>${f}${n}</${l}>`:(r+=d+">",f&&""!==n&&(f.includes("/>")||f.includes("</"))?r+=n+e.indentBy+f+n:r+=f,r+=`</${l}>`):r+=d+"/>",o=!0,i.pop()}return r}function Ot(t,e){if(!t||e.ignoreAttributes)return null;const n={};let i=!1;for(let s in t)Object.prototype.hasOwnProperty.call(t,s)&&(n[s.startsWith(e.attributeNamePrefix)?s.substr(e.attributeNamePrefix.length):s]=t[s],i=!0);return i?n:null}function $t(t,e){if(!Array.isArray(t))return null!=t?t.toString():"";let n="";for(let i=0;i<t.length;i++){const s=t[i],r=Dt(s);if(r===e.textNodeName)n+=s[r];else if(r===e.cdataPropName)n+=s[r][0][e.textNodeName];else if(r===e.commentPropName)n+=s[r][0][e.textNodeName];else{if(r&&"?"===r[0])continue;if(r){const t=It(s[":@"],e),i=$t(s[r],e);i&&0!==i.length?n+=`<${r}${t}>${i}</${r}>`:n+=`<${r}${t}/>`}}}return n}function It(t,e){let n="";if(t&&!e.ignoreAttributes)for(let i in t){if(!Object.prototype.hasOwnProperty.call(t,i))continue;let s=t[i];!0===s&&e.suppressBooleanAttributes?n+=` ${i.substr(e.attributeNamePrefix.length)}`:n+=` ${i.substr(e.attributeNamePrefix.length)}="${s}"`}return n}function Dt(t){const e=Object.keys(t);for(let n=0;n<e.length;n++){const i=e[n];if(Object.prototype.hasOwnProperty.call(t,i)&&":@"!==i)return i}}function Mt(t,e,n){let i="";if(t&&!e.ignoreAttributes)for(let s in t){if(!Object.prototype.hasOwnProperty.call(t,s))continue;let r;n?r=t[s]:(r=e.attributeValueProcessor(s,t[s]),r=Vt(r,e)),!0===r&&e.suppressBooleanAttributes?i+=` ${s.substr(e.attributeNamePrefix.length)}`:i+=` ${s.substr(e.attributeNamePrefix.length)}="${r}"`}return i}function jt(t,e){if(!e||0===e.length)return!1;for(let n=0;n<e.length;n++)if(t.matches(e[n]))return!0;return!1}function Vt(t,e){if(t&&t.length>0&&e.processEntities)for(let n=0;n<e.entities.length;n++){const i=e.entities[n];t=t.replace(i.regex,i.val)}return t}const Lt={attributeNamePrefix:"@_",attributesGroupName:!1,textNodeName:"#text",ignoreAttributes:!0,cdataPropName:!1,format:!1,indentBy:"  ",suppressEmptyNode:!1,suppressUnpairedNode:!0,suppressBooleanAttributes:!0,tagValueProcessor:function(t,e){return e},attributeValueProcessor:function(t,e){return e},preserveOrder:!1,commentPropName:!1,unpairedTags:[],entities:[{regex:new RegExp("&","g"),val:"&amp;"},{regex:new RegExp(">","g"),val:"&gt;"},{regex:new RegExp("<","g"),val:"&lt;"},{regex:new RegExp("'","g"),val:"&apos;"},{regex:new RegExp('"',"g"),val:"&quot;"}],processEntities:!0,stopNodes:[],oneListGroup:!1,maxNestedTags:100,jPath:!0};function kt(t){if(this.options=Object.assign({},Lt,t),this.options.stopNodes&&Array.isArray(this.options.stopNodes)&&(this.options.stopNodes=this.options.stopNodes.map(t=>"string"==typeof t&&t.startsWith("*.")?".."+t.substring(2):t)),this.stopNodeExpressions=[],this.options.stopNodes&&Array.isArray(this.options.stopNodes))for(let t=0;t<this.options.stopNodes.length;t++){const e=this.options.stopNodes[t];"string"==typeof e?this.stopNodeExpressions.push(new G(e)):e instanceof G&&this.stopNodeExpressions.push(e)}var e;!0===this.options.ignoreAttributes||this.options.attributesGroupName?this.isAttribute=function(){return!1}:(this.ignoreAttributesFn="function"==typeof(e=this.options.ignoreAttributes)?e:Array.isArray(e)?t=>{for(const n of e){if("string"==typeof n&&t===n)return!0;if(n instanceof RegExp&&n.test(t))return!0}}:()=>!1,this.attrPrefixLen=this.options.attributeNamePrefix.length,this.isAttribute=Gt),this.processTextOrObjNode=Ft,this.options.format?(this.indentate=Rt,this.tagEndChar=">\n",this.newLine="\n"):(this.indentate=function(){return""},this.tagEndChar=">",this.newLine="")}function Ft(t,e,n,i){const s=this.extractAttributes(t);if(i.push(e,s),this.checkStopNode(i)){const s=this.buildRawContent(t),r=this.buildAttributesForStopNode(t);return i.pop(),this.buildObjectNode(s,e,r,n)}const r=this.j2x(t,n+1,i);return i.pop(),void 0!==t[this.options.textNodeName]&&1===Object.keys(t).length?this.buildTextValNode(t[this.options.textNodeName],e,r.attrStr,n,i):this.buildObjectNode(r.val,e,r.attrStr,n)}function Rt(t){return this.options.indentBy.repeat(t)}function Gt(t){return!(!t.startsWith(this.options.attributeNamePrefix)||t===this.options.textNodeName)&&t.substr(this.attrPrefixLen)}kt.prototype.build=function(t){if(this.options.preserveOrder)return Ct(t,this.options);{Array.isArray(t)&&this.options.arrayNodeName&&this.options.arrayNodeName.length>1&&(t={[this.options.arrayNodeName]:t});const e=new R;return this.j2x(t,0,e).val}},kt.prototype.j2x=function(t,e,n){let i="",s="";if(this.options.maxNestedTags&&n.getDepth()>=this.options.maxNestedTags)throw new Error("Maximum nested tags exceeded");const r=this.options.jPath?n.toString():n,o=this.checkStopNode(n);for(let a in t)if(Object.prototype.hasOwnProperty.call(t,a))if(void 0===t[a])this.isAttribute(a)&&(s+="");else if(null===t[a])this.isAttribute(a)||a===this.options.cdataPropName?s+="":"?"===a[0]?s+=this.indentate(e)+"<"+a+"?"+this.tagEndChar:s+=this.indentate(e)+"<"+a+"/"+this.tagEndChar;else if(t[a]instanceof Date)s+=this.buildTextValNode(t[a],a,"",e,n);else if("object"!=typeof t[a]){const h=this.isAttribute(a);if(h&&!this.ignoreAttributesFn(h,r))i+=this.buildAttrPairStr(h,""+t[a],o);else if(!h)if(a===this.options.textNodeName){let e=this.options.tagValueProcessor(a,""+t[a]);s+=this.replaceEntitiesValue(e)}else{n.push(a);const i=this.checkStopNode(n);if(n.pop(),i){const n=""+t[a];s+=""===n?this.indentate(e)+"<"+a+this.closeTag(a)+this.tagEndChar:this.indentate(e)+"<"+a+">"+n+"</"+a+this.tagEndChar}else s+=this.buildTextValNode(t[a],a,"",e,n)}}else if(Array.isArray(t[a])){const i=t[a].length;let r="",o="";for(let h=0;h<i;h++){const i=t[a][h];if(void 0===i);else if(null===i)"?"===a[0]?s+=this.indentate(e)+"<"+a+"?"+this.tagEndChar:s+=this.indentate(e)+"<"+a+"/"+this.tagEndChar;else if("object"==typeof i)if(this.options.oneListGroup){n.push(a);const t=this.j2x(i,e+1,n);n.pop(),r+=t.val,this.options.attributesGroupName&&i.hasOwnProperty(this.options.attributesGroupName)&&(o+=t.attrStr)}else r+=this.processTextOrObjNode(i,a,e,n);else if(this.options.oneListGroup){let t=this.options.tagValueProcessor(a,i);t=this.replaceEntitiesValue(t),r+=t}else{n.push(a);const t=this.checkStopNode(n);if(n.pop(),t){const t=""+i;r+=""===t?this.indentate(e)+"<"+a+this.closeTag(a)+this.tagEndChar:this.indentate(e)+"<"+a+">"+t+"</"+a+this.tagEndChar}else r+=this.buildTextValNode(i,a,"",e,n)}}this.options.oneListGroup&&(r=this.buildObjectNode(r,a,o,e)),s+=r}else if(this.options.attributesGroupName&&a===this.options.attributesGroupName){const e=Object.keys(t[a]),n=e.length;for(let s=0;s<n;s++)i+=this.buildAttrPairStr(e[s],""+t[a][e[s]],o)}else s+=this.processTextOrObjNode(t[a],a,e,n);return{attrStr:i,val:s}},kt.prototype.buildAttrPairStr=function(t,e,n){return n||(e=this.options.attributeValueProcessor(t,""+e),e=this.replaceEntitiesValue(e)),this.options.suppressBooleanAttributes&&"true"===e?" "+t:" "+t+'="'+e+'"'},kt.prototype.extractAttributes=function(t){if(!t||"object"!=typeof t)return null;const e={};let n=!1;if(this.options.attributesGroupName&&t[this.options.attributesGroupName]){const i=t[this.options.attributesGroupName];for(let t in i)Object.prototype.hasOwnProperty.call(i,t)&&(e[t.startsWith(this.options.attributeNamePrefix)?t.substring(this.options.attributeNamePrefix.length):t]=i[t],n=!0)}else for(let i in t){if(!Object.prototype.hasOwnProperty.call(t,i))continue;const s=this.isAttribute(i);s&&(e[s]=t[i],n=!0)}return n?e:null},kt.prototype.buildRawContent=function(t){if("string"==typeof t)return t;if("object"!=typeof t||null===t)return String(t);if(void 0!==t[this.options.textNodeName])return t[this.options.textNodeName];let e="";for(let n in t){if(!Object.prototype.hasOwnProperty.call(t,n))continue;if(this.isAttribute(n))continue;if(this.options.attributesGroupName&&n===this.options.attributesGroupName)continue;const i=t[n];if(n===this.options.textNodeName)e+=i;else if(Array.isArray(i)){for(let t of i)if("string"==typeof t||"number"==typeof t)e+=`<${n}>${t}</${n}>`;else if("object"==typeof t&&null!==t){const i=this.buildRawContent(t),s=this.buildAttributesForStopNode(t);e+=""===i?`<${n}${s}/>`:`<${n}${s}>${i}</${n}>`}}else if("object"==typeof i&&null!==i){const t=this.buildRawContent(i),s=this.buildAttributesForStopNode(i);e+=""===t?`<${n}${s}/>`:`<${n}${s}>${t}</${n}>`}else e+=`<${n}>${i}</${n}>`}return e},kt.prototype.buildAttributesForStopNode=function(t){if(!t||"object"!=typeof t)return"";let e="";if(this.options.attributesGroupName&&t[this.options.attributesGroupName]){const n=t[this.options.attributesGroupName];for(let t in n){if(!Object.prototype.hasOwnProperty.call(n,t))continue;const i=t.startsWith(this.options.attributeNamePrefix)?t.substring(this.options.attributeNamePrefix.length):t,s=n[t];!0===s&&this.options.suppressBooleanAttributes?e+=" "+i:e+=" "+i+'="'+s+'"'}}else for(let n in t){if(!Object.prototype.hasOwnProperty.call(t,n))continue;const i=this.isAttribute(n);if(i){const s=t[n];!0===s&&this.options.suppressBooleanAttributes?e+=" "+i:e+=" "+i+'="'+s+'"'}}return e},kt.prototype.buildObjectNode=function(t,e,n,i){if(""===t)return"?"===e[0]?this.indentate(i)+"<"+e+n+"?"+this.tagEndChar:this.indentate(i)+"<"+e+n+this.closeTag(e)+this.tagEndChar;{let s="</"+e+this.tagEndChar,r="";return"?"===e[0]&&(r="?",s=""),!n&&""!==n||-1!==t.indexOf("<")?!1!==this.options.commentPropName&&e===this.options.commentPropName&&0===r.length?this.indentate(i)+`\x3c!--${t}--\x3e`+this.newLine:this.indentate(i)+"<"+e+n+r+this.tagEndChar+t+this.indentate(i)+s:this.indentate(i)+"<"+e+n+r+">"+t+s}},kt.prototype.closeTag=function(t){let e="";return-1!==this.options.unpairedTags.indexOf(t)?this.options.suppressUnpairedNode||(e="/"):e=this.options.suppressEmptyNode?"/":`></${t}`,e},kt.prototype.checkStopNode=function(t){if(!this.stopNodeExpressions||0===this.stopNodeExpressions.length)return!1;for(let e=0;e<this.stopNodeExpressions.length;e++)if(t.matches(this.stopNodeExpressions[e]))return!0;return!1},kt.prototype.buildTextValNode=function(t,e,n,i,s){if(!1!==this.options.cdataPropName&&e===this.options.cdataPropName){const e=String(t).replace(/\]\]>/g,"]]]]><![CDATA[>");return this.indentate(i)+`<![CDATA[${e}]]>`+this.newLine}if(!1!==this.options.commentPropName&&e===this.options.commentPropName){const e=String(t).replace(/--/g,"- -").replace(/-$/,"- ");return this.indentate(i)+`\x3c!--${e}--\x3e`+this.newLine}if("?"===e[0])return this.indentate(i)+"<"+e+n+"?"+this.tagEndChar;{let s=this.options.tagValueProcessor(e,t);return s=this.replaceEntitiesValue(s),""===s?this.indentate(i)+"<"+e+n+this.closeTag(e)+this.tagEndChar:this.indentate(i)+"<"+e+n+">"+s+"</"+e+this.tagEndChar}},kt.prototype.replaceEntitiesValue=function(t){if(t&&t.length>0&&this.options.processEntities)for(let e=0;e<this.options.entities.length;e++){const n=this.options.entities[e];t=t.replace(n.regex,n.val)}return t};const Bt=kt,Ut={validate:l};module.exports=e})();
+(()=>{"use strict";var t={d:(e,i)=>{for(var n in i)t.o(i,n)&&!t.o(e,n)&&Object.defineProperty(e,n,{enumerable:!0,get:i[n]})},o:(t,e)=>Object.prototype.hasOwnProperty.call(t,e),r:t=>{"undefined"!=typeof Symbol&&Symbol.toStringTag&&Object.defineProperty(t,Symbol.toStringTag,{value:"Module"}),Object.defineProperty(t,"__esModule",{value:!0})}},e={};t.r(e),t.d(e,{XMLBuilder:()=>Oe,XMLParser:()=>le,XMLValidator:()=>$e});const i=":A-Za-z_\\u00C0-\\u00D6\\u00D8-\\u00F6\\u00F8-\\u02FF\\u0370-\\u037D\\u037F-\\u1FFF\\u200C-\\u200D\\u2070-\\u218F\\u2C00-\\u2FEF\\u3001-\\uD7FF\\uF900-\\uFDCF\\uFDF0-\\uFFFD",n=new RegExp("^["+i+"]["+i+"\\-.\\d\\u00B7\\u0300-\\u036F\\u203F-\\u2040]*$"),r=function(t){return!(null==n.exec(t))},s=["hasOwnProperty","toString","valueOf","__defineGetter__","__defineSetter__","__lookupGetter__","__lookupSetter__"],o=["__proto__","constructor","prototype"],a={allowBooleanAttributes:!1,unpairedTags:[]};function l(t,e){e=Object.assign({},a,e);const i=[];let n=!1,r=!1;"\ufeff"===t[0]&&(t=t.substr(1));for(let s=0;s<t.length;s++)if("<"===t[s]&&"?"===t[s+1]){if(s+=2,s=p(t,s),s.err)return s}else{if("<"!==t[s]){if(c(t[s]))continue;return x("InvalidChar","char '"+t[s]+"' is not expected.",N(t,s))}{let o=s;if(s++,"!"===t[s]){s=h(t,s);continue}{let a=!1;"/"===t[s]&&(a=!0,s++);let l="";for(;s<t.length&&">"!==t[s]&&" "!==t[s]&&"\t"!==t[s]&&"\n"!==t[s]&&"\r"!==t[s];s++)l+=t[s];if(l=l.trim(),"/"===l[l.length-1]&&(l=l.substring(0,l.length-1),s--),!y(l)){let e;return e=0===l.trim().length?"Invalid space after '<'.":"Tag '"+l+"' is an invalid name.",x("InvalidTag",e,N(t,s))}const d=f(t,s);if(!1===d)return x("InvalidAttr","Attributes for '"+l+"' have open quote.",N(t,s));let u=d.value;if(s=d.index,"/"===u[u.length-1]){const i=s-u.length;u=u.substring(0,u.length-1);const r=g(u,e);if(!0!==r)return x(r.err.code,r.err.msg,N(t,i+r.err.line));n=!0}else if(a){if(!d.tagClosed)return x("InvalidTag","Closing tag '"+l+"' doesn't have proper closing.",N(t,s));if(u.trim().length>0)return x("InvalidTag","Closing tag '"+l+"' can't have attributes or invalid starting.",N(t,o));if(0===i.length)return x("InvalidTag","Closing tag '"+l+"' has not been opened.",N(t,o));{const e=i.pop();if(l!==e.tagName){let i=N(t,e.tagStartPos);return x("InvalidTag","Expected closing tag '"+e.tagName+"' (opened in line "+i.line+", col "+i.col+") instead of closing tag '"+l+"'.",N(t,o))}0==i.length&&(r=!0)}}else{const a=g(u,e);if(!0!==a)return x(a.err.code,a.err.msg,N(t,s-u.length+a.err.line));if(!0===r)return x("InvalidXml","Multiple possible root nodes found.",N(t,s));-1!==e.unpairedTags.indexOf(l)||i.push({tagName:l,tagStartPos:o}),n=!0}for(s++;s<t.length;s++)if("<"===t[s]){if("!"===t[s+1]){s++,s=h(t,s);continue}if("?"!==t[s+1])break;if(s=p(t,++s),s.err)return s}else if("&"===t[s]){const e=m(t,s);if(-1==e)return x("InvalidChar","char '&' is not expected.",N(t,s));s=e}else if(!0===r&&!c(t[s]))return x("InvalidXml","Extra text at the end",N(t,s));"<"===t[s]&&s--}}}return n?1==i.length?x("InvalidTag","Unclosed tag '"+i[0].tagName+"'.",N(t,i[0].tagStartPos)):!(i.length>0)||x("InvalidXml","Invalid '"+JSON.stringify(i.map(t=>t.tagName),null,4).replace(/\r?\n/g,"")+"' found.",{line:1,col:1}):x("InvalidXml","Start tag expected.",1)}function c(t){return" "===t||"\t"===t||"\n"===t||"\r"===t}function p(t,e){const i=e;for(;e<t.length;e++)if("?"==t[e]||" "==t[e]){const n=t.substr(i,e-i);if(e>5&&"xml"===n)return x("InvalidXml","XML declaration allowed only at the start of the document.",N(t,e));if("?"==t[e]&&">"==t[e+1]){e++;break}continue}return e}function h(t,e){if(t.length>e+5&&"-"===t[e+1]&&"-"===t[e+2]){for(e+=3;e<t.length;e++)if("-"===t[e]&&"-"===t[e+1]&&">"===t[e+2]){e+=2;break}}else if(t.length>e+8&&"D"===t[e+1]&&"O"===t[e+2]&&"C"===t[e+3]&&"T"===t[e+4]&&"Y"===t[e+5]&&"P"===t[e+6]&&"E"===t[e+7]){let i=1;for(e+=8;e<t.length;e++)if("<"===t[e])i++;else if(">"===t[e]&&(i--,0===i))break}else if(t.length>e+9&&"["===t[e+1]&&"C"===t[e+2]&&"D"===t[e+3]&&"A"===t[e+4]&&"T"===t[e+5]&&"A"===t[e+6]&&"["===t[e+7])for(e+=8;e<t.length;e++)if("]"===t[e]&&"]"===t[e+1]&&">"===t[e+2]){e+=2;break}return e}const d='"',u="'";function f(t,e){let i="",n="",r=!1;for(;e<t.length;e++){if(t[e]===d||t[e]===u)""===n?n=t[e]:n!==t[e]||(n="");else if(">"===t[e]&&""===n){r=!0;break}i+=t[e]}return""===n&&{value:i,index:e,tagClosed:r}}function g(t,e){const i=function(t){const e=[],i=t.length;let n=0;for(;n<i;){const r=n;for(;n<i&&c(t[n]);)n++;if(n>=i)break;if("="===t[n]){n=r+1;continue}const s=t.slice(r,n),o=n;for(;n<i&&!c(t[n])&&"="!==t[n];)n++;const a=t.slice(o,n);let l,p,h,d=n;for(;d<i&&c(t[d]);)d++;d<i&&"="===t[d]&&(l=t.slice(n,d+1),n=d+1);let u=n;for(;u<i&&c(t[u]);)u++;if(u<i&&('"'===t[u]||"'"===t[u])){const e=u+1,i=t.indexOf(t[u],e);-1!==i&&(p=t[u],h=t.slice(e,i),n=i+1)}const f={startIndex:r};f[1]=s,f[2]=a,f[3]=l,f[4]=void 0!==p||void 0,f[5]=p,f[6]=h,e.push(f)}return e}(t),n={};for(let t=0;t<i.length;t++){if(0===i[t][1].length)return x("InvalidAttr","Attribute '"+i[t][2]+"' has no space in starting.",E(i[t]));if(void 0!==i[t][3]&&void 0===i[t][4])return x("InvalidAttr","Attribute '"+i[t][2]+"' is without value.",E(i[t]));if(void 0===i[t][3]&&!e.allowBooleanAttributes)return x("InvalidAttr","boolean attribute '"+i[t][2]+"' is not allowed.",E(i[t]));const r=i[t][2];if(!b(r))return x("InvalidAttr","Attribute '"+r+"' is an invalid name.",E(i[t]));if(Object.prototype.hasOwnProperty.call(n,r))return x("InvalidAttr","Attribute '"+r+"' is repeated.",E(i[t]));n[r]=1}return!0}function m(t,e){if(";"===t[++e])return-1;if("#"===t[e])return function(t,e){let i=/\d/;for("x"===t[e]&&(e++,i=/[\da-fA-F]/);e<t.length;e++){if(";"===t[e])return e;if(!t[e].match(i))break}return-1}(t,++e);let i=0;for(;e<t.length;e++,i++)if(!(t[e].match(/\w/)&&i<20)){if(";"===t[e])break;return-1}return e}function x(t,e,i){return{err:{code:t,msg:e,line:i.line||i,col:i.col}}}function b(t){return r(t)}function y(t){return r(t)}function N(t,e){const i=t.substring(0,e).split(/\r?\n/);return{line:i.length,col:i[i.length-1].length+1}}function E(t){return t.startIndex+t[1].length}const w=t=>s.includes(t)?"__"+t:t,v={preserveOrder:!1,attributeNamePrefix:"@_",attributesGroupName:!1,textNodeName:"#text",ignoreAttributes:!0,removeNSPrefix:!1,allowBooleanAttributes:!1,parseTagValue:!0,parseAttributeValue:!1,trimValues:!0,cdataPropName:!1,numberParseOptions:{hex:!0,leadingZeros:!0,eNotation:!0,unicode:!1},tagValueProcessor:function(t,e){return e},attributeValueProcessor:function(t,e){return e},stopNodes:[],alwaysCreateTextNode:!1,isArray:()=>!1,commentPropName:!1,unpairedTags:[],processEntities:!0,htmlEntities:!1,entityDecoder:null,ignoreDeclaration:!1,ignorePiTags:!1,transformTagName:!1,transformAttributeName:!1,updateTag:function(t,e,i){return t},captureMetaData:!1,maxNestedTags:100,strictReservedNames:!0,jPath:!0,onDangerousProperty:w};function S(t,e){if("string"!=typeof t)return;const i=t.toLowerCase();if(s.some(t=>i===t.toLowerCase()))throw new Error(`[SECURITY] Invalid ${e}: "${t}" is a reserved JavaScript keyword that could cause prototype pollution`);if(o.some(t=>i===t.toLowerCase()))throw new Error(`[SECURITY] Invalid ${e}: "${t}" is a reserved JavaScript keyword that could cause prototype pollution`)}function A(t,e){return"boolean"==typeof t?{enabled:t,maxEntitySize:1e4,maxExpansionDepth:1e4,maxTotalExpansions:1/0,maxExpandedLength:1e5,maxEntityCount:1e3,allowedTags:null,tagFilter:null,appliesTo:"all"}:"object"==typeof t&&null!==t?{enabled:!1!==t.enabled,maxEntitySize:Math.max(1,t.maxEntitySize??1e4),maxExpansionDepth:Math.max(1,t.maxExpansionDepth??1e4),maxTotalExpansions:Math.max(1,t.maxTotalExpansions??1/0),maxExpandedLength:Math.max(1,t.maxExpandedLength??1e5),maxEntityCount:Math.max(1,t.maxEntityCount??1e3),allowedTags:t.allowedTags??null,tagFilter:t.tagFilter??null,appliesTo:t.appliesTo??"all"}:A(!0)}const T=function(t){const e=Object.assign({},v,t),i=[{value:e.attributeNamePrefix,name:"attributeNamePrefix"},{value:e.attributesGroupName,name:"attributesGroupName"},{value:e.textNodeName,name:"textNodeName"},{value:e.cdataPropName,name:"cdataPropName"},{value:e.commentPropName,name:"commentPropName"}];for(const{value:t,name:e}of i)t&&S(t,e);return null===e.onDangerousProperty&&(e.onDangerousProperty=w),e.processEntities=A(e.processEntities,e.htmlEntities),e.unpairedTagsSet=new Set(e.unpairedTags),e.stopNodes&&Array.isArray(e.stopNodes)&&(e.stopNodes=e.stopNodes.map(t=>"string"==typeof t&&t.startsWith("*.")?".."+t.substring(2):t)),e};let _;_="function"!=typeof Symbol?"@@xmlMetadata":Symbol("XML Node Metadata");class C{constructor(t){this.tagname=t,this.child=[],this[":@"]=Object.create(null)}add(t,e){"__proto__"===t&&(t="#__proto__"),this.child.push({[t]:e})}addChild(t,e){"__proto__"===t.tagname&&(t.tagname="#__proto__"),t[":@"]&&Object.keys(t[":@"]).length>0?this.child.push({[t.tagname]:t.child,":@":t[":@"]}):this.child.push({[t.tagname]:t.child}),this.addStartIndex(e)}addStartIndex(t){void 0!==t&&(this.child[this.child.length-1][_]={startIndex:t})}addEndIndex(t){const e=this.child[this.child.length-1];void 0!==e&&void 0!==e[_]&&void 0===e[_].endIndex&&(e[_].endIndex=t)}static getMetaDataSymbol(){return _}}const O=":A-Za-z_À-ÖØ-öø-˿Ͱ-ͽͿ-҆҈-῿‌-‍⁰-↏Ⰰ-⿯、-퟿豈-﷏ﷰ-�",$=":A-Za-z_À-˿Ͱ-ͽͿ-҆҈-῿‌-‍⁰-↏Ⰰ-⿯、-퟿豈-﷏ﷰ-�𐀀-󯿿",P=$+"\\-\\.\\d·̀-ͯ҇‿-⁀",j=(t,e,i="")=>{const n=`[${t.replace(":","")}][${e.replace(":","")}]*`;return{name:new RegExp(`^[${t}][${e}]*$`,i),ncName:new RegExp(`^${n}$`,i),qName:new RegExp(`^${n}(?::${n})?$`,i),nmToken:new RegExp(`^[${e}]+$`,i),nmTokens:new RegExp(`^[${e}]+(?:\\s+[${e}]+)*$`,i)}},I=j(O,O+"\\-\\.\\d·̀-ͯ‿-⁀"),k=j($,P,"u"),L=":A-Za-z_",D=j(L,L+"\\-\\.\\d"),M=(t="1.0",e=!1)=>e?D:"1.1"===t?k:I,R=(t,{xmlVersion:e="1.0",asciiOnly:i=!1}={})=>M(e,i).qName.test(t),V=["name","ncName","qName","nmToken","nmTokens"],q=(t,{xmlVersion:e="1.0",asciiOnly:i=!1,maxCacheSize:n=2048}={})=>{if(!V.includes(t))throw new TypeError(`Unknown production "${t}". Must be one of: ${V.join(", ")}`);const r=M(e,i)[t];let s=new Map;const o=t=>{const e=s.get(t);if(void 0!==e)return e;const i=r.test(t);return s.size<n&&s.set(t,i),i};return o.reset=()=>{s=new Map},o};class F{constructor(t,e){this.suppressValidationErr=!t,this.options=t,this.xmlVersion=e||1}setXmlVersion(t=1){this.xmlVersion=t}readDocType(t,e){const i=Object.create(null);let n=0;if("O"!==t[e+3]||"C"!==t[e+4]||"T"!==t[e+5]||"Y"!==t[e+6]||"P"!==t[e+7]||"E"!==t[e+8])throw new Error("Invalid Tag instead of DOCTYPE");{e+=9;let r=1,s=!1,o=!1,a=null,l="";for(;e<t.length;e++)if(null===a)if(s||o||'"'!==t[e]&&"'"!==t[e])if("<"!==t[e]||o)if(">"===t[e]){if(o?"-"===t[e-1]&&"-"===t[e-2]&&(o=!1,r--):r--,0===r)break}else"["===t[e]?s=!0:l+=t[e];else{if(s&&B(t,"!ENTITY",e)){let r,s;if(e+=7,[r,s,e]=this.readEntityExp(t,e+1,this.suppressValidationErr),-1===s.indexOf("&")){if(!1!==this.options.enabled&&null!=this.options.maxEntityCount&&n>=this.options.maxEntityCount)throw new Error(`Entity count (${n+1}) exceeds maximum allowed (${this.options.maxEntityCount})`);i[r]=s,n++}}else if(s&&B(t,"!ELEMENT",e)){e+=8;const{index:i}=this.readElementExp(t,e+1);e=i}else if(s&&B(t,"!ATTLIST",e))e+=8;else if(s&&B(t,"!NOTATION",e)){e+=9;const{index:i}=this.readNotationExp(t,e+1,this.suppressValidationErr);e=i}else{if(!B(t,"!--",e))throw new Error("Invalid DOCTYPE");o=!0}r++,l=""}else a=t[e],l+=t[e];else t[e]===a&&(a=null),l+=t[e];if(null!==a||0!==r)throw new Error("Unclosed DOCTYPE")}return{entities:i,i:e}}readEntityExp(t,e){const i=e=U(t,e);for(;e<t.length&&!/\s/.test(t[e])&&'"'!==t[e]&&"'"!==t[e];)e++;let n=t.substring(i,e);if(G(n,{xmlVersion:this.xmlVersion}),e=U(t,e),!this.suppressValidationErr){if("SYSTEM"===t.substring(e,e+6).toUpperCase())throw new Error("External entities are not supported");if("%"===t[e])throw new Error("Parameter entities are not supported")}let r="";if([e,r]=this.readIdentifierVal(t,e,"entity"),!1!==this.options.enabled&&null!=this.options.maxEntitySize&&r.length>this.options.maxEntitySize)throw new Error(`Entity "${n}" size (${r.length}) exceeds maximum allowed size (${this.options.maxEntitySize})`);return[n,r,--e]}readNotationExp(t,e){const i=e=U(t,e);for(;e<t.length&&!/\s/.test(t[e]);)e++;let n=t.substring(i,e);!this.suppressValidationErr&&G(n,{xmlVersion:this.xmlVersion}),e=U(t,e);const r=t.substring(e,e+6).toUpperCase();if(!this.suppressValidationErr&&"SYSTEM"!==r&&"PUBLIC"!==r)throw new Error(`Expected SYSTEM or PUBLIC, found "${r}"`);e+=r.length,e=U(t,e);let s=null,o=null;if("PUBLIC"===r)[e,s]=this.readIdentifierVal(t,e,"publicIdentifier"),'"'!==t[e=U(t,e)]&&"'"!==t[e]||([e,o]=this.readIdentifierVal(t,e,"systemIdentifier"));else if("SYSTEM"===r&&([e,o]=this.readIdentifierVal(t,e,"systemIdentifier"),!this.suppressValidationErr&&!o))throw new Error("Missing mandatory system identifier for SYSTEM notation");return{notationName:n,publicIdentifier:s,systemIdentifier:o,index:--e}}readIdentifierVal(t,e,i){let n="";const r=t[e];if('"'!==r&&"'"!==r)throw new Error(`Expected quoted string, found "${r}"`);const s=++e;for(;e<t.length&&t[e]!==r;)e++;if(n=t.substring(s,e),t[e]!==r)throw new Error(`Unterminated ${i} value`);return[++e,n]}readElementExp(t,e){const i=e=U(t,e);for(;e<t.length&&!/\s/.test(t[e]);)e++;let n=t.substring(i,e);if(!this.suppressValidationErr&&!R(n,{xmlVersion:this.xmlVersion}))throw new Error(`Invalid element name: "${n}"`);let r="";if("E"===t[e=U(t,e)]&&B(t,"MPTY",e))e+=4;else if("A"===t[e]&&B(t,"NY",e))e+=2;else if("("===t[e]){const i=++e;for(;e<t.length&&")"!==t[e];)e++;if(r=t.substring(i,e),")"!==t[e])throw new Error("Unterminated content model")}else if(!this.suppressValidationErr)throw new Error(`Invalid Element Expression, found "${t[e]}"`);return{elementName:n,contentModel:r.trim(),index:e}}readAttlistExp(t,e){let i=e=U(t,e);for(;e<t.length&&!/\s/.test(t[e]);)e++;let n=t.substring(i,e);for(G(n,{xmlVersion:this.xmlVersion}),i=e=U(t,e);e<t.length&&!/\s/.test(t[e]);)e++;let r=t.substring(i,e);if(!G(r,{xmlVersion:this.xmlVersion}))throw new Error(`Invalid attribute name: "${r}"`);e=U(t,e);let s="";if("NOTATION"===t.substring(e,e+8).toUpperCase()){if(s="NOTATION","("!==t[e=U(t,e+=8)])throw new Error(`Expected '(', found "${t[e]}"`);e++;let i=[];for(;e<t.length&&")"!==t[e];){const n=e;for(;e<t.length&&"|"!==t[e]&&")"!==t[e];)e++;let r=t.substring(n,e);if(r=r.trim(),!G(r,{xmlVersion:this.xmlVersion}))throw new Error(`Invalid notation name: "${r}"`);i.push(r),"|"===t[e]&&(e++,e=U(t,e))}if(")"!==t[e])throw new Error("Unterminated list of notations");e++,s+=" ("+i.join("|")+")"}else{const i=e;for(;e<t.length&&!/\s/.test(t[e]);)e++;s+=t.substring(i,e);const n=["CDATA","ID","IDREF","IDREFS","ENTITY","ENTITIES","NMTOKEN","NMTOKENS"];if(!this.suppressValidationErr&&!n.includes(s.toUpperCase()))throw new Error(`Invalid attribute type: "${s}"`)}e=U(t,e);let o="";return"#REQUIRED"===t.substring(e,e+8).toUpperCase()?(o="#REQUIRED",e+=8):"#IMPLIED"===t.substring(e,e+7).toUpperCase()?(o="#IMPLIED",e+=7):[e,o]=this.readIdentifierVal(t,e,"ATTLIST"),{elementName:n,attributeName:r,attributeType:s,defaultValue:o,index:e}}}const U=(t,e)=>{for(;e<t.length&&/\s/.test(t[e]);)e++;return e};function B(t,e,i){for(let n=0;n<e.length;n++)if(e[n]!==t[i+n+1])return!1;return!0}function G(t,e){if(R(t,{xmlVersion:e}))return t;throw new Error(`Invalid entity name ${t}`)}const X=[48,1632,1776,2406,2534,2662,2790,2918,3046,3174,3302,3430,3558,3664,3792,3872,4160,4240,6112,6160,6470,6608,6784,6800,6992,7088,7232,7248,65296,120782,120792,120802,120812,120822,66720,68912,69734,69872,69942,70096,70384,70736,70864,71248,71360,71472,71904,72016,72688,72784,73040,73120,73552,92768,92864,93008,123200,123632,124144,125264,130032],W=new Map,z=1632,Y=new Uint8Array(63904).fill(255);for(const t of X)for(let e=0;e<10;e++){const i=t+e;i<=65535?Y[i-z]=e:W.set(i,e)}const H=new Set([8722,65293,65123]),Q=/^[-+]?0x[a-fA-F0-9]+$/,J=/^0b[01]+$/,Z=/^0o[0-7]+$/,K=/^([\-\+])?(0*)([0-9]*(\.[0-9]*)?)$/,tt={hex:!0,binary:!1,octal:!1,leadingZeros:!0,decimalPoint:".",eNotation:!0,infinity:"original",unicode:!1};function et(t,e={}){if(e=Object.assign({},tt,e),!t||"string"!=typeof t)return t;let i=t.trim();if(0===i.length)return t;if(void 0!==e.skipLike&&e.skipLike.test(i))return t;if("0"===i)return 0;if(e.unicode&&(i=function(t){if("string"!=typeof t)return t;const e=t.length;if(0===e)return t;let i=-1;for(let n=0;n<e;n++){const r=t.charCodeAt(n);if(!(r>=48&&r<=57||45===r))if(r<z){if(H.has(r)){i=n;break}}else if(r>=55296&&r<=56319){if(n+1<e){const e=t.charCodeAt(n+1);if(e>=56320&&e<=57343){const t=65536+(r-55296<<10)+(e-56320);if(W.has(t)){i=n;break}}}}else if(255!==Y[r-z]||H.has(r)){i=n;break}}if(-1===i)return t;const n=[];i>0&&n.push(t.slice(0,i));for(let r=i;r<e;r++){const i=t.charCodeAt(r);if(i>=48&&i<=57||45===i){n.push(t[r]);continue}if(i<z){n.push(H.has(i)?"-":t[r]);continue}if(i>=55296&&i<=56319){if(r+1<e){const e=t.charCodeAt(r+1);if(e>=56320&&e<=57343){const t=65536+(i-55296<<10)+(e-56320),s=W.get(t);if(void 0!==s){n.push(String.fromCharCode(s+48)),r++;continue}}}n.push(t[r]);continue}if(H.has(i)){n.push("-");continue}const s=Y[i-z];n.push(255!==s?String.fromCharCode(s+48):t[r])}return n.join("")}(i),"0"===i))return 0;if(e.hex&&Q.test(i))return nt(i,16);if(e.binary&&J.test(i))return nt(i,2);if(e.octal&&Z.test(i))return nt(i,8);if(isFinite(i)){if(i.includes("e")||i.includes("E"))return function(t,e,i){if(!i.eNotation)return t;const n=e.match(it);if(n){let r=n[1]||"";const s=-1===n[3].indexOf("e")?"E":"e",o=n[2],a=r?e[o.length+1]===s:e[o.length]===s;return o.length>1&&a?t:(1!==o.length||!n[3].startsWith(`.${s}`)&&n[3][0]!==s)&&o.length>0?i.leadingZeros&&!a?Number(e):t:Number(e)}return t}(t,i,e);{const n=K.exec(i);if(n){const r=n[1]||"",s=n[2];let o=function(t){if(t&&-1!==t.indexOf(".")){let e=t.length;for(;e>0&&48===t.charCodeAt(e-1);)e--;return"."===(t=t.slice(0,e))?t="0":"."===t[0]?t="0"+t:"."===t[t.length-1]&&(t=t.substring(0,t.length-1)),t}return t}(n[3]);const a=r?"."===i[s.length+1]:"."===i[s.length];if(!e.leadingZeros&&(s.length>1||1===s.length&&!a))return t;{const n=Number(i),a=String(n);if(0===n)return n;if(-1!==a.search(/[eE]/))return e.eNotation?n:t;if(-1!==i.indexOf("."))return"0"===a||a===o||a===`${r}${o}`?n:t;let l=s?o:i;return s?l===a||r+l===a?n:t:l===a||l===r+a?n:t}}return t}}{const n=Number(i);return Number.isNaN(n)?t:function(t,e,i){const n=e===1/0;switch(i.infinity.toLowerCase()){case"null":return null;case"infinity":return e;case"string":return n?"Infinity":"-Infinity";default:return t}}(t,n,e)}}const it=/^([-+])?(0*)(\d*(\.\d*)?[eE][-\+]?\d+)$/;function nt(t,e){const i=t.trim();if(2!==e&&8!==e||(t=i.substring(2)),parseInt)return parseInt(t,e);if(Number.parseInt)return Number.parseInt(t,e);if(window&&window.parseInt)return window.parseInt(t,e);throw new Error("parseInt, Number.parseInt, window.parseInt are not supported")}class rt{constructor(t){this._matcher=t}get separator(){return this._matcher.separator}getCurrentTag(){const t=this._matcher.path;return t.length>0?t[t.length-1].tag:void 0}getCurrentNamespace(){const t=this._matcher.path;return t.length>0?t[t.length-1].namespace:void 0}getAttrValue(t){const e=this._matcher.path;if(0!==e.length)return e[e.length-1].values?.[t]}hasAttr(t){const e=this._matcher.path;if(0===e.length)return!1;const i=e[e.length-1];return void 0!==i.values&&t in i.values}getAnyParentAttr(t){return this._matcher.getAnyParentAttr(t)}hasAnyParentAttr(t){return this._matcher.hasAnyParentAttr(t)}getPosition(){const t=this._matcher.path;return 0===t.length?-1:t[t.length-1].position??0}getCounter(){const t=this._matcher.path;return 0===t.length?-1:t[t.length-1].counter??0}getIndex(){return this.getPosition()}getDepth(){return this._matcher.path.length}toString(t,e=!0){return this._matcher.toString(t,e)}toArray(){return this._matcher.path.map(t=>t.tag)}matches(t){return this._matcher.matches(t)}matchesAny(t){return t.matchesAny(this._matcher)}}class st{constructor(t={}){this.separator=t.separator||".",this.path=[],this.siblingStacks=[],this._pathStringCache=null,this._view=new rt(this),this._keptAttrs=[]}push(t,e=null,i=null,n=null){this._pathStringCache=null,this.path.length>0&&(this.path[this.path.length-1].values=void 0);const r=this.path.length;let s=this.siblingStacks[r];s||(s={counts:new Map,total:0},this.siblingStacks[r]=s);const o=i?`${i}:${t}`:t,a=s.counts.get(o)||0,l=s.total;s.counts.set(o,a+1),s.total++;const c={tag:t,position:l,counter:a};null!=i&&(c.namespace=i),null!=e&&(c.values=e),this.path.push(c);const p=this.path.length,h=null!==n?n.keep:null;if(null!=h&&h.length>0&&e)for(let t=0;t<h.length;t++){const i=h[t];void 0!==e[i]&&this._keptAttrs.push({depth:p,name:i,value:e[i]})}}pop(){if(0===this.path.length)return;this._pathStringCache=null;const t=this.path.pop();this.siblingStacks.length>this.path.length+1&&(this.siblingStacks.length=this.path.length+1);const e=this.path.length+1;for(;this._keptAttrs.length>0&&this._keptAttrs[this._keptAttrs.length-1].depth>=e;)this._keptAttrs.pop();return t}updateCurrent(t){if(this.path.length>0){const e=this.path[this.path.length-1];null!=t&&(e.values=t)}}getCurrentTag(){return this.path.length>0?this.path[this.path.length-1].tag:void 0}getCurrentNamespace(){return this.path.length>0?this.path[this.path.length-1].namespace:void 0}getAttrValue(t){if(0!==this.path.length)return this.path[this.path.length-1].values?.[t]}hasAttr(t){if(0===this.path.length)return!1;const e=this.path[this.path.length-1];return void 0!==e.values&&t in e.values}getAnyParentAttr(t){const e=this._keptAttrs;for(let i=e.length-1;i>=0;i--)if(e[i].name===t)return e[i].value}hasAnyParentAttr(t){const e=this._keptAttrs;for(let i=e.length-1;i>=0;i--)if(e[i].name===t)return!0;return!1}getPosition(){return 0===this.path.length?-1:this.path[this.path.length-1].position??0}getCounter(){return 0===this.path.length?-1:this.path[this.path.length-1].counter??0}getIndex(){return this.getPosition()}getDepth(){return this.path.length}toString(t,e=!0){const i=t||this.separator;if(i===this.separator&&!0===e){if(null!==this._pathStringCache)return this._pathStringCache;const t=this.path.map(t=>t.namespace?`${t.namespace}:${t.tag}`:t.tag).join(i);return this._pathStringCache=t,t}return this.path.map(t=>e&&t.namespace?`${t.namespace}:${t.tag}`:t.tag).join(i)}toArray(){return this.path.map(t=>t.tag)}reset(){this._pathStringCache=null,this.path=[],this.siblingStacks=[],this._keptAttrs=[]}matches(t){const e=t.segments;return 0!==e.length&&(t.hasDeepWildcard()?this._matchWithDeepWildcard(e):this._matchSimple(e))}_matchSimple(t){if(this.path.length!==t.length)return!1;for(let e=0;e<t.length;e++)if(!this._matchSegment(t[e],this.path[e],e===this.path.length-1))return!1;return!0}_matchWithDeepWildcard(t){let e=this.path.length-1,i=t.length-1;for(;i>=0&&e>=0;){const n=t[i];if("deep-wildcard"===n.type){if(i--,i<0)return!0;const n=t[i];let r=!1;for(let t=e;t>=0;t--)if(this._matchSegment(n,this.path[t],t===this.path.length-1)){e=t-1,i--,r=!0;break}if(!r)return!1}else{if(!this._matchSegment(n,this.path[e],e===this.path.length-1))return!1;e--,i--}}return i<0}_matchSegment(t,e,i){if("*"!==t.tag&&t.tag!==e.tag)return!1;if(void 0!==t.namespace&&"*"!==t.namespace&&t.namespace!==e.namespace)return!1;if(void 0!==t.attrName){if(!i)return!1;if(!e.values||!(t.attrName in e.values))return!1;if(void 0!==t.attrValue&&String(e.values[t.attrName])!==String(t.attrValue))return!1}if(void 0!==t.position){if(!i)return!1;const n=e.counter??0;if("first"===t.position&&0!==n)return!1;if("odd"===t.position&&n%2!=1)return!1;if("even"===t.position&&n%2!=0)return!1;if("nth"===t.position&&n!==t.positionValue)return!1}return!0}matchesAny(t){return t.matchesAny(this)}snapshot(){return{path:this.path.map(t=>({...t})),siblingStacks:this.siblingStacks.map(t=>t?{counts:new Map(t.counts),total:t.total}:t),keptAttrs:this._keptAttrs.map(t=>({...t}))}}restore(t){this._pathStringCache=null,this.path=t.path.map(t=>({...t})),this.siblingStacks=t.siblingStacks.map(t=>t?{counts:new Map(t.counts),total:t.total}:t),this._keptAttrs=(t.keptAttrs||[]).map(t=>({...t}))}readOnly(){return this._view}}class ot{constructor(t,e={},i){this.pattern=t,this.separator=e.separator||".",this.segments=this._parse(t),this.data=i,this._hasDeepWildcard=this.segments.some(t=>"deep-wildcard"===t.type),this._hasAttributeCondition=this.segments.some(t=>void 0!==t.attrName),this._hasPositionSelector=this.segments.some(t=>void 0!==t.position)}_parse(t){const e=[];let i=0,n="";for(;i<t.length;)t[i]===this.separator?i+1<t.length&&t[i+1]===this.separator?(n.trim()&&(e.push(this._parseSegment(n.trim())),n=""),e.push({type:"deep-wildcard"}),i+=2):(n.trim()&&e.push(this._parseSegment(n.trim())),n="",i++):(n+=t[i],i++);return n.trim()&&e.push(this._parseSegment(n.trim())),e}_parseSegment(t){const e={type:"tag"};let i=null,n=t;const r=t.match(/^([^\[]+)(\[[^\]]*\])(.*)$/);if(r&&(n=r[1]+r[3],r[2])){const t=r[2].slice(1,-1);t&&(i=t)}let s,o,a=n;if(n.includes("::")){const e=n.indexOf("::");if(s=n.substring(0,e).trim(),a=n.substring(e+2).trim(),!s)throw new Error(`Invalid namespace in pattern: ${t}`)}let l=null;if(a.includes(":")){const t=a.lastIndexOf(":"),e=a.substring(0,t).trim(),i=a.substring(t+1).trim();["first","last","odd","even"].includes(i)||/^nth\(\d+\)$/.test(i)?(o=e,l=i):o=a}else o=a;if(!o)throw new Error(`Invalid segment pattern: ${t}`);if(e.tag=o,s&&(e.namespace=s),i)if(i.includes("=")){const t=i.indexOf("=");e.attrName=i.substring(0,t).trim(),e.attrValue=i.substring(t+1).trim()}else e.attrName=i.trim();if(l){const t=l.match(/^nth\((\d+)\)$/);t?(e.position="nth",e.positionValue=parseInt(t[1],10)):e.position=l}return e}get length(){return this.segments.length}hasDeepWildcard(){return this._hasDeepWildcard}hasAttributeCondition(){return this._hasAttributeCondition}hasPositionSelector(){return this._hasPositionSelector}toString(){return this.pattern}}class at{constructor(){this._byDepthAndTag=new Map,this._wildcardByDepth=new Map,this._deepWildcards=[],this._deepByTerminalTag=new Map,this._patterns=new Set,this._sealed=!1}add(t){if(this._sealed)throw new TypeError("ExpressionSet is sealed. Create a new ExpressionSet to add more expressions.");if(this._patterns.has(t.pattern))return this;if(this._patterns.add(t.pattern),t.hasDeepWildcard()){const e=t.segments[t.segments.length-1];if(e&&"deep-wildcard"!==e.type&&"*"!==e.tag){const i=e.tag;this._deepByTerminalTag.has(i)||this._deepByTerminalTag.set(i,[]),this._deepByTerminalTag.get(i).push(t)}else this._deepWildcards.push(t);return this}const e=t.length,i=t.segments[t.segments.length-1],n=i?.tag;if(n&&"*"!==n){const i=`${e}:${n}`;this._byDepthAndTag.has(i)||this._byDepthAndTag.set(i,[]),this._byDepthAndTag.get(i).push(t)}else this._wildcardByDepth.has(e)||this._wildcardByDepth.set(e,[]),this._wildcardByDepth.get(e).push(t);return this}addAll(t){for(const e of t)this.add(e);return this}has(t){return this._patterns.has(t.pattern)}get size(){return this._patterns.size}seal(){return this._sealed=!0,this}get isSealed(){return this._sealed}matchesAny(t){return null!==this.findMatch(t)}findMatch(t){const e=t.getDepth(),i=t.getCurrentTag(),n=`${e}:${i}`,r=this._byDepthAndTag.get(n);if(r)for(let e=0;e<r.length;e++)if(t.matches(r[e]))return r[e];const s=this._wildcardByDepth.get(e);if(s)for(let e=0;e<s.length;e++)if(t.matches(s[e]))return s[e];const o=this._deepByTerminalTag.get(i);if(o)for(let e=0;e<o.length;e++)if(t.matches(o[e]))return o[e];for(let e=0;e<this._deepWildcards.length;e++)if(t.matches(this._deepWildcards[e]))return this._deepWildcards[e];return null}}const lt={cent:"¢",pound:"£",curren:"¤",yen:"¥",euro:"€",dollar:"$",fnof:"ƒ",inr:"₹",af:"؋",birr:"ብር",peso:"₱",rub:"₽",won:"₩",yuan:"¥",cedil:"¸"},ct={amp:"&",apos:"'",gt:">",lt:"<",quot:'"'},pt={nbsp:" ",copy:"©",reg:"®",trade:"™",mdash:"—",ndash:"–",hellip:"…",laquo:"«",raquo:"»",lsquo:"‘",rsquo:"’",ldquo:"“",rdquo:"”",bull:"•",para:"¶",sect:"§",deg:"°",frac12:"½",frac14:"¼",frac34:"¾"},ht=Object.freeze({ALLOW:"allow",BLOCK:"block",THROW:"throw"}),dt=new Set("!?\\\\/[]$%{}^&*()<>|+");function ut(t){if("#"===t[0])throw new Error(`[EntityReplacer] Invalid character '#' in entity name: "${t}"`);for(const e of t)if(dt.has(e))throw new Error(`[EntityReplacer] Invalid character '${e}' in entity name: "${t}"`);return t}function ft(...t){const e=Object.create(null);for(const i of t)if(i)for(const t of Object.keys(i)){const n=i[t];if("string"==typeof n)e[t]=n;else if(n&&"object"==typeof n&&void 0!==n.val){const i=n.val;"string"==typeof i&&(e[t]=i)}}return e}const gt="external",mt="base",xt="all",bt=Object.freeze({allow:0,leave:1,remove:2,throw:3}),yt=new Set([9,10,13]);class Nt{constructor(t={}){var e;this._limit=t.limit||{},this._maxTotalExpansions=this._limit.maxTotalExpansions||0,this._maxExpandedLength=this._limit.maxExpandedLength||0,this._postCheck="function"==typeof t.postCheck?t.postCheck:t=>t,this._limitTiers=(e=this._limit.applyLimitsTo??gt)&&e!==gt?e===xt?new Set([xt]):e===mt?new Set([mt]):Array.isArray(e)?new Set(e):new Set([gt]):new Set([gt]),this._numericAllowed=t.numericAllowed??!0,this._baseMap=ft(ct,t.namedEntities||null),this._externalMap=Object.create(null),this._inputMap=Object.create(null),this._totalExpansions=0,this._expandedLength=0,this._removeSet=new Set(t.remove&&Array.isArray(t.remove)?t.remove:[]),this._leaveSet=new Set(t.leave&&Array.isArray(t.leave)?t.leave:[]);const i=function(t){if(!t)return{xmlVersion:1,onLevel:bt.allow,nullLevel:bt.remove};const e=1.1===t.xmlVersion?1.1:1,i=bt[t.onNCR]??bt.allow,n=bt[t.nullNCR]??bt.remove;return{xmlVersion:e,onLevel:i,nullLevel:Math.max(n,bt.remove)}}(t.ncr);this._ncrXmlVersion=i.xmlVersion,this._ncrOnLevel=i.onLevel,this._ncrNullLevel=i.nullLevel,this._onExternalEntity="function"==typeof t.onExternalEntity?t.onExternalEntity:null,this._onInputEntity="function"==typeof t.onInputEntity?t.onInputEntity:null}_applyRegistrationHook(t,e,i,n){if(!t)return!0;const r=t(e,i);if(r===ht.BLOCK)return!1;if(r===ht.THROW)throw new Error(`[EntityDecoder] Registration of ${n} entity "&${e};" was rejected by hook`);return!0}setExternalEntities(t){if(t)for(const e of Object.keys(t))ut(e);if(!this._onExternalEntity)return void(this._externalMap=ft(t));const e=ft(t),i=Object.create(null);for(const[t,n]of Object.entries(e))this._applyRegistrationHook(this._onExternalEntity,t,n,"external")&&(i[t]=n);this._externalMap=i}addExternalEntity(t,e){ut(t),"string"==typeof e&&-1===e.indexOf("&")&&this._applyRegistrationHook(this._onExternalEntity,t,e,"external")&&(this._externalMap[t]=e)}addInputEntities(t){if(this._totalExpansions=0,this._expandedLength=0,!this._onInputEntity)return void(this._inputMap=ft(t));const e=ft(t),i=Object.create(null);for(const[t,n]of Object.entries(e))this._applyRegistrationHook(this._onInputEntity,t,n,"input")&&(i[t]=n);this._inputMap=i}reset(){return this._inputMap=Object.create(null),this._totalExpansions=0,this._expandedLength=0,this}setXmlVersion(t){this._ncrXmlVersion=1.1===t?1.1:1}decode(t){if("string"!=typeof t||0===t.length)return t;if(-1===t.indexOf("&"))return t;const e=t,i=[],n=t.length;let r=0,s=0;const o=this._maxTotalExpansions>0,a=this._maxExpandedLength>0,l=o||a;for(;s<n;){if(38!==t.charCodeAt(s)){s++;continue}let e=s+1;for(;e<n&&59!==t.charCodeAt(e)&&e-s<=32;)e++;if(e>=n||59!==t.charCodeAt(e)){s++;continue}const c=t.slice(s+1,e);if(0===c.length){s++;continue}let p,h;if(this._removeSet.has(c))p="",void 0===h&&(h=gt);else{if(this._leaveSet.has(c)){s++;continue}if(35===c.charCodeAt(0)){const t=this._resolveNCR(c);if(void 0===t){s++;continue}p=t,h=mt}else{const t=this._resolveName(c);p=t?.value,h=t?.tier}}if(void 0!==p){if(s>r&&i.push(t.slice(r,s)),i.push(p),r=e+1,s=r,l&&this._tierCounts(h)){if(o&&(this._totalExpansions++,this._totalExpansions>this._maxTotalExpansions))throw new Error(`[EntityReplacer] Entity expansion count limit exceeded: ${this._totalExpansions} > ${this._maxTotalExpansions}`);if(a){const t=p.length-(c.length+2);if(t>0&&(this._expandedLength+=t,this._expandedLength>this._maxExpandedLength))throw new Error(`[EntityReplacer] Expanded content length limit exceeded: ${this._expandedLength} > ${this._maxExpandedLength}`)}}}else s++}r<n&&i.push(t.slice(r));const c=0===i.length?t:i.join("");return this._postCheck(c,e)}_tierCounts(t){return!!this._limitTiers.has(xt)||this._limitTiers.has(t)}_resolveName(t){return t in this._inputMap?{value:this._inputMap[t],tier:gt}:t in this._externalMap?{value:this._externalMap[t],tier:gt}:t in this._baseMap?{value:this._baseMap[t],tier:mt}:void 0}_classifyNCR(t){return 0===t?this._ncrNullLevel:t>=55296&&t<=57343||1===this._ncrXmlVersion&&t>=1&&t<=31&&!yt.has(t)?bt.remove:-1}_applyNCRAction(t,e,i){switch(t){case bt.allow:return String.fromCodePoint(i);case bt.remove:return"";case bt.leave:return;case bt.throw:throw new Error(`[EntityDecoder] Prohibited numeric character reference &${e}; (U+${i.toString(16).toUpperCase().padStart(4,"0")})`);default:return String.fromCodePoint(i)}}_resolveNCR(t){const e=t.charCodeAt(1);let i;if(i=120===e||88===e?parseInt(t.slice(2),16):parseInt(t.slice(1),10),Number.isNaN(i)||i<0||i>1114111)return;const n=this._classifyNCR(i);if(!this._numericAllowed&&n<bt.remove)return;const r=-1===n?this._ncrOnLevel:Math.max(this._ncrOnLevel,n);return this._applyNCRAction(r,t,i)}}const Et=[{id:"sql-block-comment-open",description:"SQL block comment open: /* ... */ — unusual in legitimate user text",pattern:/\/\*/},{id:"sql-union-select",description:"UNION SELECT — most common SQL injection aggregation attack",pattern:/\bUNION\s{1,20}(?:ALL\s{1,20})?SELECT\b/i},{id:"sql-drop-table",description:"DROP TABLE — destructive DDL injection",pattern:/\bDROP\s{1,20}TABLE\b/i},{id:"sql-drop-database",description:"DROP DATABASE — destructive DDL injection",pattern:/\bDROP\s{1,20}DATABASE\b/i},{id:"sql-insert-into",description:"INSERT INTO — data injection",pattern:/\bINSERT\s{1,20}INTO\b/i},{id:"sql-delete-from",description:"DELETE FROM — data deletion injection",pattern:/\bDELETE\s{1,20}FROM\b/i},{id:"sql-update-set",description:"UPDATE ... SET — data modification injection",pattern:/\bUPDATE\b[\s\S]{1,60}\bSET\b/i},{id:"sql-exec-xp",description:"EXEC xp_ — MSSQL extended stored procedure execution",pattern:/\bEXEC(?:UTE)?\s{1,20}xp_/i},{id:"sql-tautology-string",description:'Classic string tautology: \' OR \'1\'=\'1 or " OR "1"="1"',pattern:/'\s{0,10}OR\s{0,10}'[^']{0,20}'\s*=\s*'[^']{0,20}/i},{id:"sql-tautology-numeric",description:"Numeric tautology: OR 1=1",pattern:/\bOR\s{1,10}1\s*=\s*1\b/i},{id:"sql-always-true-zero",description:"Numeric tautology: OR 0=0",pattern:/\bOR\s{1,10}0\s*=\s*0\b/i},{id:"sql-sleep-benchmark",description:"Time-based blind injection: SLEEP() or BENCHMARK()",pattern:/\b(?:SLEEP|BENCHMARK)\s*\(/i},{id:"sql-waitfor-delay",description:"MSSQL time-based blind injection: WAITFOR DELAY",pattern:/\bWAITFOR\s{1,20}DELAY\b/i},{id:"sql-char-function",description:"CHAR() function — used to obfuscate injected strings",pattern:/\bCHAR\s*\(\s*\d{1,3}/i},{id:"sql-information-schema",description:"INFORMATION_SCHEMA — reconnaissance query for table/column enumeration",pattern:/\bINFORMATION_SCHEMA\b/i}],wt=[...Et,{id:"sql-line-comment",description:"SQL line comment: -- followed by whitespace or end of string",pattern:/--(?:\s|$)/},{id:"sql-stacked-query",description:"Stacked queries: semicolon immediately followed by a SQL keyword",pattern:/;\s{0,10}(?:SELECT|INSERT|UPDATE|DELETE|DROP|CREATE|ALTER|EXEC)\b/i},{id:"sql-hex-encoding",description:"Hex-encoded string injection: 0x41414141 style (MySQL)",pattern:/\b0x[0-9a-f]{4,}/i}],vt=Object.freeze({colon:":",Tab:"\t",NewLine:"\n"}),St=/&(?:#[xX]0*([0-9a-fA-F]{1,6});?|#0*([0-9]{1,7});?|([a-zA-Z][a-zA-Z0-9]{1,15});)/g,At=[{id:"html-script-open",description:"<script opening tag",pattern:/<script[\s>/]/i},{id:"html-script-close",description:"<\/script closing tag",pattern:/<\/script[\s>]/i},{id:"html-javascript-protocol",description:"javascript: URI scheme (with optional whitespace/encoding)",pattern:/j[\t\n\r ]*a[\t\n\r ]*v[\t\n\r ]*a[\t\n\r ]*s[\t\n\r ]*c[\t\n\r ]*r[\t\n\r ]*i[\t\n\r ]*p[\t\n\r ]*t[\t\n\r ]*:/i},{id:"html-vbscript-protocol",description:"vbscript: URI scheme",pattern:/vbscript[\t\n\r ]*:/i},{id:"html-data-html",description:"data:text/html URI — can execute scripts in browsers",pattern:/data[\t\n\r ]*:[\t\n\r ]*text\/html/i},{id:"html-data-xhtml",description:"data:application/xhtml+xml URI",pattern:/data[\t\n\r ]*:[\t\n\r ]*application\/xhtml/i},{id:"html-data-svg",description:"data:image/svg+xml URI — can execute scripts",pattern:/data[\t\n\r ]*:[\t\n\r ]*image\/svg\+xml/i},{id:"html-inline-event-handler",description:"Inline event handler attributes: onclick=, onerror=, onload=, etc.",pattern:/\bon\w{1,30}\s*=/i},{id:"html-entity-obfuscated-script",description:"HTML-entity-encoded <script (e.g. &#x3C;script or &lt;script)",pattern:/(?:&#x0*3[Cc];?|&#0*60;?|&lt;)\s*script/i},{id:"html-entity-obfuscated-javascript",description:'HTML-entity-encoded javascript: (partial — catches common &#106; or &#x6a; for "j")',pattern:/(?:&#x0*6[Aa];?|&#0*106;?)\s*(?:&#x0*61;?|a)[\s\S]{0,80}script\s*:/i},{id:"html-style-expression",description:"CSS expression() — IE-era code execution in style attributes",pattern:/style[\s\S]{0,20}expression\s*\(/i},{id:"html-object-embed",description:"<object or <embed tags that can load active content",pattern:/<(?:object|embed)[\s>/]/i},{id:"html-base-tag",description:"<base href= — can hijack all relative URLs on a page",pattern:/<base[\s>]/i},{id:"html-meta-refresh",description:'<meta http-equiv="refresh" — can redirect users',pattern:/<meta[\s\S]{0,40}http-equiv[\s\S]{0,20}refresh/i},{id:"html-srcdoc",description:"srcdoc= attribute on iframes — embeds HTML that can run scripts",pattern:/srcdoc\s*=/i},{id:"html-iframe",description:"<iframe tag",pattern:/<iframe[\s>/]/i},{id:"html-form",description:"<form tag — can be used for phishing / credential harvesting injection",pattern:/<form[\s>/]/i}],Tt=[{id:"xml-cdata-injection",description:"CDATA section injection: <![CDATA[ breaks out of text node context",pattern:/<!\[CDATA\[/i},{id:"xml-cdata-close",description:"CDATA close sequence: ]]> can terminate an enclosing CDATA section",pattern:/\]\]>/},{id:"xml-processing-instruction",description:"XML processing instruction: <?xml-stylesheet or <?php etc.",pattern:/<\?(?:xml[\- ]|php|asp)/i},{id:"xml-doctype-injection",description:"DOCTYPE declaration embedded in content — can define entities",pattern:/<!DOCTYPE(?:[\s[]|$)/i},{id:"xml-entity-system",description:"SYSTEM keyword — used in external entity declarations (XXE)",pattern:/\bSYSTEM\s+["']/i},{id:"xml-entity-public",description:"PUBLIC keyword — used in external entity declarations (XXE)",pattern:/\bPUBLIC\s+["']/i},{id:"xml-entity-declaration",description:"<!ENTITY declaration — defines entities, potential XXE or entity expansion",pattern:/<!ENTITY[\s%]/i},{id:"xml-billion-laughs",description:"Entity reference chaining / billion laughs: repeated &eX; style references",pattern:/(?:&\w{1,20};){3,}/},{id:"xml-namespace-confusion",description:"xmlns: attribute injection — can redefine namespaces to confuse parsers",pattern:/\bxmlns(?::\w{1,40})?\s*=/i},{id:"xml-comment-injection",description:"\x3c!-- comment injection — can hide content from some parsers",pattern:/<!--/},{id:"xml-comment-close",description:"--\x3e closes an enclosing XML comment",pattern:/-->/},{id:"xml-pi-close",description:"?> closes an enclosing processing instruction",pattern:/\?>/}],_t=[{id:"svg-script-element",description:"<script element inside SVG executes JavaScript",pattern:/<script[\s>/]/i},{id:"svg-xlink-href-javascript",description:"xlink:href with javascript: — classic SVG XSS via <a> or <use>",pattern:/xlink\s*:\s*href\s*=\s*["']?\s*javascript\s*:/i},{id:"svg-href-javascript",description:"href= with javascript: in SVG context (<a>, <animate>, etc.)",pattern:/href\s*=\s*["']?\s*javascript\s*:/i},{id:"svg-foreignobject",description:"<foreignObject embeds HTML inside SVG — can execute scripts",pattern:/<foreignObject[\s>/]/i},{id:"svg-use-external",description:"<use xlink:href or href pointing to external resource (non-fragment URL)",pattern:/<use[\s\S]{0,60}(?:xlink\s*:\s*)?href\s*=\s*(?:["'][^#]|[^"'#\s>])/i},{id:"svg-animate-href",description:'<animate attributeName="href" — can dynamically change href to javascript:',pattern:/<animate[\s\S]{0,80}attributeName\s*=\s*["'][\s]*href["']/i},{id:"svg-animate-xlinkhref",description:'<animate attributeName="xlink:href"',pattern:/<animate[\s\S]{0,80}attributeName\s*=\s*["'][\s]*xlink\s*:\s*href["']/i},{id:"svg-set-javascript",description:'<set to="javascript:..." — sets an attribute to a javascript: URI',pattern:/<set[\s\S]{0,80}to\s*=\s*["']?\s*javascript\s*:/i},{id:"svg-event-handler",description:"SVG-specific event handler attributes: onload=, onerror=, onactivate=, etc.",pattern:/\bon(?:load|error|activate|begin|end|repeat|focus|blur|click|mouse\w{1,20}|key\w{1,20})\s*=/i},{id:"svg-handler-generic",description:"Generic on* handler catch-all for SVG attributes",pattern:/\bon\w{1,30}\s*=/i},{id:"svg-filter-feimage",description:"<feImage href= — filter primitive that can load external resources",pattern:/<feImage[\s\S]{0,80}(?:xlink\s*:\s*)?href\s*=/i},{id:"svg-image-external",description:"<image xlink:href with http/https or javascript protocol",pattern:/<image[\s\S]{0,80}(?:xlink\s*:\s*)?href\s*=\s*["']?\s*(?:https?|javascript)\s*:/i},{id:"svg-style-javascript",description:"style= attribute containing javascript: (e.g. background:url(javascript:...))",pattern:/style\s*=[\s\S]{0,60}javascript\s*:/i}],Ct=[{id:"shell-path-traversal-unix",description:"Unix path traversal: ../  — climbing the directory tree",pattern:/\.\.\//},{id:"shell-path-traversal-windows",description:"Windows path traversal: ..\\ — climbing the directory tree",pattern:/\.\.\\/},{id:"shell-path-traversal-encoded",description:"URL-encoded path traversal: %2e%2e or %2f variants",pattern:/%2e%2e|%2f\.\.|\.\.%2f/i},{id:"shell-null-byte",description:"Null byte injection: \\x00 or %00 — truncates strings in C-backed functions",pattern:/\x00|%00/},{id:"shell-semicolon",description:"Semicolon command separator: cmd1; cmd2",pattern:/;/},{id:"shell-pipe",description:"Pipe operator: cmd1 | cmd2",pattern:/\|/},{id:"shell-and-operator",description:"AND operator: cmd1 && cmd2",pattern:/&&/},{id:"shell-or-operator",description:"OR operator: cmd1 || cmd2",pattern:/\|\|/},{id:"shell-backtick",description:"Backtick command substitution: `cmd`",pattern:/`/},{id:"shell-dollar-paren",description:"Dollar-paren command substitution: $(cmd)",pattern:/\$\(/},{id:"shell-dollar-brace",description:"Dollar-brace variable expansion: ${var} — can be abused for injection",pattern:/\$\{/},{id:"shell-redirect-out",description:"Output redirection: cmd > file or cmd >> file",pattern:/>{1,2}/},{id:"shell-redirect-in",description:"Input redirection: cmd < file",pattern:/</},{id:"shell-newline-injection",description:"Newline injection: \\n or \\r — can inject new shell commands",pattern:/[\n\r]/},{id:"shell-glob-star",description:"Glob expansion: * or ? — can expand to unintended files",pattern:/[/\\][*?]/},{id:"shell-absolute-root",description:"Absolute root path injection: string starting with / or \\ (Windows UNC)",pattern:/^(?:\/|\\\\)/},{id:"shell-windows-drive",description:"Windows drive letter path injection: C:\\ or D:/",pattern:/^[a-zA-Z]:[/\\]/},{id:"shell-curl-wget",description:"curl/wget with URL or flags — can exfiltrate data or download payloads",pattern:/\b(?:curl|wget)\s+(?:https?:\/\/|ftp:\/\/|-)/i}],Ot=[{id:"redos-nested-quantifier-plus",description:"Nested + quantifier inside a group with outer quantifier: (a+)+, (.+b)*, etc.",pattern:/\([^)]*\+[^)]*\)[+*]/},{id:"redos-nested-quantifier-star",description:"Nested * quantifier: (a*)* or (a*)+ — catastrophic backtracking",pattern:/\([^)]*\*[^)]*\)[*+]/},{id:"redos-nested-groups",description:"Doubly nested quantified groups: ((a+)+) — guaranteed catastrophic",pattern:/\(\([^)]{0,40}\)[+*]\)[+*]/},{id:"redos-alternation-overlap",description:"Overlapping alternation under quantifier: (a|a)+ — ambiguous NFA paths",pattern:/\(([^|()]{1,20})\|(?:\1)(?:\|[^|()]{1,20}){0,5}\)[+*?]{1,2}/},{id:"redos-star-plus-concat",description:"(x*x)+ pattern — triggers super-linear backtracking",pattern:/\([^)]{0,10}\*[^)]{0,10}\)[+*]/},{id:"redos-dot-star-greedy",description:"(.*){n,} or (.+){n,} — repeated greedy dot quantifiers",pattern:/\(\.[*+]\)\{?\d/},{id:"redos-large-repetition",description:"Very large fixed or range repetition count {1000,} or {1000,n} — denial of service via backtracking",pattern:/\{\d{4,}(?:,\d*)?\}/},{id:"redos-catastrophic-alternation",description:"Long alternation with many similar branches — polynomial backtracking risk",pattern:/\([^)]{0,200}(?:\|[^|)]{0,50}){9,}\)/}],$t="[\"'\\s]*:",Pt=[{id:"nosql-where-operator",description:"$where — executes arbitrary JavaScript server-side in MongoDB",pattern:new RegExp(`\\$where${$t}`,"i")},{id:"nosql-ne-operator",description:'$ne — "not equal" operator used to bypass equality checks',pattern:new RegExp(`\\$ne${$t}`,"i")},{id:"nosql-gt-operator",description:'$gt — "greater than" used to bypass password/value checks',pattern:new RegExp(`\\$gte?${$t}`,"i")},{id:"nosql-lt-operator",description:'$lt / $lte — "less than" bypass variants',pattern:new RegExp(`\\$lte?${$t}`,"i")},{id:"nosql-regex-operator",description:"$regex — can be used to extract data character by character (blind injection)",pattern:new RegExp(`\\$regex${$t}`,"i")},{id:"nosql-or-operator",description:"$or — logical OR; used to create always-true conditions",pattern:new RegExp(`\\$or${$t}\\s*\\[`,"i")},{id:"nosql-and-operator",description:"$and — logical AND operator injection",pattern:new RegExp(`\\$and${$t}\\s*\\[`,"i")},{id:"nosql-nor-operator",description:"$nor — logical NOR operator injection",pattern:new RegExp(`\\$nor${$t}\\s*\\[`,"i")},{id:"nosql-exists-operator",description:"$exists — can enumerate fields to determine schema",pattern:new RegExp(`\\$exists${$t}`,"i")},{id:"nosql-in-operator",description:"$in — matches any value in a list; can enumerate values",pattern:new RegExp(`\\$in${$t}\\s*\\[`,"i")},{id:"nosql-expr-operator",description:"$expr — allows aggregation expressions in queries (MongoDB 3.6+)",pattern:new RegExp(`\\$expr${$t}`,"i")},{id:"nosql-function-operator",description:"$function — executes arbitrary JavaScript in MongoDB 4.4+",pattern:new RegExp(`\\$function${$t}`,"i")},{id:"nosql-accumulator-operator",description:"$accumulator — custom aggregation with arbitrary JS execution",pattern:new RegExp(`\\$accumulator${$t}`,"i")},{id:"nosql-proto-pollution",description:"__proto__ — prototype pollution via object key injection",pattern:/__proto__/},{id:"nosql-constructor-prototype",description:"constructor.prototype — alternative prototype pollution vector (dot notation or JSON key)",pattern:/constructor[\s"':.,{\[]*prototype/i},{id:"nosql-proto-bracket",description:'["__proto__"] — bracket-notation prototype pollution',pattern:/\[["']__proto__["']\]/}],jt=[{id:"log-crlf-injection",description:"CRLF injection: literal \\r or \\n embeds fake log lines",pattern:/[\r\n]/},{id:"log-url-encoded-crlf",description:"URL-encoded CRLF: %0d, %0a, %0D, %0A — decoded by some log parsers",pattern:/%0[dDaA]/},{id:"log-unicode-newline",description:"Unicode newline variants: U+2028 (line separator), U+2029 (paragraph separator)",pattern:/[\u2028\u2029]/},{id:"log-log4shell-jndi",description:"Log4Shell: ${jndi:...} triggers remote code execution in Apache Log4j",pattern:/\$\{jndi\s*:/i},{id:"log-log4shell-obfuscated",description:"Obfuscated Log4Shell: ${::-j}... lookup-bypass prefix used to evade WAF detection",pattern:/\$\{::-/},{id:"log-log4j-lookup",description:"Log4j lookup syntax: ${env:...}, ${sys:...}, ${ctx:...} — data exfiltration",pattern:/\$\{(?:env|sys|ctx|main|map|sd|web|docker|k8s|spring)\s*:/i},{id:"log-ssti-double-brace",description:"SSTI double-brace: {{expression}} — Jinja2, Twig, Handlebars, etc.",pattern:/\{\{[\s\S]{0,80}\}\}/},{id:"log-ssti-hash-brace",description:"SSTI hash-brace: #{expression} — Thymeleaf, Velocity, Ruby ERB",pattern:/#\{[\s\S]{0,80}\}/},{id:"log-ssti-dollar-brace",description:"SSTI/EL injection: ${expression with operators or method calls} — JSP EL, Freemarker, SpEL",pattern:/\$\{[^}]*(?:\.|\(|\*|\+|\bclass\b|\bruntime\b|\bprocess\b|\bexec\b)[^}]{0,80}\}/i},{id:"log-ssti-percent-tag",description:"SSTI ERB/ASP tag: <%= expression %> — Ruby ERB, ASP",pattern:/<%=[\s\S]{0,80}%>/},{id:"log-null-byte",description:"Null byte: \\x00 or %00 — can truncate log entries in C-backed loggers",pattern:/\x00|%00/},{id:"log-ansi-escape",description:"ANSI escape sequence: ESC[ — can manipulate terminal output when logs are tailed",pattern:/\x1b\[/}];function It(t,e){const i=e.label??"CUSTOM",n=function(t,e){if(!e.decodeEntities)return null;const i=-1===(n=t).indexOf("&")?n:n.replace(St,(t,e,i,n)=>{if(void 0!==n)return Object.prototype.hasOwnProperty.call(vt,n)?vt[n]:t;const r=void 0!==e?parseInt(e,16):parseInt(i,10);return!Number.isFinite(r)||r>1114111?t:String.fromCodePoint(r)});var n;return i===t?null:i}(t,e);for(const r of e)if(r.pattern.test(t)||null!==n&&r.pattern.test(n))return{context:i,id:r.id,description:r.description,pattern:r.pattern};return null}function kt(t,e){(function(t){if("string"!=typeof t)throw new TypeError("is-unsafe: first argument must be a string, got "+typeof t)})(t),function(t){if(!(t instanceof RegExp)){if(!Array.isArray(t))throw new TypeError("is-unsafe: second argument must be a PatternList (e.g. HTML), an array of PatternLists (e.g. [HTML, XML]), or a RegExp. Got: "+typeof t);if(0===t.length)throw new TypeError("is-unsafe: context must not be an empty array");if(Array.isArray(t[0]))for(const e of t)if(!Array.isArray(e)||0===e.length)throw new TypeError("is-unsafe: each context in the array must be a non-empty pattern array (PatternList)")}}(e);const{lists:i,regex:n}=function(t){return t instanceof RegExp?{lists:null,regex:t}:Array.isArray(t[0])?{lists:t,regex:null}:{lists:[t],regex:null}}(e);if(n)return n.test(t);for(const e of i)if(null!==It(t,e))return!0;return!1}function Lt(t,e){if(!t)return{};const i=e.attributesGroupName?t[e.attributesGroupName]:t;if(!i)return{};const n={};for(const t in i)t.startsWith(e.attributeNamePrefix)?n[t.substring(e.attributeNamePrefix.length)]=i[t]:n[t]=i[t];return n}function Dt(t){if(!t||"string"!=typeof t)return;const e=t.indexOf(":");if(-1!==e&&e>0){const i=t.substring(0,e);if("xmlns"!==i)return i}}At.label="HTML",Tt.label="XML",_t.label="SVG",At.decodeEntities=!0,Tt.decodeEntities=!0,_t.decodeEntities=!0,Et.label="SQL",wt.label="SQL-STRICT",Ct.label="SHELL",Ot.label="REDOS",Pt.label="NOSQL",jt.label="LOG",Object.freeze({HTML:At,XML:Tt,SVG:_t,SQL:Et,"SQL-STRICT":wt,SHELL:Ct,REDOS:Ot,NOSQL:Pt,LOG:jt});class Mt{constructor(t,e){var i;this.options=t,this.currentNode=null,this.tagsNodeStack=[],this.parseXml=Ut,this.parseTextData=Rt,this.resolveNameSpace=Vt,this.buildAttributesMap=Ft,this.isItStopNode=zt,this.replaceEntitiesValue=Xt,this.readStopNodeData=Jt,this.saveTextToParentTag=Wt,this.addChild=Gt,this.ignoreAttributesFn="function"==typeof(i=this.options.ignoreAttributes)?i:Array.isArray(i)?t=>{for(const e of i){if("string"==typeof e&&t===e)return!0;if(e instanceof RegExp&&e.test(t))return!0}}:()=>!1,this.entityExpansionCount=0,this.currentExpandedLength=0,this.doctypefound=!1;let n={...ct};this.options.entityDecoder?this.entityDecoder=this.options.entityDecoder:("object"==typeof this.options.htmlEntities?n=this.options.htmlEntities:!0===this.options.htmlEntities&&(n={...pt,...lt}),this.entityDecoder=new Nt({namedEntities:{...n,...e},numericAllowed:this.options.htmlEntities,limit:{maxTotalExpansions:this.options.processEntities.maxTotalExpansions,maxExpandedLength:this.options.processEntities.maxExpandedLength,applyLimitsTo:this.options.processEntities.appliesTo},onInputEntity:(t,e)=>kt(e,[At,Tt])?ht.BLOCK:ht.ALLOW})),this.matcher=new st,this.readonlyMatcher=this.matcher.readOnly(),this.isCurrentNodeStopNode=!1,this.stopNodeExpressionsSet=new at;const r=this.options.stopNodes;if(r&&r.length>0){for(let t=0;t<r.length;t++){const e=r[t];"string"==typeof e?this.stopNodeExpressionsSet.add(new ot(e)):e instanceof ot&&this.stopNodeExpressionsSet.add(e)}this.stopNodeExpressionsSet.seal()}}}function Rt(t,e,i,n,r,s,o){const a=this.options;if(void 0!==t&&(a.trimValues&&!n&&(t=t.trim()),t.length>0)){o||(t=this.replaceEntitiesValue(t,e,i));const n=a.jPath?i.toString():i,l=a.tagValueProcessor(e,t,n,r,s);return null==l?t:typeof l!=typeof t||l!==t?l:a.trimValues||t.trim()===t?Zt(t,a.parseTagValue,a.numberParseOptions):t}}function Vt(t){if(this.options.removeNSPrefix){const e=t.split(":"),i="/"===t.charAt(0)?"/":"";if("xmlns"===e[0])return"";2===e.length&&(t=i+e[1])}return t}const qt=new RegExp("([^\\s=]+)\\s*(=\\s*(['\"])([\\s\\S]*?)\\3)?","gm");function Ft(t,e,i,n=!1){const r=this.options;if(!0===n||!0!==r.ignoreAttributes&&"string"==typeof t){const n=function(t,e){const i=[];let n=e.exec(t);for(;n;){const r=[];r.startIndex=e.lastIndex-n[0].length;const s=n.length;for(let t=0;t<s;t++)r.push(n[t]);i.push(r),n=e.exec(t)}return i}(t,qt),s=n.length,o={},a=new Array(s);let l=!1;const c={};for(let t=0;t<s;t++){const e=this.resolveNameSpace(n[t][1]),s=n[t][4];if(e.length&&void 0!==s){let n=s;r.trimValues&&(n=n.trim()),n=this.replaceEntitiesValue(n,i,this.readonlyMatcher),a[t]=n,c[e]=n,l=!0}}l&&"object"==typeof e&&e.updateCurrent&&e.updateCurrent(c);const p=r.jPath?e.toString():this.readonlyMatcher;let h=!1;for(let t=0;t<s;t++){const e=this.resolveNameSpace(n[t][1]);if(this.ignoreAttributesFn(e,p))continue;let i=r.attributeNamePrefix+e;if(e.length)if(r.transformAttributeName&&(i=r.transformAttributeName(i)),i=te(i,r),void 0!==n[t][4]){const n=a[t],s=r.attributeValueProcessor(e,n,p);o[i]=null==s?n:typeof s!=typeof n||s!==n?s:Zt(n,r.parseAttributeValue,r.numberParseOptions),h=!0}else r.allowBooleanAttributes&&(o[i]=!0,h=!0)}if(!h)return;if(r.attributesGroupName&&!r.preserveOrder){const t={};return t[r.attributesGroupName]=o,t}return o}}const Ut=function(t){const e=this.options,i=e.captureMetaData?[]:void 0;t=t.replace(/\r\n?/g,e.captureMetaData?(t,e)=>(2===t.length&&i.push(e-i.length),"\n"):"\n");const n=new C("!xml");let r=n,s="";this.matcher.reset(),this.entityDecoder.reset(),this.entityExpansionCount=0,this.currentExpandedLength=0,this.doctypefound=!1;const o=new F(e.processEntities),a=t.length;for(let l=0;l<a;l++)if("<"===t[l]){const c=t.charCodeAt(l+1);if(47===c){const o=Yt(t,">",l,"Closing Tag is not closed.");let a=t.substring(l+2,o).trim();if(e.removeNSPrefix){const t=a.indexOf(":");-1!==t&&(a=a.substr(t+1))}a=Kt(e.transformTagName,a,"",e).tagName,r&&(s=this.saveTextToParentTag(s,r,this.readonlyMatcher));const c=this.matcher.getCurrentTag();if(a&&e.unpairedTagsSet.has(a))throw new Error(`Unpaired tag can not be used as closing tag: </${a}>`);c&&e.unpairedTagsSet.has(c)&&(this.matcher.pop(),this.tagsNodeStack.pop()),this.matcher.pop(),this.isCurrentNodeStopNode=!1,r=this.tagsNodeStack.pop()||n,e.captureMetaData&&r&&r.addEndIndex(Bt(o+1,i)),s="",l=o}else if(63===c){let n=Qt(t,l,!1,"?>");if(!n)throw new Error("Pi Tag is not closed.");s=this.saveTextToParentTag(s,r,this.readonlyMatcher);const a=this.buildAttributesMap(n.tagExp,this.matcher,n.tagName,!0);if(a){const t=a[this.options.attributeNamePrefix+"version"];this.entityDecoder.setXmlVersion(Number(t)||1),o.setXmlVersion(Number(t)||1)}if(e.ignoreDeclaration&&"?xml"===n.tagName||e.ignorePiTags);else{const t=new C(n.tagName);t.add(e.textNodeName,""),n.tagName!==n.tagExp&&n.attrExpPresent&&!0!==e.ignoreAttributes&&(t[":@"]=a);const s=e.captureMetaData?Bt(l,i):l;this.addChild(r,t,this.readonlyMatcher,s),e.captureMetaData&&r.addEndIndex(Bt(n.closeIndex+2,i))}l=n.closeIndex+1}else if(33===c&&45===t.charCodeAt(l+2)&&45===t.charCodeAt(l+3)){const i=Yt(t,"--\x3e",l+4,"Comment is not closed.");if(e.commentPropName){const n=t.substring(l+4,i-2);s=this.saveTextToParentTag(s,r,this.readonlyMatcher),r.add(e.commentPropName,[{[e.textNodeName]:n}])}l=i}else if(33===c&&68===t.charCodeAt(l+2)){if(this.doctypefound)throw new Error("Multiple DOCTYPE declarations found.");this.doctypefound=!0;const e=o.readDocType(t,l);this.entityDecoder.addInputEntities(e.entities),l=e.i}else if(33===c&&91===t.charCodeAt(l+2)){const i=Yt(t,"]]>",l,"CDATA is not closed.")-2,n=t.substring(l+9,i);s=this.saveTextToParentTag(s,r,this.readonlyMatcher);let o=this.parseTextData(n,r.tagname,this.readonlyMatcher,!0,!1,!0,!0);null==o&&(o=""),e.cdataPropName?r.add(e.cdataPropName,[{[e.textNodeName]:n}]):r.add(e.textNodeName,o),l=i+2}else{let o=Qt(t,l,e.removeNSPrefix);if(!o){const e=t.substring(Math.max(0,l-50),Math.min(a,l+50));throw new Error(`readTagExp returned undefined at position ${l}. Context: "${e}"`)}let c=o.tagName;const p=o.rawTagName;let h=o.tagExp,d=o.attrExpPresent,u=o.closeIndex;if(({tagName:c,tagExp:h}=Kt(e.transformTagName,c,h,e)),e.strictReservedNames&&(c===e.commentPropName||c===e.cdataPropName||c===e.textNodeName||c===e.attributesGroupName))throw new Error(`Invalid tag name: ${c}`);r&&s&&"!xml"!==r.tagname&&(s=this.saveTextToParentTag(s,r,this.readonlyMatcher,!1));const f=r;f&&e.unpairedTagsSet.has(f.tagname)&&(r=this.tagsNodeStack.pop(),this.matcher.pop());let g=!1;h.length>0&&h.lastIndexOf("/")===h.length-1&&(g=!0,"/"===c[c.length-1]?(c=c.substr(0,c.length-1),h=c):h=h.substr(0,h.length-1),d=c!==h);let m,x=null,b={};m=Dt(p),c!==n.tagname&&this.matcher.push(c,{},m),c!==h&&d&&(x=this.buildAttributesMap(h,this.matcher,c),x&&(b=Lt(x,e))),c!==n.tagname&&(this.isCurrentNodeStopNode=this.isItStopNode());const y=e.captureMetaData?Bt(l,i):l;if(this.isCurrentNodeStopNode){let n="";if(g)l=o.closeIndex;else if(e.unpairedTagsSet.has(c))l=o.closeIndex;else{const e=this.readStopNodeData(t,p,u+1);if(!e)throw new Error(`Unexpected end of ${p}`);l=e.i,n=e.tagContent}const s=new C(c);x&&(s[":@"]=x),s.add(e.textNodeName,n),this.matcher.pop(),this.isCurrentNodeStopNode=!1,this.addChild(r,s,this.readonlyMatcher,y),e.captureMetaData&&r.addEndIndex(Bt(l+1,i))}else{if(g){({tagName:c,tagExp:h}=Kt(e.transformTagName,c,h,e));const t=new C(c);x&&(t[":@"]=x),this.addChild(r,t,this.readonlyMatcher,y),e.captureMetaData&&r.addEndIndex(Bt(u+1,i)),this.matcher.pop(),this.isCurrentNodeStopNode=!1}else{if(e.unpairedTagsSet.has(c)){const t=new C(c);x&&(t[":@"]=x),this.addChild(r,t,this.readonlyMatcher,y),e.captureMetaData&&r.addEndIndex(Bt(o.closeIndex+1,i)),this.matcher.pop(),this.isCurrentNodeStopNode=!1,l=o.closeIndex;continue}{const t=new C(c);if(this.tagsNodeStack.length>e.maxNestedTags)throw new Error("Maximum nested tags exceeded");this.tagsNodeStack.push(r),x&&(t[":@"]=x),this.addChild(r,t,this.readonlyMatcher,y),r=t}}s="",l=u}}}else s+=t[l];return n.child};function Bt(t,e){let i=0,n=e.length;for(;i<n;){const r=Math.floor((i+n)/2);e[r]<t?i=r+1:n=r}return t+i}function Gt(t,e,i,n){this.options.captureMetaData||(n=void 0);const r=this.options.jPath?i.toString():i,s=this.options.updateTag(e.tagname,r,e[":@"]);!1===s||("string"==typeof s?(e.tagname=s,t.addChild(e,n)):t.addChild(e,n))}function Xt(t,e,i){const n=this.options.processEntities;if(!n||!n.enabled)return t;if(n.allowedTags){const r=this.options.jPath?i.toString():i;if(!(Array.isArray(n.allowedTags)?n.allowedTags.includes(e):n.allowedTags(e,r)))return t}if(n.tagFilter){const r=this.options.jPath?i.toString():i;if(!n.tagFilter(e,r))return t}return this.entityDecoder.decode(t)}function Wt(t,e,i,n){return t&&(void 0===n&&(n=0===e.child.length),void 0!==(t=this.parseTextData(t,e.tagname,i,!1,!!e[":@"]&&0!==Object.keys(e[":@"]).length,n))&&""!==t&&e.add(this.options.textNodeName,t),t=""),t}function zt(){return 0!==this.stopNodeExpressionsSet.size&&this.matcher.matchesAny(this.stopNodeExpressionsSet)}function Yt(t,e,i,n){const r=t.indexOf(e,i);if(-1===r)throw new Error(n);return r+e.length-1}function Ht(t,e,i,n){const r=t.indexOf(e,i);if(-1===r)throw new Error(n);return r}function Qt(t,e,i,n=">"){const r=function(t,e,i=">"){let n=0;const r=t.length,s=i.charCodeAt(0),o=i.length>1?i.charCodeAt(1):-1;let a="",l=e;for(let i=e;i<r;i++){const e=t.charCodeAt(i);if(n)e===n&&(n=0);else if(34===e||39===e)n=e;else if(e===s){if(-1===o)return a+=t.substring(l,i),{data:a,index:i};if(t.charCodeAt(i+1)===o)return a+=t.substring(l,i),{data:a,index:i}}else 9!==e||n||(a+=t.substring(l,i)+" ",l=i+1)}}(t,e+1,n);if(!r)return;let s=r.data;const o=r.index,a=s.search(/\s/);let l=s,c=!0;-1!==a&&(l=s.substring(0,a),s=s.substring(a+1).trimStart());const p=l;if(i){const t=l.indexOf(":");-1!==t&&(l=l.substr(t+1),c=l!==r.data.substr(t+1))}return{tagName:l,tagExp:s,closeIndex:o,attrExpPresent:c,rawTagName:p}}function Jt(t,e,i){const n=i;let r=1,s=!1,o=-1;const a=t.length;for(;i<a;i++)if("<"===t[i]){const a=t.charCodeAt(i+1);if(47===a){const s=Ht(t,">",i,`${e} is not closed`);if(t.substring(i+2,s).trim()===e&&(r--,0===r))return{tagContent:t.substring(n,i),i:s};i=s}else if(63===a)i=Yt(t,"?>",i+1,"StopNode is not closed.");else if(33===a&&45===t.charCodeAt(i+2)&&45===t.charCodeAt(i+3))i=Yt(t,"--\x3e",i+3,"StopNode is not closed.");else if(33===a&&91===t.charCodeAt(i+2))i=Yt(t,"]]>",i,"StopNode is not closed.")-2;else{const n=s?void 0:Qt(t,i,!1);if(n)n.tagName===e&&"/"!==n.tagExp[n.tagExp.length-1]&&r++,i=n.closeIndex;else{if(s=!0,o<i&&(o=t.indexOf(">",i),-1===o))return;const n=t.indexOf("<",i+1);if(-1===n||n>o){const n=t.substring(i+1,o),s=n.search(/\s/);(-1===s?n:n.substring(0,s))===e&&"/"!==n[n.length-1]&&r++,i=o}}}}}function Zt(t,e,i){if(e&&"string"==typeof t){const e=t.trim();return"true"===e||"false"!==e&&et(t,i)}return void 0!==t?t:""}function Kt(t,e,i,n){if(t){const n=t(e);i===e&&(i=n),e=n}return{tagName:e=te(e,n),tagExp:i}}function te(t,e){if(o.includes(t))throw new Error(`[SECURITY] Invalid name: "${t}" is a reserved JavaScript keyword that could cause prototype pollution`);return s.includes(t)?e.onDangerousProperty(t):t}const ee=C.getMetaDataSymbol();function ie(t,e){if(!t||"object"!=typeof t)return{};if(!e)return t;const i={};for(const n in t)n.startsWith(e)?i[n.substring(e.length)]=t[n]:i[n]=t[n];return i}function ne(t,e,i,n){return re(t,e,i,n)}function re(t,e,i,n){let r;const s={};for(let o=0;o<t.length;o++){const a=t[o],l=se(a);if(void 0!==l&&l!==e.textNodeName){const t=ie(a[":@"]||{},e.attributeNamePrefix);i.push(l,t)}if(l===e.textNodeName)void 0===r?r=a[l]:r+=""+a[l];else{if(void 0===l)continue;if(a[l]){let t=re(a[l],e,i,n);const r=ae(t,e);if(0===Object.keys(t).length&&e.alwaysCreateTextNode&&(t[e.textNodeName]=""),a[":@"]?oe(t,a[":@"],n,e):1!==Object.keys(t).length||void 0===t[e.textNodeName]||e.alwaysCreateTextNode?0===Object.keys(t).length&&(e.alwaysCreateTextNode?t[e.textNodeName]="":t=""):t=t[e.textNodeName],void 0!==a[ee]&&"object"==typeof t&&null!==t&&(t[ee]=a[ee]),void 0!==s[l]&&Object.prototype.hasOwnProperty.call(s,l))Array.isArray(s[l])||(s[l]=[s[l]]),s[l].push(t);else{const i=e.jPath?n.toString():n;e.isArray(l,i,r)?s[l]=[t]:s[l]=t}void 0!==l&&l!==e.textNodeName&&i.pop()}}}return"string"==typeof r?r.length>0&&(s[e.textNodeName]=r):void 0!==r&&(s[e.textNodeName]=r),s}function se(t){const e=Object.keys(t);for(let t=0;t<e.length;t++){const i=e[t];if(":@"!==i)return i}}function oe(t,e,i,n){if(e){const r=Object.keys(e),s=r.length;for(let o=0;o<s;o++){const s=r[o],a=s.startsWith(n.attributeNamePrefix)?s.substring(n.attributeNamePrefix.length):s,l=n.jPath?i.toString()+"."+a:i;n.isArray(s,l,!0,!0)?t[s]=[e[s]]:t[s]=e[s]}}}function ae(t,e){const{textNodeName:i}=e,n=Object.keys(t).length;return 0===n||!(1!==n||!t[i]&&"boolean"!=typeof t[i]&&0!==t[i])}class le{constructor(t){this.externalEntities={},this.options=T(t)}parse(t,e){if("string"!=typeof t&&t.toString)t=t instanceof Uint8Array&&("undefined"==typeof Buffer||!Buffer.isBuffer(t))?new TextDecoder("utf-8",{ignoreBOM:!0}).decode(t):t.toString();else if("string"!=typeof t)throw new Error("XML data is accepted in String or Bytes[] form.");if(e){!0===e&&(e={});const i=l(t,e);if(!0!==i)throw Error(`${i.err.msg}:${i.err.line}:${i.err.col}`)}const i=new Mt(this.options,this.externalEntities),n=i.parseXml(t);return this.options.preserveOrder||void 0===n?n:ne(n,this.options,i.matcher,i.readonlyMatcher)}addEntity(t,e){if(-1!==e.indexOf("&"))throw new Error("Entity value can't have '&'");if(-1!==t.indexOf("&")||-1!==t.indexOf(";"))throw new Error("An entity must be set without '&' and ';'. Eg. use '#xD' for '&#xD;'");if("&"===e)throw new Error("An entity with value '&' is not permitted");this.externalEntities[t]=e}static getMetaDataSymbol(){return C.getMetaDataSymbol()}}function ce(t){return"number"==typeof t&&Object.is(t,-0)?"-0":String(t)}function pe(t){return ce(t).replace(/--/g,"- -").replace(/--/g,"- -").replace(/-$/,"- ")}function he(t){return ce(t).replace(/\]\]>/g,"]]]]><![CDATA[>")}function de(t){return ce(t).replace(/"/g,"&quot;").replace(/'/g,"&apos;")}function ue(t,e,i,n,r){return i.sanitizeName?r(t)?t:i.sanitizeName(t,{isAttribute:e,matcher:n.readOnly()}):t}function fe(t,e){let i="";e.format&&(i="\n");const n=[];if(e.stopNodes&&Array.isArray(e.stopNodes))for(let t=0;t<e.stopNodes.length;t++){const i=e.stopNodes[t];"string"==typeof i?n.push(new ot(i)):i instanceof ot&&n.push(i)}const r=function(t,e){if(!Array.isArray(t)||0===t.length)return"1.0";const i=t[0];if("?xml"===ye(i)){const t=i[":@"];if(t){const i=e.attributeNamePrefix+"version";if(t[i])return t[i]}}return"1.0"}(t,e),s=q("qName",{xmlVersion:r});return ge(t,e,i,new st,n,s)}function ge(t,e,i,n,r,s){let o="",a=!1;if(e.maxNestedTags&&n.getDepth()>e.maxNestedTags)throw new Error("Maximum nested tags exceeded");if(!Array.isArray(t)){if(null!=t){let i=ce(t);return i=we(i,e),i}return""}for(let l=0;l<t.length;l++){const c=t[l],p=ye(c);if(void 0===p)continue;const h=p===e.textNodeName||p===e.cdataPropName||p===e.commentPropName||"?"===p[0]?p:ue(p,!1,e,n,s),d=me(c[":@"],e);n.push(h,d);const u=Ee(n,r);if(h===e.textNodeName){let t=c[p];u||(t=e.tagValueProcessor(h,t),t=we(t,e)),t=ce(t),a&&(o+=i),o+=t,a=!1,n.pop();continue}if(h===e.cdataPropName){a&&(o+=i),o+=`<![CDATA[${he(c[p][0][e.textNodeName])}]]>`,a=!1,n.pop();continue}if(h===e.commentPropName){o+=i+`\x3c!--${pe(c[p][0][e.textNodeName])}--\x3e`,a=!0,n.pop();continue}if("?"===h[0]){o+=("?xml"===h?"":i)+`<${h}${Ne(c[":@"],e,u,n,s)}?>`,a=!0,n.pop();continue}let f=i;""!==f&&(f+=e.indentBy);const g=i+`<${h}${Ne(c[":@"],e,u,n,s)}`;let m;m=u?xe(c[p],e):ge(c[p],e,f,n,r,s),-1!==e.unpairedTags.indexOf(h)?e.suppressUnpairedNode?o+=g+">":o+=g+"/>":m&&0!==m.length||!e.suppressEmptyNode?m&&m.endsWith(">")?o+=g+`>${m}${i}</${h}>`:(o+=g+">",m&&""!==i&&(m.includes("/>")||m.includes("</"))?o+=i+e.indentBy+m+i:o+=m,o+=`</${h}>`):o+=g+"/>",a=!0,n.pop()}return o}function me(t,e){if(!t||e.ignoreAttributes)return null;const i={};let n=!1;for(let r in t)Object.prototype.hasOwnProperty.call(t,r)&&(i[r.startsWith(e.attributeNamePrefix)?r.substr(e.attributeNamePrefix.length):r]=de(t[r]),n=!0);return n?i:null}function xe(t,e){if(!Array.isArray(t))return null!=t?ce(t):"";let i="";for(let n=0;n<t.length;n++){const r=t[n],s=ye(r);if(s===e.textNodeName)i+=ce(r[s]);else if(s===e.cdataPropName)i+=r[s][0][e.textNodeName];else if(s===e.commentPropName)i+=r[s][0][e.textNodeName];else{if(s&&"?"===s[0])continue;if(s){const t=be(r[":@"],e),n=xe(r[s],e);n&&0!==n.length?i+=`<${s}${t}>${n}</${s}>`:i+=`<${s}${t}/>`}}}return i}function be(t,e){let i="";if(t&&!e.ignoreAttributes)for(let n in t){if(!Object.prototype.hasOwnProperty.call(t,n))continue;let r=t[n];!0===r&&e.suppressBooleanAttributes?i+=` ${n.substr(e.attributeNamePrefix.length)}`:i+=` ${n.substr(e.attributeNamePrefix.length)}="${de(r)}"`}return i}function ye(t){const e=Object.keys(t);for(let i=0;i<e.length;i++){const n=e[i];if(Object.prototype.hasOwnProperty.call(t,n)&&":@"!==n)return n}}function Ne(t,e,i,n,r){let s="";if(t&&!e.ignoreAttributes)for(let o in t){if(!Object.prototype.hasOwnProperty.call(t,o))continue;const a=o.substr(e.attributeNamePrefix.length),l=i?a:ue(a,!0,e,n,r);let c;i?c=t[o]:(c=e.attributeValueProcessor(o,t[o]),c=we(c,e)),!0===c&&e.suppressBooleanAttributes?s+=` ${l}`:s+=` ${l}="${de(c)}"`}return s}function Ee(t,e){if(!e||0===e.length)return!1;for(let i=0;i<e.length;i++)if(t.matches(e[i]))return!0;return!1}function we(t,e){if(t&&t.length>0&&e.processEntities)for(let i=0;i<e.entities.length;i++){const n=e.entities[i];t=t.replace(n.regex,n.val)}return t}const ve={attributeNamePrefix:"@_",attributesGroupName:!1,textNodeName:"#text",ignoreAttributes:!0,cdataPropName:!1,format:!1,indentBy:"  ",suppressEmptyNode:!1,suppressUnpairedNode:!0,suppressBooleanAttributes:!0,tagValueProcessor:function(t,e){return e},attributeValueProcessor:function(t,e){return e},preserveOrder:!1,commentPropName:!1,unpairedTags:[],entities:[{regex:new RegExp("&","g"),val:"&amp;"},{regex:new RegExp(">","g"),val:"&gt;"},{regex:new RegExp("<","g"),val:"&lt;"},{regex:new RegExp("'","g"),val:"&apos;"},{regex:new RegExp('"',"g"),val:"&quot;"}],processEntities:!0,stopNodes:[],oneListGroup:!1,maxNestedTags:100,jPath:!0,sanitizeName:!1};function Se(t){if(this.options=Object.assign({},ve,t),this.options.stopNodes&&Array.isArray(this.options.stopNodes)&&(this.options.stopNodes=this.options.stopNodes.map(t=>"string"==typeof t&&t.startsWith("*.")?".."+t.substring(2):t)),this.stopNodeExpressions=[],this.options.stopNodes&&Array.isArray(this.options.stopNodes))for(let t=0;t<this.options.stopNodes.length;t++){const e=this.options.stopNodes[t];"string"==typeof e?this.stopNodeExpressions.push(new ot(e)):e instanceof ot&&this.stopNodeExpressions.push(e)}var e;!0===this.options.ignoreAttributes||this.options.attributesGroupName?this.isAttribute=function(){return!1}:(this.ignoreAttributesFn="function"==typeof(e=this.options.ignoreAttributes)?e:Array.isArray(e)?t=>{for(const i of e){if("string"==typeof i&&t===i)return!0;if(i instanceof RegExp&&i.test(t))return!0}}:()=>!1,this.attrPrefixLen=this.options.attributeNamePrefix.length,this.isAttribute=Ce),this.processTextOrObjNode=Te,this.options.format?(this.indentate=_e,this.tagEndChar=">\n",this.newLine="\n"):(this.indentate=function(){return""},this.tagEndChar=">",this.newLine="")}function Ae(t,e,i,n,r){return i.sanitizeName?r(t)?t:i.sanitizeName(t,{isAttribute:e,matcher:n.readOnly()}):t}function Te(t,e,i,n,r){const s=this.extractAttributes(t);if(n.push(e,s),this.checkStopNode(n)){const r=this.buildRawContent(t),s=this.buildAttributesForStopNode(t);return n.pop(),this.buildObjectNode(r,e,s,i)}const o=this.j2x(t,i+1,n,r);return n.pop(),"?"===e[0]?this.buildTextValNode("",e,o.attrStr,i,n):void 0!==t[this.options.textNodeName]&&1===Object.keys(t).length?this.buildTextValNode(t[this.options.textNodeName],e,o.attrStr,i,n):this.buildObjectNode(o.val,e,o.attrStr,i)}function _e(t){return this.options.indentBy.repeat(t)}function Ce(t){return!(!t.startsWith(this.options.attributeNamePrefix)||t===this.options.textNodeName)&&t.substr(this.attrPrefixLen)}Se.prototype.build=function(t){if(this.options.preserveOrder)return fe(t,this.options);{Array.isArray(t)&&this.options.arrayNodeName&&this.options.arrayNodeName.length>1&&(t={[this.options.arrayNodeName]:t});const e=new st,i=function(t,e){const i=t["?xml"];if(i&&"object"==typeof i){if(e.attributesGroupName&&i[e.attributesGroupName]){const t=i[e.attributesGroupName][e.attributeNamePrefix+"version"];if(t)return t}const t=i[e.attributeNamePrefix+"version"];if(t)return t}return"1.0"}(t,this.options),n=q("qName",{xmlVersion:i});return this.j2x(t,0,e,n).val}},Se.prototype.j2x=function(t,e,i,n){let r="",s="";if(this.options.maxNestedTags&&i.getDepth()>=this.options.maxNestedTags)throw new Error("Maximum nested tags exceeded");const o=this.options.jPath?i.toString():i,a=this.checkStopNode(i);for(let l in t){if(!Object.prototype.hasOwnProperty.call(t,l))continue;const c=l===this.options.textNodeName||l===this.options.cdataPropName||l===this.options.commentPropName||this.options.attributesGroupName&&l===this.options.attributesGroupName||this.isAttribute(l)||"?"===l[0]?l:Ae(l,!1,this.options,i,n);if(void 0===t[l])this.isAttribute(l)&&(s+="");else if(null===t[l])this.isAttribute(l)||c===this.options.cdataPropName||c===this.options.commentPropName?s+="":"?"===c[0]?s+=this.indentate(e)+"<"+c+"?"+this.tagEndChar:s+=this.indentate(e)+"<"+c+"/"+this.tagEndChar;else if(t[l]instanceof Date)s+=this.buildTextValNode(t[l],c,"",e,i);else if("object"!=typeof t[l]){const p=this.isAttribute(l);if(p&&!this.ignoreAttributesFn(p,o)){const e=Ae(p,!0,this.options,i,n);r+=this.buildAttrPairStr(e,ce(t[l]),a)}else if(!p)if(l===this.options.textNodeName){let e=this.options.tagValueProcessor(l,ce(t[l]));s+=this.replaceEntitiesValue(e)}else{i.push(c);const n=this.checkStopNode(i);if(i.pop(),n){const i=ce(t[l]);s+=""===i?this.indentate(e)+"<"+c+this.closeTag(c)+this.tagEndChar:this.indentate(e)+"<"+c+">"+i+"</"+c+this.tagEndChar}else s+=this.buildTextValNode(t[l],c,"",e,i)}}else if(Array.isArray(t[l])){const r=t[l].length;let o="",a="";for(let p=0;p<r;p++){const r=t[l][p];if(void 0===r);else if(null===r)"?"===c[0]?s+=this.indentate(e)+"<"+c+"?"+this.tagEndChar:s+=this.indentate(e)+"<"+c+"/"+this.tagEndChar;else if("object"==typeof r)if(this.options.oneListGroup){i.push(c);const t=this.j2x(r,e+1,i,n);i.pop(),o+=t.val,this.options.attributesGroupName&&r.hasOwnProperty(this.options.attributesGroupName)&&(a+=t.attrStr)}else o+=this.processTextOrObjNode(r,c,e,i,n);else if(this.options.oneListGroup){let t=this.options.tagValueProcessor(c,r);t=this.replaceEntitiesValue(t),t=ce(t),o+=t}else{i.push(c);const t=this.checkStopNode(i);if(i.pop(),t){const t=ce(r);o+=""===t?this.indentate(e)+"<"+c+this.closeTag(c)+this.tagEndChar:this.indentate(e)+"<"+c+">"+t+"</"+c+this.tagEndChar}else o+=this.buildTextValNode(r,c,"",e,i)}}this.options.oneListGroup&&(o=this.buildObjectNode(o,c,a,e)),s+=o}else if(this.options.attributesGroupName&&l===this.options.attributesGroupName){const e=Object.keys(t[l]),s=e.length;for(let o=0;o<s;o++){const s=Ae(e[o],!0,this.options,i,n);r+=this.buildAttrPairStr(s,ce(t[l][e[o]]),a)}}else s+=this.processTextOrObjNode(t[l],c,e,i,n)}return{attrStr:r,val:s}},Se.prototype.buildAttrPairStr=function(t,e,i){return i||(e=this.options.attributeValueProcessor(t,ce(e)),e=this.replaceEntitiesValue(e)),this.options.suppressBooleanAttributes&&"true"===e?" "+t:" "+t+'="'+de(e)+'"'},Se.prototype.extractAttributes=function(t){if(!t||"object"!=typeof t)return null;const e={};let i=!1;if(this.options.attributesGroupName&&t[this.options.attributesGroupName]){const n=t[this.options.attributesGroupName];for(let t in n)Object.prototype.hasOwnProperty.call(n,t)&&(e[t.startsWith(this.options.attributeNamePrefix)?t.substring(this.options.attributeNamePrefix.length):t]=de(n[t]),i=!0)}else for(let n in t){if(!Object.prototype.hasOwnProperty.call(t,n))continue;const r=this.isAttribute(n);r&&(e[r]=de(t[n]),i=!0)}return i?e:null},Se.prototype.buildRawContent=function(t){if("string"==typeof t)return t;if("object"!=typeof t||null===t)return String(t);if(void 0!==t[this.options.textNodeName])return t[this.options.textNodeName];let e="";for(let i in t){if(!Object.prototype.hasOwnProperty.call(t,i))continue;if(this.isAttribute(i))continue;if(this.options.attributesGroupName&&i===this.options.attributesGroupName)continue;const n=t[i];if(i===this.options.textNodeName)e+=n;else if(Array.isArray(n)){for(let t of n)if("string"==typeof t||"number"==typeof t)e+=`<${i}>${t}</${i}>`;else if("object"==typeof t&&null!==t){const n=this.buildRawContent(t),r=this.buildAttributesForStopNode(t);e+=""===n?`<${i}${r}/>`:`<${i}${r}>${n}</${i}>`}}else if("object"==typeof n&&null!==n){const t=this.buildRawContent(n),r=this.buildAttributesForStopNode(n);e+=""===t?`<${i}${r}/>`:`<${i}${r}>${t}</${i}>`}else e+=`<${i}>${n}</${i}>`}return e},Se.prototype.buildAttributesForStopNode=function(t){if(!t||"object"!=typeof t)return"";let e="";if(this.options.attributesGroupName&&t[this.options.attributesGroupName]){const i=t[this.options.attributesGroupName];for(let t in i){if(!Object.prototype.hasOwnProperty.call(i,t))continue;const n=t.startsWith(this.options.attributeNamePrefix)?t.substring(this.options.attributeNamePrefix.length):t,r=i[t];!0===r&&this.options.suppressBooleanAttributes?e+=" "+n:e+=" "+n+'="'+de(r)+'"'}}else for(let i in t){if(!Object.prototype.hasOwnProperty.call(t,i))continue;const n=this.isAttribute(i);if(n){const r=t[i];!0===r&&this.options.suppressBooleanAttributes?e+=" "+n:e+=" "+n+'="'+de(r)+'"'}}return e},Se.prototype.buildObjectNode=function(t,e,i,n){if(""===t)return"?"===e[0]?this.indentate(n)+"<"+e+i+"?"+this.tagEndChar:this.indentate(n)+"<"+e+i+this.closeTag(e)+this.tagEndChar;if("?"===e[0])return this.indentate(n)+"<"+e+i+"?"+this.tagEndChar;{let r="</"+e+this.tagEndChar,s="";return"?"===e[0]&&(s="?",r=""),!i&&""!==i||-1!==t.indexOf("<")?!1!==this.options.commentPropName&&e===this.options.commentPropName&&0===s.length?this.indentate(n)+`\x3c!--${pe(t)}--\x3e`+this.newLine:this.indentate(n)+"<"+e+i+s+this.tagEndChar+t+this.indentate(n)+r:this.indentate(n)+"<"+e+i+s+">"+t+r}},Se.prototype.closeTag=function(t){let e="";return-1!==this.options.unpairedTags.indexOf(t)?this.options.suppressUnpairedNode||(e="/"):e=this.options.suppressEmptyNode?"/":`></${t}`,e},Se.prototype.checkStopNode=function(t){if(!this.stopNodeExpressions||0===this.stopNodeExpressions.length)return!1;for(let e=0;e<this.stopNodeExpressions.length;e++)if(t.matches(this.stopNodeExpressions[e]))return!0;return!1},Se.prototype.buildTextValNode=function(t,e,i,n,r){if(!1!==this.options.cdataPropName&&e===this.options.cdataPropName){const e=he(t);return this.indentate(n)+`<![CDATA[${e}]]>`+this.newLine}if(!1!==this.options.commentPropName&&e===this.options.commentPropName){const e=pe(t);return this.indentate(n)+`\x3c!--${e}--\x3e`+this.newLine}if("?"===e[0])return this.indentate(n)+"<"+e+i+"?"+this.tagEndChar;{let r=this.options.tagValueProcessor(e,t);return r=this.replaceEntitiesValue(r),r=ce(r),""===r?this.indentate(n)+"<"+e+i+this.closeTag(e)+this.tagEndChar:this.indentate(n)+"<"+e+i+">"+r+"</"+e+this.tagEndChar}},Se.prototype.replaceEntitiesValue=function(t){if(t&&t.length>0&&this.options.processEntities)for(let e=0;e<this.options.entities.length;e++){const i=this.options.entities[e];t=t.replace(i.regex,i.val)}return t};const Oe=Se,$e={validate:l};module.exports=e})();
 
 /***/ }),
 
@@ -220779,7 +222711,7 @@ module.exports = { pkg };
 /***/ ((module) => {
 
 "use strict";
-module.exports = {"rE":"1.14.4"};
+module.exports = {"rE":"1.14.7"};
 
 /***/ }),
 
@@ -220787,7 +222719,7 @@ module.exports = {"rE":"1.14.4"};
 /***/ ((module) => {
 
 "use strict";
-module.exports = /*#__PURE__*/JSON.parse('{"name":"gaxios","version":"7.1.3","description":"A simple common HTTP client specifically for Google APIs and services.","main":"build/cjs/src/index.js","types":"build/cjs/src/index.d.ts","files":["build/"],"exports":{".":{"import":{"types":"./build/esm/src/index.d.ts","default":"./build/esm/src/index.js"},"require":{"types":"./build/cjs/src/index.d.ts","default":"./build/cjs/src/index.js"}}},"scripts":{"lint":"gts check --no-inline-config","test":"c8 mocha build/esm/test","presystem-test":"npm run compile","system-test":"mocha build/esm/system-test --timeout 80000","compile":"tsc -b ./tsconfig.json ./tsconfig.cjs.json && node utils/enable-esm.mjs","fix":"gts fix","prepare":"npm run compile","pretest":"npm run compile","webpack":"webpack","prebrowser-test":"npm run compile","browser-test":"node build/browser-test/browser-test-runner.js","docs":"jsdoc -c .jsdoc.js","docs-test":"linkinator docs","predocs-test":"npm run docs","samples-test":"cd samples/ && npm link ../ && npm test && cd ../","prelint":"cd samples; npm link ../; npm install","clean":"gts clean"},"repository":{"type":"git","directory":"packages/gaxios","url":"https://github.com/googleapis/google-cloud-node-core.git"},"keywords":["google"],"engines":{"node":">=18"},"author":"Google, LLC","license":"Apache-2.0","devDependencies":{"@babel/plugin-proposal-private-methods":"^7.18.6","@types/cors":"^2.8.6","@types/express":"^5.0.0","@types/extend":"^3.0.1","@types/mocha":"^10.0.10","@types/multiparty":"4.2.1","@types/mv":"^2.1.0","@types/ncp":"^2.0.1","@types/node":"^22.0.0","@types/sinon":"^17.0.0","@types/tmp":"0.2.6","assert":"^2.0.0","browserify":"^17.0.0","c8":"^10.0.0","cors":"^2.8.5","express":"^5.0.0","gts":"^6.0.0","is-docker":"^3.0.0","jsdoc":"^4.0.0","jsdoc-fresh":"^5.0.0","jsdoc-region-tag":"^4.0.0","karma":"^6.0.0","karma-chrome-launcher":"^3.0.0","karma-coverage":"^2.0.0","karma-firefox-launcher":"^2.0.0","karma-mocha":"^2.0.0","karma-remap-coverage":"^0.1.5","karma-sourcemap-loader":"^0.4.0","karma-webpack":"^5.0.1","linkinator":"^6.1.2","mocha":"^11.1.0","multiparty":"^4.2.1","mv":"^2.1.1","ncp":"^2.0.0","nock":"^14.0.0-beta.13","null-loader":"^4.0.0","pack-n-play":"^4.0.0","puppeteer":"^24.0.0","sinon":"^21.0.0","stream-browserify":"^3.0.0","tmp":"0.2.5","ts-loader":"^9.5.2","typescript":"^5.8.3","webpack":"^5.35.0","webpack-cli":"^6.0.1"},"dependencies":{"extend":"^3.0.2","https-proxy-agent":"^7.0.1","node-fetch":"^3.3.2","rimraf":"^5.0.1"},"homepage":"https://github.com/googleapis/google-cloud-node-core/tree/main/packages/gaxios"}');
+module.exports = /*#__PURE__*/JSON.parse('{"name":"gaxios","version":"7.3.1","description":"A simple common HTTP client specifically for Google APIs and services.","main":"build/cjs/src/index.js","types":"build/cjs/src/index.d.ts","files":["build/"],"exports":{".":{"import":{"types":"./build/esm/src/index.d.ts","default":"./build/esm/src/index.js"},"require":{"types":"./build/cjs/src/index.d.ts","default":"./build/cjs/src/index.js"}}},"scripts":{"lint":"gts check --no-inline-config","test":"c8 mocha build/esm/test","presystem-test":"npm run compile","system-test":"mocha build/esm/system-test --timeout 80000","compile":"tsc -b ./tsconfig.json ./tsconfig.cjs.json && node utils/enable-esm.mjs","fix":"gts fix","prepare":"npm run compile","pretest":"npm run compile","webpack":"webpack","prebrowser-test":"npm run compile","browser-test":"node build/browser-test/browser-test-runner.js","docs":"jsdoc -c .jsdoc.js","samples-test":"cd samples/ && npm link ../ && npm test && cd ../","prelint":"cd samples; npm link ../; npm install","clean":"gts clean"},"repository":{"type":"git","directory":"core/packages/gaxios","url":"https://github.com/googleapis/google-cloud-node.git"},"keywords":["google"],"engines":{"node":">=18"},"author":"Google, LLC","license":"Apache-2.0","devDependencies":{"@babel/plugin-proposal-private-methods":"^7.18.6","@types/cors":"^2.8.6","@types/express":"^5.0.0","@types/extend":"^3.0.1","@types/mocha":"^10.0.10","@types/multiparty":"4.2.1","@types/mv":"^2.1.0","@types/ncp":"^2.0.8","@types/node":"^24.0.0","@types/sinon":"^21.0.0","@types/tmp":"^0.2.6","assert":"^2.0.0","browserify":"^17.0.0","c8":"^10.1.3","cors":"^2.8.5","express":"^5.0.0","gts":"^6.0.2","is-docker":"^3.0.0","jsdoc":"^4.0.4","jsdoc-fresh":"^5.0.0","jsdoc-region-tag":"^4.0.0","karma":"^6.0.0","karma-chrome-launcher":"^3.0.0","karma-coverage":"^2.0.0","karma-firefox-launcher":"^2.0.0","karma-mocha":"^2.0.0","karma-remap-coverage":"^0.1.5","karma-sourcemap-loader":"^0.4.0","karma-webpack":"^5.0.0","mocha":"^11.1.0","multiparty":"^4.2.1","mv":"^2.1.1","ncp":"^2.0.0","nock":"14.0.5","null-loader":"^4.0.1","pack-n-play":"^4.0.0","puppeteer":"^24.0.0","sinon":"21.0.3","stream-browserify":"^3.0.0","tmp":"0.2.7","ts-loader":"^9.5.2","typescript":"5.8.3","undici-types":"^7.24.1","webpack":"^5.97.1","webpack-cli":"^6.0.1"},"dependencies":{"extend":"^3.0.2","https-proxy-agent":"^7.0.1","node-fetch":"^3.3.2"},"homepage":"https://github.com/googleapis/google-cloud-node/tree/main/core/packages/gaxios"}');
 
 /***/ }),
 
